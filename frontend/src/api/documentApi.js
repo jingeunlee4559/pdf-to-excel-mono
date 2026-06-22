@@ -1,11 +1,12 @@
 import api, { API_BASE } from "./axios";
 
-export const createDocumentJobApi = async ({ title, userRequest, outputMode, templateId, files }) => {
+export const createDocumentJobApi = async ({ title, userRequest, outputMode, templateId, files, chatSessionId }) => {
   const formData = new FormData();
   formData.append('title', title || '문서 분석 작업');
   formData.append('userRequest', userRequest || '문서를 분석해서 표로 만들어줘');
   formData.append('outputMode', outputMode || 'FREE_FORM');
   if (templateId) formData.append('templateId', templateId);
+  if (chatSessionId) formData.append('chatSessionId', chatSessionId);
   Array.from(files || []).forEach((file) => formData.append('files', file));
 
   const { data } = await api.post('/document-jobs', formData, {
@@ -39,11 +40,34 @@ export const generateExcelApi = async (jobId, payload = {}) => {
   return data;
 };
 
-export const sendAiChatApi = async ({ message, context }) => {
+export const sendAiChatApi = async ({ message, context, sessionId, jobId, tableId }) => {
   const { data } = await api.post('/document-jobs/chat', {
     message: message || '',
-    context: context || {}
+    context: context || {},
+    sessionId: sessionId || null,
+    jobId: jobId || null,
+    tableId: tableId || null
   });
+  return data;
+};
+
+export const listChatSessionsApi = async () => {
+  const { data } = await api.get('/document-jobs/chats');
+  return data;
+};
+
+export const createChatSessionApi = async (payload = {}) => {
+  const { data } = await api.post('/document-jobs/chats', payload);
+  return data;
+};
+
+export const getChatSessionApi = async (sessionId) => {
+  const { data } = await api.get(`/document-jobs/chats/${sessionId}`);
+  return data;
+};
+
+export const listDownloadsApi = async () => {
+  const { data } = await api.get('/document-jobs/downloads');
   return data;
 };
 

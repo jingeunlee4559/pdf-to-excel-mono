@@ -29,7 +29,7 @@ export default function RegisterPage() {
     <div className="grid min-h-screen place-items-center bg-white px-5 py-10">
       <div className="w-full max-w-[560px] rounded-[32px] border border-slate-200 bg-white p-6 shadow-soft sm:p-8">
         <div className="text-center">
-          <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-3xl bg-brand-600 text-xl font-black text-white shadow-glow">AI</div>
+          <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-3xl bg-gradient-to-br from-brand-500 to-brand-300 text-xl font-black text-white shadow-glow">AI</div>
           <h1 className="mt-5 text-3xl font-black tracking-[-0.03em] text-slate-950">회원가입</h1>
           <p className="mt-2 text-sm text-slate-500">일반 사용자 권한으로 생성됩니다.</p>
         </div>
@@ -49,7 +49,7 @@ export default function RegisterPage() {
           </label>
           <Input label="직책" value={form.positionName} onChange={(v) => update('positionName', v)} />
           {message && <p className="sm:col-span-2 rounded-2xl bg-brand-50 px-4 py-3 text-sm font-bold text-brand-700">{message}</p>}
-          <button disabled={loading} className="sm:col-span-2 rounded-2xl bg-slate-950 px-4 py-3 text-sm font-black text-white hover:bg-brand-700 disabled:bg-slate-400">{loading ? '처리 중...' : '회원가입'}</button>
+          <button disabled={loading} className="sm:col-span-2 rounded-2xl bg-gradient-to-r from-brand-500 to-brand-400 px-4 py-3 text-sm font-black text-white shadow-glow hover:from-brand-600 hover:to-brand-500 disabled:from-slate-300 disabled:to-slate-300">{loading ? '처리 중...' : '회원가입'}</button>
         </form>
 
         <div className="mt-5 text-center text-sm text-slate-500">

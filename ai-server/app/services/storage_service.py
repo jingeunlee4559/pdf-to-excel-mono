@@ -20,8 +20,27 @@ def ensure_storage() -> None:
         (STORAGE_DIR / name).mkdir(parents=True, exist_ok=True)
 
 
+def _score_korean_filename(text: str) -> int:
+    hangul = len(re.findall(r"[가-힣]", text or ""))
+    mojibake = len(re.findall(r"[ÃÂêëìíðÐ�]", text or ""))
+    return hangul * 3 - mojibake * 5
+
+
+def repair_mojibake_filename(filename: str | None) -> str:
+    raw = str(filename or "upload.bin").replace("\r", " ").replace("\n", " ").strip() or "upload.bin"
+    candidates = [raw]
+    for src_enc, dst_enc in (("latin1", "utf-8"), ("cp1252", "utf-8")):
+        try:
+            repaired = raw.encode(src_enc, errors="strict").decode(dst_enc, errors="strict")
+            candidates.append(repaired)
+        except Exception:
+            pass
+    best = max(candidates, key=_score_korean_filename)
+    return re.sub(r"\s+", " ", best).strip() or "upload.bin"
+
+
 def safe_filename(filename: str | None) -> str:
-    raw = filename or "upload.bin"
+    raw = repair_mojibake_filename(filename)
     name = Path(raw).name
     stem = Path(name).stem
     suffix = Path(name).suffix.lower()
@@ -32,7 +51,7 @@ def safe_filename(filename: str | None) -> str:
 async def save_upload_file(upload_file: UploadFile, upload_type: str = "documents") -> dict:
     ensure_storage()
     normalized_type = upload_type if upload_type in ALLOWED_UPLOAD_TYPES else "documents"
-    original_name = upload_file.filename or "upload.bin"
+    original_name = repair_mojibake_filename(upload_file.filename)
     safe_name = safe_filename(original_name)
     stored_name = f"{uuid.uuid4().hex}_{safe_name}"
     target_path = (STORAGE_DIR / normalized_type / stored_name).resolve()

@@ -3,16 +3,19 @@ from __future__ import annotations
 import csv
 import io
 import json
+import logging
 import os
 import re
+import time
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Tuple
 
 from fastapi import UploadFile
 
 from app.services.llm_client import call_local_llm_json, get_llm_config
-from app.services.storage_service import save_upload_file, validate_storage_path
-from app.services.unit_normalizer import enrich_row_units
+from app.services.storage_service import repair_mojibake_filename, save_upload_file, validate_storage_path
+from app.services.unit_normalizer import clean_cell_text, enrich_row_units
 
 DEFAULT_COLUMNS = [
     {"key": "vendor_name", "label": "업체명"},
@@ -25,7 +28,437 @@ DEFAULT_COLUMNS = [
     {"key": "remark", "label": "비고"},
 ]
 
+STANDARD_MARKET_PRICE_COLUMNS = [
+    {"key": "construction_code", "label": "공종코드"},
+    {"key": "item_name", "label": "공종명칭"},
+    {"key": "spec", "label": "규격"},
+    {"key": "unit", "label": "단위"},
+    {"key": "unit_price", "label": "단가"},
+    {"key": "labor_ratio", "label": "노무비율"},
+    {"key": "remark", "label": "비고"},
+]
+
+REFERENCE_GUIDELINE_COLUMNS = [
+    {"key": "section", "label": "구분/장절"},
+    {"key": "basis_item", "label": "기준 항목"},
+    {"key": "application_basis", "label": "적용 기준"},
+    {"key": "calculation_method", "label": "계산/적용 방식"},
+    {"key": "unit_price_basis", "label": "단가 기준"},
+    {"key": "source_page", "label": "근거 페이지"},
+    {"key": "remark", "label": "비고"},
+]
+
+REFERENCE_TABLE_TYPES = {"REFERENCE_GUIDELINE_TABLE", "GUIDELINE_SUMMARY_TABLE"}
+STANDARD_MARKET_TABLE_TYPES = {"STANDARD_MARKET_PRICE_TABLE"}
+
+MULTI_VENDOR_COMPARE_TABLE_TYPE = "MULTI_VENDOR_PRICE_COMPARISON"
+
+
+def _safe_compare_key(label: str, index: int, suffix: str = "unit_price") -> str:
+    raw = compact_text(label) or f"vendor{index}"
+    m = re.search(r"([A-Za-z0-9]+)회사", str(label or ""), re.I)
+    if m:
+        base = f"company_{m.group(1).lower()}"
+    else:
+        base = re.sub(r"[^A-Za-z0-9]+", "_", raw).strip("_").lower() or f"vendor_{index}"
+    return f"{base}_{suffix}"
+
+
+def _extract_company_name(filename: str, text: str = "", rows: List[Dict[str, Any]] | None = None, index: int = 1) -> str:
+    source = f"{filename}\n{text[:1200]}"
+    patterns = [
+        r"([A-Za-z가-힣0-9]+회사)",
+        r"업체명\s*[:：]?\s*([^\n\r\t ]{1,40})",
+        r"회사명\s*[:：]?\s*([^\n\r\t ]{1,40})",
+        r"상호\s*[:：]?\s*([^\n\r\t ]{1,40})",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, source)
+        if m:
+            value = clean_cell_text(m.group(1))
+            if value:
+                return value[:40]
+    for row in rows or []:
+        value = clean_cell_text(row.get("vendor_name") or row.get("company_name") or "")
+        if value:
+            return value[:40]
+    stem = Path(filename or f"업체{index}").stem
+    return stem[:40] or f"업체{index}"
+
+
+
+
+def _iter_price_fields(row: Dict[str, Any]) -> List[Tuple[str, str]]:
+    fields: List[Tuple[str, str]] = []
+    for key, value in row.items():
+        key_text = str(key or "")
+        if key_text in {"unit_price", "standard_unit_price", "quote_unit_price", "amount"} or "단가" in key_text or "price" in key_text.lower():
+            cleaned = clean_number(value)
+            if cleaned:
+                fields.append((key_text, cleaned))
+    # 단가 컬럼류를 먼저, 금액은 후순위로 둔다.
+    fields.sort(key=lambda item: (0 if "unit_price" in item[0] or "단가" in item[0] or "price" in item[0].lower() else 1, item[0]))
+    return fields
+
+
+def _select_vendor_unit_price(row: Dict[str, Any]) -> str:
+    """업체 견적 행에서 실제 업체 제시 단가를 고른다.
+
+    표준시장단가 비교용 견적서에서는 첫 번째 단가가 기준단가, 두 번째 단가가
+    업체 견적단가인 경우가 많다. 컬럼명이 동적으로 들어와도 원문 컬럼 수와
+    차이/대비 컬럼 존재 여부로 판단한다.
+    """
+    if not isinstance(row, dict):
+        return ""
+    explicit = clean_number(row.get("quote_unit_price") or row.get("vendor_unit_price") or row.get("company_unit_price") or "")
+    if explicit:
+        return explicit
+    if clean_number(row.get("unit_price_2")):
+        return clean_number(row.get("unit_price_2"))
+    price_fields = [(k, v) for k, v in _iter_price_fields(row) if k not in {"amount", "standard_unit_price"}]
+    if len(price_fields) >= 2 and any("차이" in str(k) or "대비" in str(k) for k in row.keys()):
+        return price_fields[1][1]
+    return clean_number(row.get("unit_price") or row.get("단가") or "")
+
+
+def _select_standard_unit_price(row: Dict[str, Any]) -> str:
+    if not isinstance(row, dict):
+        return ""
+    explicit = clean_number(row.get("standard_unit_price") or row.get("reference_unit_price") or "")
+    if explicit:
+        return explicit
+    if clean_number(row.get("unit_price_2")) and clean_number(row.get("unit_price")):
+        return clean_number(row.get("unit_price"))
+    return clean_number(row.get("unit_price") or "")
+
+
+def _looks_like_company_quote_document(filename: str, text: str, rows: List[Dict[str, Any]] | None = None) -> bool:
+    """업체 견적/내역 문서 여부를 구조적으로 판단한다.
+
+    표준시장단가 비교용 견적서에는 본문에 `표준시장단가`라는 단어가 같이
+    들어갈 수 있다. 그래서 `표준시장단가` 단어만으로 기준 단가집으로
+    분류하지 않고, 견적서 표지/업체 정보/견적단가 컬럼/차이 컬럼의
+    조합을 함께 확인한다.
+    """
+    compact = compact_text(f"{filename}\n{text[:6000]}")
+    rows = rows or []
+    has_quote_title = any(marker in compact for marker in ["견적서", "견적단가", "공종별견적단가", "공사견적", "내역서"])
+    has_company_meta = any(marker in compact for marker in ["업체명", "회사명", "사업자번호", "대표자", "견적일자"])
+    has_compare_columns = any(marker in compact for marker in ["차이", "대비", "견적단가", "합계금액"])
+    has_quote_rows = sum(
+        1
+        for row in rows
+        if str(row.get("item_name") or "").strip()
+        and (_select_vendor_unit_price(row) or row.get("amount") or row.get("unit_price"))
+    ) >= 2
+    return bool((has_quote_title and (has_company_meta or has_compare_columns)) or (has_company_meta and has_quote_rows))
+
+
+def _is_standard_market_file(filename: str, text: str, rows: List[Dict[str, Any]] | None = None) -> bool:
+    # 업체 견적서가 `표준시장단가 비교용` 문구를 포함하는 경우를 우선 제외한다.
+    if _looks_like_company_quote_document(filename, text, rows):
+        return False
+    compact = compact_text(f"{filename}\n{text[:8000]}")
+    title_like = any(marker in compact for marker in ["건설공사표준시장단가", "표준시장단가적용공종및단가", "표준시장단가적용공종"])
+    schema_like = all(marker in compact for marker in ["공종코드", "공종명칭", "노무비율"])
+    return bool(title_like and schema_like)
+
+
+def _is_estimate_file(filename: str, text: str, rows: List[Dict[str, Any]]) -> bool:
+    if _is_standard_market_file(filename, text, rows):
+        return False
+    compact = compact_text(f"{filename}\n{text[:5000]}")
+    has_estimate_word = any(word in compact for word in ["견적서", "견적", "업체명", "회사명", "합계금액", "공사견적", "내역서"])
+    has_price_rows = sum(1 for row in rows if _select_vendor_unit_price(row) and str(row.get("item_name") or "").strip()) >= 2
+    return bool(has_estimate_word or has_price_rows)
+
+
+def _row_match_key(row: Dict[str, Any]) -> str:
+    code = compact_text(row.get("construction_code"))
+    if code:
+        return f"code:{code}"
+    item = compact_text(row.get("item_name"))
+    spec = compact_text(row.get("spec"))
+    unit = compact_text(row.get("unit_normalized") or row.get("unit"))
+    return f"text:{item}|{spec}|{unit}"
+
+
+def _row_relaxed_key(row: Dict[str, Any]) -> str:
+    return f"{compact_text(row.get('item_name'))}|{compact_text(row.get('spec'))}"
+
+
+def _row_item_key(row: Dict[str, Any]) -> str:
+    return compact_text(row.get("item_name"))
+
+
+def _find_reference_row(company_row: Dict[str, Any], reference_rows: List[Dict[str, Any]]) -> Dict[str, Any] | None:
+    if not reference_rows:
+        return None
+    code = compact_text(company_row.get("construction_code"))
+    if code:
+        for ref in reference_rows:
+            if compact_text(ref.get("construction_code")) == code:
+                return ref
+    relaxed = _row_relaxed_key(company_row)
+    if relaxed != "|":
+        for ref in reference_rows:
+            if _row_relaxed_key(ref) == relaxed:
+                return ref
+    item = _row_item_key(company_row)
+    unit = clean_cell_text(company_row.get("unit_normalized") or company_row.get("unit"))
+    if item:
+        candidates = [ref for ref in reference_rows if _row_item_key(ref) == item]
+        if unit:
+            same_unit = [ref for ref in candidates if clean_cell_text(ref.get("unit_normalized") or ref.get("unit")) == unit]
+            if same_unit:
+                return same_unit[0]
+        if candidates:
+            return candidates[0]
+    return None
+
+
+def _extract_focus_terms(user_request: str, company_rows: List[Dict[str, Any]], reference_rows: List[Dict[str, Any]]) -> List[str]:
+    """사용자 요청에서 실제 검색 대상 공종/품목을 추출한다.
+
+    하드코딩된 공종 목록은 사용하지 않는다. 사용자가 입력한 문장과
+    실제 파싱된 행의 공종명칭/품목명/공종코드가 교차하는 경우에만
+    필터 조건으로 채택한다.
+    """
+    req = compact_text(user_request)
+    if not req:
+        return []
+    candidates: List[str] = []
+    available_terms: List[str] = []
+
+    for row in [*(company_rows or []), *(reference_rows or [])]:
+        for key in ["item_name", "construction_code", "spec"]:
+            value = clean_cell_text(row.get(key) or "")
+            compact_value = compact_text(value)
+            if len(compact_value) >= 2:
+                available_terms.append(compact_value)
+
+    for term in sorted(set(available_terms), key=len, reverse=True):
+        if term and term in req:
+            candidates.append(term)
+
+    # 보조 패턴도 실제 추출된 행에 존재하는 값과 교차할 때만 사용한다.
+    raw_terms = []
+    for m in re.finditer(r"([가-힣A-Za-z0-9·./()\-]{2,40})(?:만|를|을|로|기준|비교|표|찾아|검색)", str(user_request or "")):
+        raw_terms.append(compact_text(m.group(1)))
+
+    generic = {"단가", "견적", "비교", "표준", "시장", "파일", "회사", "업체", "공종", "표", "자료", "문서", "정리"}
+    for raw in raw_terms:
+        if len(raw) < 2 or raw in generic:
+            continue
+        for term in available_terms:
+            if raw in term or term in raw:
+                candidates.append(term if len(term) >= len(raw) else raw)
+
+    candidates = [c for c in candidates if len(c) >= 2 and c not in generic]
+    return sorted(set(candidates), key=len, reverse=True)
+
+
+def _filter_rows_by_focus(rows: List[Dict[str, Any]], focus_terms: List[str]) -> List[Dict[str, Any]]:
+    if not focus_terms:
+        return rows
+    filtered: List[Dict[str, Any]] = []
+    for row in rows:
+        haystack = compact_text(" ".join([
+            str(row.get("item_name") or ""),
+            str(row.get("construction_code") or ""),
+            str(row.get("spec") or ""),
+        ]))
+        if any(term in haystack or haystack in term for term in focus_terms):
+            filtered.append(row)
+    return filtered
+
+
+def _format_price_diff(company_price: float, standard_price: float) -> str:
+    if not company_price or not standard_price:
+        return ""
+    diff = company_price - standard_price
+    pct = (diff / standard_price) * 100 if standard_price else 0
+    sign = "+" if diff > 0 else ""
+    return f"{sign}{diff:,.0f} ({sign}{pct:.1f}%)"
+
+
+def build_multi_vendor_price_comparison(parsed_files: List[Dict[str, Any]], user_request: str = "") -> Dict[str, Any] | None:
+    if len(parsed_files or []) < 2:
+        return None
+    request = str(user_request or "")
+    wants_compare = any(word in request for word in ["비교", "단가", "최저", "견적", "업체", "회사"])
+    if not wants_compare:
+        return None
+
+    reference_rows: List[Dict[str, Any]] = []
+    vendor_sources: List[Dict[str, Any]] = []
+    for idx, file in enumerate(parsed_files, start=1):
+        filename = str(file.get("originalName") or file.get("original_name") or "")
+        text = str(file.get("extractedText") or file.get("extracted_text") or "")
+        rows = [enrich_row_units(dict(row)) for row in (file.get("parsedRows") or file.get("rows") or []) if isinstance(row, dict)]
+        if _is_standard_market_file(filename, text, rows):
+            text_rows = extract_standard_market_rows_from_text(text, max_rows=0)
+            if rows:
+                rows = [row for row in rows if str(row.get("item_name") or "").strip() and str(row.get("unit_price") or "").strip()]
+                reference_rows.extend(merge_standard_market_rows(rows, text_rows))
+            else:
+                reference_rows.extend(text_rows)
+            continue
+        if _is_estimate_file(filename, text, rows):
+            company = _extract_company_name(filename, text, rows, idx)
+            vendor_rows: List[Dict[str, Any]] = []
+            for row in rows:
+                if not str(row.get("item_name") or "").strip():
+                    continue
+                quote_price = _select_vendor_unit_price(row)
+                if not str(quote_price or row.get("amount") or "").strip():
+                    continue
+                next_row = dict(row)
+                next_row["vendor_name"] = company
+                next_row["source_file_name"] = filename
+                next_row["quote_unit_price"] = quote_price
+                standard_price_in_row = _select_standard_unit_price(row)
+                if standard_price_in_row:
+                    next_row["standard_unit_price"] = standard_price_in_row
+                vendor_rows.append(enrich_row_units(next_row))
+            if vendor_rows:
+                vendor_sources.append({"name": company, "filename": filename, "rows": vendor_rows})
+
+    if len(vendor_sources) < 2:
+        return None
+
+    all_vendor_rows = [row for source in vendor_sources for row in source["rows"]]
+    focus_terms = _extract_focus_terms(request, all_vendor_rows, reference_rows)
+    if focus_terms:
+        for source in vendor_sources:
+            source["rows"] = _filter_rows_by_focus(source["rows"], focus_terms)
+        vendor_sources = [source for source in vendor_sources if source.get("rows")]
+        reference_rows = _filter_rows_by_focus(reference_rows, focus_terms)
+        if len(vendor_sources) < 2:
+            return {
+                "tableName": "업체별 단가 비교표",
+                "tableType": MULTI_VENDOR_COMPARE_TABLE_TYPE,
+                "columns": [
+                    {"key": "item_name", "label": "공종명칭"},
+                    {"key": "remark", "label": "비고"},
+                ],
+                "rows": [{
+                    "item_name": ", ".join(focus_terms),
+                    "remark": "요청한 공종이 2개 이상 업체 견적서에서 동시에 확인되지 않아 비교표를 만들 수 없습니다.",
+                }],
+                "meta": {"vendorCount": len(vendor_sources), "vendors": [{"name": item["name"], "filename": item["filename"]} for item in vendor_sources], "referenceRows": len(reference_rows), "focusTerms": focus_terms},
+            }
+
+    groups: Dict[str, Dict[str, Any]] = {}
+    for source in vendor_sources:
+        for row in source["rows"]:
+            key = _row_match_key(row)
+            if key in {"text:||", "text:|"}:
+                continue
+            group = groups.setdefault(key, {"sample": row, "vendors": {}, "sourceFiles": set()})
+            group["vendors"][source["name"]] = row
+            group["sourceFiles"].add(source["filename"])
+    if not groups:
+        return None
+
+    columns: List[Dict[str, str]] = [
+        {"key": "construction_code", "label": "공종코드"},
+        {"key": "item_name", "label": "공종명칭"},
+        {"key": "spec", "label": "규격"},
+        {"key": "unit", "label": "단위"},
+        {"key": "standard_unit_price", "label": "표준시장단가"},
+    ]
+    vendor_key_map: Dict[str, str] = {}
+    for idx, source in enumerate(vendor_sources, start=1):
+        key = _safe_compare_key(source["name"], idx, "unit_price")
+        vendor_key_map[source["name"]] = key
+        columns.append({"key": key, "label": f"{source['name']} 단가"})
+    columns.extend([
+        {"key": "lowest_vendor", "label": "최저 업체"},
+        {"key": "lowest_unit_price", "label": "최저 단가"},
+        {"key": "lowest_vs_standard", "label": "최저-표준 차이"},
+        {"key": "labor_ratio", "label": "노무비율"},
+        {"key": "remark", "label": "비고"},
+    ])
+
+    result_rows: List[Dict[str, Any]] = []
+    for _, group in sorted(groups.items(), key=lambda kv: (str(kv[1]["sample"].get("item_name") or ""), str(kv[1]["sample"].get("spec") or ""))):
+        sample = group["sample"]
+        ref = _find_reference_row(sample, reference_rows)
+        standard_price_text = clean_number((ref or {}).get("unit_price") or sample.get("standard_unit_price") or "")
+        standard_price = to_number(standard_price_text)
+        unit = clean_cell_text(sample.get("unit_normalized") or sample.get("unit") or (ref or {}).get("unit") or "")
+        out: Dict[str, Any] = {
+            "construction_code": clean_cell_text(sample.get("construction_code") or (ref or {}).get("construction_code") or ""),
+            "item_name": clean_cell_text(sample.get("item_name") or (ref or {}).get("item_name") or ""),
+            "spec": clean_cell_text(sample.get("spec") or (ref or {}).get("spec") or ""),
+            "unit": unit,
+            "standard_unit_price": standard_price_text,
+            "labor_ratio": clean_cell_text((ref or {}).get("labor_ratio") or sample.get("labor_ratio") or ""),
+            "remark": "",
+        }
+        vendor_prices: List[Tuple[float, str]] = []
+        units = {unit} if unit else set()
+        for source in vendor_sources:
+            vendor = source["name"]
+            vrow = group["vendors"].get(vendor)
+            col_key = vendor_key_map[vendor]
+            if not vrow:
+                out[col_key] = ""
+                continue
+            price_text = clean_number(vrow.get("quote_unit_price") or _select_vendor_unit_price(vrow) or vrow.get("amount") or "")
+            out[col_key] = price_text
+            price = to_number(price_text)
+            if price:
+                vendor_prices.append((price, vendor))
+            vunit = clean_cell_text(vrow.get("unit_normalized") or vrow.get("unit") or "")
+            if vunit:
+                units.add(vunit)
+        if vendor_prices:
+            lowest_price, lowest_vendor = min(vendor_prices, key=lambda item: item[0])
+            out["lowest_vendor"] = lowest_vendor
+            out["lowest_unit_price"] = f"{lowest_price:,.0f}"
+            out["lowest_vs_standard"] = _format_price_diff(lowest_price, standard_price)
+        else:
+            out["lowest_vendor"] = ""
+            out["lowest_unit_price"] = ""
+            out["lowest_vs_standard"] = ""
+        remarks = []
+        if len([u for u in units if u]) >= 2:
+            remarks.append(f"단위 확인 필요: {', '.join(sorted(units))}")
+        if not ref and not standard_price_text:
+            remarks.append("표준시장단가 기준 행 미매칭")
+        out["remark"] = " / ".join(remarks)
+        result_rows.append(out)
+        if len(result_rows) >= _env_int("MULTI_COMPARE_MAX_ROWS", 300):
+            break
+
+    if not result_rows:
+        return None
+    columns = prune_empty_columns(columns, result_rows)
+    return {
+        "tableName": "업체별 단가 비교표",
+        "tableType": MULTI_VENDOR_COMPARE_TABLE_TYPE,
+        "columns": columns,
+        "rows": result_rows,
+        "meta": {
+            "vendorCount": len(vendor_sources),
+            "vendors": [{"name": item["name"], "filename": item["filename"]} for item in vendor_sources],
+            "referenceRows": len(reference_rows),
+            "focusTerms": focus_terms,
+        },
+    }
+
+
+REFERENCE_TABLE_KEYWORDS = [
+    "단가", "가격", "계약단가", "거래실례가격", "노임단가", "정부노임단가",
+    "요율", "산정", "산출", "계산", "적용기준", "산정기준", "기준",
+    "할증", "품셈", "경비", "노무비", "재료비", "자재", "전력비", "기본요금",
+]
+
 FIELD_ALIASES = {
+    "construction_code": ["공종코드", "코드", "code"],
+    "labor_ratio": ["노무비율", "노무 비율", "노무율", "labor"],
     "vendor_name": ["업체", "업체명", "거래처", "공급업체", "회사명", "상호", "시공사", "견적업체"],
     "item_name": ["품목", "품목명", "자재", "자재명", "내역", "공종", "작업명", "명칭", "품명"],
     "spec": ["규격", "사양", "모델", "크기", "치수", "규격명"],
@@ -39,9 +472,65 @@ FIELD_ALIASES = {
 NUMBER_KEYS = {"quantity", "unit_price", "amount", "supply_amount", "tax_amount"}
 PRICE_COMPARE_WORDS = ["단가", "견적", "비교", "업체", "최저", "최고", "가격", "견적서"]
 
+logger = logging.getLogger("app.document_analyzer")
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(str(os.getenv(name, default)).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(str(os.getenv(name, default)).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _new_parse_logger(scope: str) -> Tuple[List[Dict[str, Any]], Callable[..., None]]:
+    # 기본은 터미널 로그만 남긴다.
+    # 프론트/API 응답으로 로그를 보내고 싶을 때만 RETURN_PARSE_LOGS=true로 켠다.
+    logs: List[Dict[str, Any]] = []
+    capture_logs = _env_bool("RETURN_PARSE_LOGS", False)
+
+    def write(level: str, message: str, **data: Any) -> None:
+        clean_data = {k: v for k, v in data.items() if v is not None}
+        suffix = " ".join(f"{key}={value}" for key, value in clean_data.items())
+        text = f"[{scope}] {message}" + (f" {suffix}" if suffix else "")
+        if capture_logs:
+            logs.append({
+                "time": datetime.now().isoformat(timespec="seconds"),
+                "level": level.upper(),
+                "message": text,
+                "data": clean_data,
+            })
+        log_fn = getattr(logger, level.lower(), logger.info)
+        log_fn(text)
+
+    return logs, write
+
+
+def _limit_pages(total_pages: int, env_name: str = "PDF_MAX_PAGES") -> int:
+    # 0 또는 음수는 전체 페이지 처리. 기존 50페이지 제한을 제거하기 위한 기본값이다.
+    limit = _env_int(env_name, 0)
+    if limit <= 0:
+        return total_pages
+    return min(total_pages, limit)
+
 
 
 DOCUMENT_TYPE_RULES = [
+    ("표준시장단가표", ["건설공사표준시장단가", "표준시장단가", "공종코드", "노무비율"]),
+    ("기준서/지침서", ["지침서", "적용기준", "표준품셈", "품셈", "적산", "공사원가", "건축견적지침서"]),
     ("Use Case 명세서", ["use case", "유스케이스", "use case id", "actor 정의", "main flow", "alternative flow"]),
     ("업무 프로세스 명세서", ["프로세스", "as-is", "to-be", "업무 흐름"]),
     ("요구사항 정의서", ["요구사항", "기능 요구", "비기능 요구", "요구사항 id"]),
@@ -65,7 +554,7 @@ def source_has_value(source_text: str, value: Any) -> bool:
     if not compact:
         return True
     # 너무 일반적인 단어/단위는 근거 검증 대상으로 보지 않는다.
-    if compact in {"개", "m", "ea", "pcs", "box", "set", "lot", "식", "원", "-", "none", "null"}:
+    if compact in {"개", "개소", "본", "m", "m2", "m3", "㎡", "㎥", "공m3", "공㎥", "ea", "pcs", "box", "set", "lot", "식", "원", "-", "none", "null"}:
         return True
     # 숫자는 구분자를 제거하고 확인한다.
     if re.fullmatch(r"[0-9,\.\-]+", compact):
@@ -78,6 +567,13 @@ def infer_document_profile(text: str, user_request: str = "") -> Dict[str, Any]:
     """문서 유형을 키워드 하나로 과잉 분류하지 않고, 제목/구조 기반으로 보수적으로 판별한다."""
     lower = text.lower()
     compact = compact_text(text)
+
+    if is_standard_market_price_document(text):
+        return {
+            "documentType": "표준시장단가표",
+            "purpose": "공종별 표준시장단가 표 추출 및 단가 확인",
+            "confidence": 0.9,
+        }
 
     for doc_type, keywords in DOCUMENT_TYPE_RULES:
         score = sum(1 for kw in keywords if compact_text(kw) in compact or kw in lower)
@@ -94,7 +590,7 @@ def infer_document_profile(text: str, user_request: str = "") -> Dict[str, Any]:
         if kw in text:
             price_structural_score += 1
     request_price = any(word in (user_request or "") for word in ["단가", "견적", "비교", "가격"])
-    if price_structural_score >= 5 and ("견적" in text or "단가" in text or request_price):
+    if price_structural_score >= 5 and ("견적" in text or "단가" in text or request_price) and not is_reference_or_guideline_document(text):
         return {
             "documentType": "견적서/단가표",
             "purpose": "단가 및 금액 비교용 표 데이터 생성",
@@ -154,7 +650,7 @@ def filter_grounded_rows(rows: List[Dict[str, Any]], source_text: str) -> List[D
     for row in rows:
         if not isinstance(row, dict):
             continue
-        if is_business_row_supported(row, source_text):
+        if is_reference_row_supported(row, source_text) or is_business_row_supported(row, source_text):
             filtered.append(row)
     return filtered
 
@@ -165,8 +661,322 @@ def is_narrative_document(text: str) -> bool:
     return sum(1 for marker in narrative_markers if marker in compact) >= 2
 
 
+def is_reference_or_guideline_document(text: str) -> bool:
+    compact = compact_text(text)
+    markers = ["건축견적지침서", "지침서", "적용기준", "표준품셈", "품셈의정의", "적산및견적", "공사원가", "관계법령"]
+    return sum(1 for marker in markers if compact_text(marker) in compact) >= 2
+
+
+def is_standard_market_price_document(text: str) -> bool:
+    compact = compact_text(text)
+    # 업체 견적서도 `표준시장단가 비교용`, `공종코드`, `공종명칭`을 포함할 수 있다.
+    # 기준 단가집으로 확정하려면 표준시장단가 문구와 함께 노무비율 컬럼까지 확인한다.
+    return "표준시장단가" in compact and "공종코드" in compact and "공종명칭" in compact and "노무비율" in compact
+
+
+def _split_text_pages(text: str) -> List[Dict[str, Any]]:
+    """PyMuPDF/pdfplumber가 붙인 [page N / T] 마커 기준으로 페이지를 나눈다."""
+    if not text:
+        return []
+    pattern = re.compile(r"\[page\s+(\d+)\s*/\s*(\d+)(?:\s+OCR)?\]", re.I)
+    matches = list(pattern.finditer(text))
+    if not matches:
+        return [{"page": None, "text": text}]
+    pages: List[Dict[str, Any]] = []
+    for idx, match in enumerate(matches):
+        start = match.end()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        pages.append({"page": int(match.group(1)), "pageCount": int(match.group(2)), "text": text[start:end]})
+    return pages
+
+
+def _clean_line(value: Any, limit: int = 220) -> str:
+    clean = re.sub(r"\s+", " ", str(value or "")).strip(" -·•\t")
+    return clean[:limit]
+
+
+
+
+def _coalesce_standard_market_lines(page_text: str) -> List[str]:
+    """표준시장단가 PDF의 행을 텍스트 라인 기준으로 재조립한다.
+
+    PyMuPDF/pdfplumber는 m², m³, 공m³ 같은 위첨자와 다단 셀을 줄바꿈으로
+    분리하는 경우가 많다. 예: `... m` 다음 줄 `2 24,973 63%`.
+    이 함수는 공종코드로 시작하는 라인을 기준으로 뒤따르는 줄을 붙여
+    코드/명칭/규격/단위/단가/노무비율 행을 복구한다.
+    """
+    lines = [_clean_line(line, 260) for line in str(page_text or '').splitlines()]
+    lines = [line for line in lines if line]
+    merged: List[str] = []
+    code_re = re.compile(r"^[A-Z]{1,3}\d{3}\.\d{5}\b")
+    tail_re = re.compile(r"\s(?:\d|공?m\s*[23]|[㎡㎥]|개|본|식|시간|hr|ton|kg|개소)\s+[0-9]{1,3}(?:,[0-9]{3})+\s+\d{1,3}(?:\.\d+)?%\s*$", re.I)
+
+    idx = 0
+    while idx < len(lines):
+        line = lines[idx]
+        if not code_re.match(line):
+            idx += 1
+            continue
+        buf = [line]
+        j = idx + 1
+        # 한 행은 길어도 5줄 내외다. 다음 코드/단가정의/단가보정이 나오면 중단한다.
+        while j < len(lines) and len(buf) < 7:
+            candidate = " ".join(buf)
+            if tail_re.search(candidate):
+                break
+            nxt = lines[j]
+            if code_re.match(nxt) or nxt.startswith("【") or nxt.startswith("■") or "공종코드" in nxt:
+                break
+            buf.append(nxt)
+            j += 1
+        merged.append(" ".join(buf))
+        idx = max(j, idx + 1)
+    return merged
+
+
+def _split_standard_market_body(body: str) -> Tuple[str, str, str, str, str]:
+    tail = re.search(
+        r"(?P<unit>공\s*m\s*[23]|공㎥|m\s*[23]|㎡|㎥|개소|개|본|식|시간|hr|ton|kg|m|대|조|매|장)\s+"
+        r"(?P<price>[0-9]{1,3}(?:,[0-9]{3})+|[0-9]{3,})\s+"
+        r"(?P<labor>\d{1,3}(?:\.\d+)?%)\s*$",
+        body,
+        re.I,
+    )
+    if not tail:
+        return "", "", "", "", ""
+
+    prefix = body[:tail.start()].strip()
+    unit = tail.group("unit")
+    price = tail.group("price")
+    labor = tail.group("labor")
+
+    # 규격은 보통 숫자/H=/ℓ=/Type/φ/Φ/D= 등으로 시작한다.
+    spec_marker = re.search(r"(?=\b(?:H|B|L|D)\s*=|[ℓøØφΦ∅]|\bType\b|\bTYPE\b|\d|[-–])", prefix)
+    if spec_marker and spec_marker.start() > 0:
+        item_name = prefix[:spec_marker.start()].strip()
+        spec = prefix[spec_marker.start():].strip()
+    else:
+        parts = prefix.rsplit(" ", 1)
+        item_name = parts[0].strip() if len(parts) > 1 else prefix.strip()
+        spec = parts[1].strip() if len(parts) > 1 else "-"
+
+    item_name = re.sub(r"\s+", " ", item_name).strip()
+    spec = re.sub(r"\s+", " ", spec).strip() or "-"
+    return item_name, spec, unit, price, labor
+
+
+def extract_standard_market_rows_from_text(text: str, max_rows: int | None = None) -> List[Dict[str, Any]]:
+    """표준시장단가 문서 전용 텍스트 파서.
+
+    pdfplumber가 표의 왼쪽 공종코드/오른쪽 노무비율 컬럼을 누락하는 PDF가 있어
+    PyMuPDF 텍스트 라인에서 해당 값을 보강한다.
+    """
+    if max_rows is None:
+        limit = _env_int("PDF_TABLE_MAX_ROWS", 500)
+    elif max_rows <= 0:
+        limit = 10**9
+    else:
+        limit = max_rows
+    if limit <= 0:
+        limit = 10**9
+
+    rows: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    row_re = re.compile(r"^(?P<code>[A-Z]{1,3}\d{3}\.\d{5})\s+(?P<body>.+)$")
+    for page in _split_text_pages(text):
+        page_no = page.get("page")
+        for line in _coalesce_standard_market_lines(str(page.get("text") or "")):
+            match = row_re.match(line)
+            if not match:
+                continue
+            code = match.group("code").strip()
+            body = match.group("body").strip()
+            item_name, spec, unit, price, labor = _split_standard_market_body(body)
+            if not price or not labor:
+                continue
+            key = compact_text(f"{code}|{item_name}|{spec}|{unit}|{price}|{labor}")
+            if key in seen:
+                continue
+            seen.add(key)
+            row = enrich_row_units({
+                "construction_code": code,
+                "item_name": clean_cell_text(item_name),
+                "spec": clean_cell_text(spec),
+                "unit": clean_cell_text(unit),
+                "unit_price": clean_number(price),
+                "labor_ratio": clean_cell_text(labor),
+                "source_page": f"p.{page_no}" if page_no else "",
+            })
+            rows.append(row)
+            if len(rows) >= limit:
+                return rows
+    return rows
+
+
+def merge_standard_market_rows(table_rows: List[Dict[str, Any]], text_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """pdfplumber 표 행과 PyMuPDF 텍스트 행을 같은 순서 기준으로 병합한다."""
+    if not text_rows:
+        return table_rows
+    if not table_rows:
+        return text_rows
+
+    merged: List[Dict[str, Any]] = []
+    total = max(len(table_rows), len(text_rows))
+    for idx in range(total):
+        base = dict(table_rows[idx]) if idx < len(table_rows) else {}
+        extra = text_rows[idx] if idx < len(text_rows) else {}
+        row = dict(base)
+        # pdfplumber가 더 정확한 셀을 가진 경우는 유지하고, 누락된 코드/노무비율/페이지를 보강한다.
+        for key in ["construction_code", "labor_ratio", "source_page"]:
+            if not str(row.get(key, "")).strip() and str(extra.get(key, "")).strip():
+                row[key] = extra.get(key)
+        for key in ["item_name", "spec", "unit", "unit_price"]:
+            if not str(row.get(key, "")).strip() and str(extra.get(key, "")).strip():
+                row[key] = extra.get(key)
+        row = enrich_row_units(row)
+        merged.append(row)
+    return merged
+
+
+def prune_empty_columns(columns: List[Dict[str, Any]], rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """값이 전혀 없는 컬럼은 응답에서 제외한다."""
+    if not rows:
+        return columns
+    visible: List[Dict[str, Any]] = []
+    for col in columns:
+        key = col.get("key")
+        if not key:
+            continue
+        if any(str(row.get(key, "")).strip() for row in rows):
+            visible.append(col)
+    return visible or columns
+
+
+def _looks_like_section_heading(line: str) -> bool:
+    line = _clean_line(line, 120)
+    if not line or len(line) > 90:
+        return False
+    if re.match(r"^(?:제\s*\d+\s*[장절]|\d+(?:\.\d+){0,4}(?:[-ㅡ]\d+)?\.?)\s*[^0-9=]{1,70}$", line):
+        return True
+    if re.match(r"^[가-힣A-Za-z][가-힣A-Za-z0-9\s/·()\-'\[\]]{1,50}$", line) and any(k in line for k in ["기준", "단가", "방법", "요령", "할증", "품셈"]):
+        return True
+    return False
+
+
+def _find_section_heading(lines: List[str], index: int) -> str:
+    for back in range(index, max(-1, index - 18), -1):
+        if back < 0:
+            break
+        candidate = _clean_line(lines[back], 120)
+        if _looks_like_section_heading(candidate):
+            return candidate
+    return "본문 기준"
+
+
+def is_reference_row_supported(row: Dict[str, Any], source_text: str) -> bool:
+    if not isinstance(row, dict):
+        return False
+    basis = str(row.get("basis_item") or row.get("application_basis") or row.get("unit_price_basis") or "").strip()
+    if not basis:
+        return False
+    # 기준서 표는 문장 일부가 원문에 있으면 근거 있음으로 판단한다.
+    for key in ("basis_item", "application_basis", "calculation_method", "unit_price_basis"):
+        value = str(row.get(key) or "").strip()
+        if value and source_has_value(source_text, value[:80]):
+            return True
+    return False
+
+
+def extract_reference_guideline_rows(text: str, user_request: str = "", max_rows: int | None = None) -> List[Dict[str, Any]]:
+    """기준서/지침서 문서를 '품목 단가표'가 아니라 '기준 항목 표'로 변환한다.
+
+    원문에 없는 품목·금액을 만들지 않고, 문서 안에 실제 등장한 기준/단가/산정 문장만 행으로 만든다.
+    """
+    if not is_reference_or_guideline_document(text):
+        return []
+    max_rows = max_rows or max(_env_int("REFERENCE_TABLE_MAX_ROWS", 120), 20)
+    request = compact_text(user_request)
+    focus_price = any(k in request for k in ["단가", "가격", "견적", "비교", "원가"])
+    focus_table = any(k in request for k in ["표", "테이블", "정리", "엑셀", "양식"])
+    keywords = ["단가", "가격", "계약단가", "거래실례가격", "노임단가", "정부노임단가", "기본요금"] if focus_price else REFERENCE_TABLE_KEYWORDS
+    if not focus_table and not focus_price:
+        keywords = ["적용기준", "산정기준", "계산", "단가", "가격", "요율"]
+
+    rows: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for page in _split_text_pages(text):
+        page_no = page.get("page")
+        raw_lines = [line for line in str(page.get("text") or "").splitlines()]
+        lines = [_clean_line(line) for line in raw_lines]
+        for idx, line in enumerate(lines):
+            if not line or len(line) < 5:
+                continue
+            if not any(keyword in line for keyword in keywords):
+                continue
+
+            section = _find_section_heading(lines, idx)
+            context_parts = [line]
+            # 한 줄짜리 PDF 줄바꿈을 완화하기 위해 바로 다음 1~2줄만 근거 문맥으로 붙인다.
+            for next_idx in range(idx + 1, min(len(lines), idx + 3)):
+                nxt = lines[next_idx]
+                if not nxt or _looks_like_section_heading(nxt):
+                    break
+                if len(" ".join(context_parts)) < 180:
+                    context_parts.append(nxt)
+            basis = _clean_line(" ".join(context_parts), 260)
+            calculation = ""
+            if re.search(r"[=*×xX]|곱|나누|계산|산출|적용|가산|공제|요율|%", basis):
+                calculation = basis
+            unit_basis = basis if any(k in basis for k in ["단가", "가격", "요금", "노임", "거래실례"]) else ""
+            row_key = compact_text(f"{page_no}|{section}|{basis[:120]}")
+            if row_key in seen:
+                continue
+            seen.add(row_key)
+            rows.append({
+                "section": section,
+                "basis_item": section if section != "본문 기준" else basis[:40],
+                "application_basis": basis,
+                "calculation_method": calculation,
+                "unit_price_basis": unit_basis,
+                "source_page": f"p.{page_no}" if page_no else "",
+                "remark": "기준서 원문 키워드 기반 추출",
+            })
+            if len(rows) >= max_rows:
+                return rows
+
+    # 키워드가 너무 적을 때는 주요 장절 제목만 최소 표로 제공한다.
+    if not rows:
+        for page in _split_text_pages(text):
+            page_no = page.get("page")
+            for line in [_clean_line(v) for v in str(page.get("text") or "").splitlines()]:
+                if _looks_like_section_heading(line) and any(k in line for k in ["기준", "단가", "계산", "산출", "품셈"]):
+                    row_key = compact_text(f"{page_no}|{line}")
+                    if row_key in seen:
+                        continue
+                    seen.add(row_key)
+                    rows.append({
+                        "section": line,
+                        "basis_item": line,
+                        "application_basis": line,
+                        "calculation_method": "",
+                        "unit_price_basis": line if any(k in line for k in ["단가", "가격", "요금"]) else "",
+                        "source_page": f"p.{page_no}" if page_no else "",
+                        "remark": "기준서 장절 제목 기반 추출",
+                    })
+                    if len(rows) >= max_rows:
+                        return rows
+    return rows
+
+
 def normalize_header(header: Any) -> str:
-    compact = re.sub(r"\s+", "", str(header or "")).lower()
+    raw = str(header or "")
+    compact = re.sub(r"\s+", "", raw).lower()
+    if compact in {"가", "가격"}:
+        return "unit_price"
+    if "공종코드" in compact or compact == "code":
+        return "construction_code"
+    if "노무비율" in compact or "노무율" in compact:
+        return "labor_ratio"
     for key, aliases in FIELD_ALIASES.items():
         for alias in aliases:
             if re.sub(r"\s+", "", alias).lower() in compact:
@@ -200,7 +1010,7 @@ def rows_to_table(raw_rows: List[List[Any]]) -> List[Dict[str, Any]]:
 
     cleaned_rows = []
     for row in raw_rows:
-        values = ["" if v is None else str(v).strip() for v in row]
+        values = ["" if v is None else clean_cell_text(v) for v in row]
         while values and not values[-1]:
             values.pop()
         if any(values):
@@ -219,7 +1029,17 @@ def rows_to_table(raw_rows: List[List[Any]]) -> List[Dict[str, Any]]:
         if score >= 3:
             break
 
+    if best_score < 2:
+        return []
+
     headers = [normalize_header(cell) for cell in cleaned_rows[header_idx]]
+    # pdfplumber text 전략에서 '단위 단', '가'처럼 단가 헤더가 분리되는 경우 보정
+    for i in range(1, len(headers)):
+        raw_cell = re.sub(r"\s+", "", str(cleaned_rows[header_idx][i] or "")).lower()
+        prev_raw = re.sub(r"\s+", "", str(cleaned_rows[header_idx][i - 1] or "")).lower()
+        if headers[i] in {"field", "가", "unit_price"} and raw_cell in {"가", "가격"} and (headers[i - 1] == "unit" or "단위" in prev_raw):
+            headers[i] = "unit_price"
+
     normalized_headers = []
     seen: Dict[str, int] = {}
     for col in headers:
@@ -235,8 +1055,10 @@ def rows_to_table(raw_rows: List[List[Any]]) -> List[Dict[str, Any]]:
         for key, value in zip(normalized_headers, raw):
             if key in NUMBER_KEYS:
                 item[key] = clean_number(value)
+            elif key == "labor_ratio":
+                item[key] = clean_cell_text(value)
             else:
-                item[key] = str(value or "").strip()
+                item[key] = clean_cell_text(value)
         rows.append(enrich_row_units(item))
     return rows
 
@@ -278,62 +1100,568 @@ def read_xlsx(content: bytes) -> Tuple[str, List[Dict[str, Any]]]:
     return "\n".join(text_lines), rows_to_table(all_rows)
 
 
-def _read_pdf_with_pypdf(content: bytes) -> Tuple[str, int | None]:
-    try:
-        from pypdf import PdfReader
+def _read_pdf_with_pymupdf(
+    content: bytes,
+    filename: str = "",
+    log: Callable[..., None] | None = None,
+) -> Tuple[str, int | None, List[Dict[str, Any]], Dict[str, Any]]:
+    """PyMuPDF 기반 PDF 텍스트 추출.
 
-        reader = PdfReader(io.BytesIO(content))
-        page_texts = []
-        for idx, page in enumerate(reader.pages[:50]):
-            page_texts.append(f"[page {idx + 1}]\n" + (page.extract_text() or ""))
-        return "\n\n".join(page_texts), len(reader.pages)
-    except Exception:
-        return "", None
-
-
-def _read_pdf_tables_with_pdfplumber(content: bytes) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
-    try:
-        import pdfplumber
-    except Exception:
-        return rows
-
-    try:
-        with pdfplumber.open(io.BytesIO(content)) as pdf:
-            for page in pdf.pages[:30]:
-                for table in page.extract_tables() or []:
-                    parsed = rows_to_table(table)
-                    rows.extend(parsed)
-                    if len(rows) >= 200:
-                        return rows[:200]
-    except Exception:
-        return rows
-    return rows
-
-
-def _read_pdf_with_pymupdf(content: bytes) -> str:
+    - OCR을 사용하지 않는다.
+    - 기본값은 전체 페이지 추출이다(PDF_MAX_PAGES=0).
+    - pypdf의 /UniKS-UTF16-H 경고를 피하기 위해 pypdf를 기본 경로에서 제외한다.
+    """
+    started = time.perf_counter()
     try:
         import fitz  # PyMuPDF
-    except Exception:
-        return ""
+    except Exception as exc:
+        if log:
+            log("error", "PyMuPDF import failed", filename=filename, error=str(exc))
+        return "", None, [], {"engine": "pymupdf", "error": str(exc)}
+
     try:
         doc = fitz.open(stream=content, filetype="pdf")
-        parts = []
-        for idx, page in enumerate(doc[:50]):
-            parts.append(f"[page {idx + 1} blocks]\n" + page.get_text("text", sort=True))
-        return "\n\n".join(parts)
-    except Exception:
-        return ""
+        page_count = int(doc.page_count or 0)
+        pages_to_read = _limit_pages(page_count, "PDF_MAX_PAGES")
+        log_every = _env_int("PDF_LOG_EVERY_PAGES", 0)
+        parts: List[str] = []
+        page_meta: List[Dict[str, Any]] = []
+        empty_pages = 0
+        total_chars = 0
+
+        if log:
+            log(
+                "info",
+                "PDF parse start",
+                filename=filename,
+                engine="PyMuPDF",
+                text_layer=True,
+                page_count=page_count,
+                pages_to_read=pages_to_read,
+                size_bytes=len(content),
+            )
+
+        for idx in range(pages_to_read):
+            page = doc.load_page(idx)
+            text = page.get_text("text", sort=True) or ""
+            char_count = len(text)
+            total_chars += char_count
+            if not text.strip():
+                empty_pages += 1
+            parts.append(f"[page {idx + 1} / {page_count}]\n{text}".rstrip())
+            page_meta.append({
+                "page": idx + 1,
+                "pageCount": page_count,
+                "engine": "PyMuPDF",
+                "status": "TEXT_EXTRACTED" if text.strip() else "NO_TEXT_LAYER",
+                "charCount": char_count,
+            })
+            if log and log_every > 0 and ((idx + 1) == 1 or (idx + 1) % log_every == 0 or (idx + 1) == pages_to_read):
+                log(
+                    "info",
+                    "PDF parse progress",
+                    filename=filename,
+                    page=f"{idx + 1}/{page_count}",
+                    chars=total_chars,
+                    empty_pages=empty_pages,
+                )
+
+        elapsed = round(time.perf_counter() - started, 3)
+        truncated_by_limit = page_count > pages_to_read
+        if log:
+            log(
+                "info",
+                "PDF parse finish",
+                filename=filename,
+                engine="PyMuPDF",
+                text_layer=True,
+                page_count=page_count,
+                pages_read=pages_to_read,
+                chars=total_chars,
+                empty_pages=empty_pages,
+                elapsed_sec=elapsed,
+                truncated_by_limit=truncated_by_limit,
+            )
+        return "\n\n".join(parts), page_count, page_meta, {
+            "engine": "PyMuPDF",
+            "noOcr": True,
+            "pageCount": page_count,
+            "pagesRead": pages_to_read,
+            "charCount": total_chars,
+            "emptyPages": empty_pages,
+            "elapsedSec": elapsed,
+            "truncatedByLimit": truncated_by_limit,
+        }
+    except Exception as exc:
+        if log:
+            log("error", "PyMuPDF parse failed", filename=filename, error=str(exc))
+        return "", None, [], {"engine": "PyMuPDF", "noOcr": True, "error": str(exc)}
 
 
-def read_pdf(content: bytes) -> Tuple[str, List[Dict[str, Any]], int | None]:
-    text, page_count = _read_pdf_with_pypdf(content)
-    rows = _read_pdf_tables_with_pdfplumber(content)
-    if len(text.strip()) < 80:
-        fallback_text = _read_pdf_with_pymupdf(content)
-        if len(fallback_text.strip()) > len(text.strip()):
-            text = fallback_text
-    return text, rows, page_count
+def _read_pdf_text_with_pdfplumber(
+    content: bytes,
+    filename: str = "",
+    log: Callable[..., None] | None = None,
+) -> Tuple[str, int | None, List[Dict[str, Any]], Dict[str, Any]]:
+    try:
+        import pdfplumber
+    except Exception as exc:
+        if log:
+            log("error", "pdfplumber import failed", filename=filename, error=str(exc))
+        return "", None, [], {"engine": "pdfplumber", "error": str(exc)}
+
+    started = time.perf_counter()
+    try:
+        with pdfplumber.open(io.BytesIO(content)) as pdf:
+            page_count = len(pdf.pages)
+            pages_to_read = _limit_pages(page_count, "PDF_MAX_PAGES")
+            log_every = _env_int("PDF_LOG_EVERY_PAGES", 0)
+            parts: List[str] = []
+            page_meta: List[Dict[str, Any]] = []
+            empty_pages = 0
+            total_chars = 0
+            if log:
+                log("info", "PDF fallback parse start", filename=filename, engine="pdfplumber", text_layer=True, page_count=page_count, pages_to_read=pages_to_read)
+            for idx, page in enumerate(pdf.pages[:pages_to_read]):
+                text = page.extract_text(x_tolerance=1, y_tolerance=3) or ""
+                char_count = len(text)
+                total_chars += char_count
+                if not text.strip():
+                    empty_pages += 1
+                parts.append(f"[page {idx + 1} / {page_count}]\n{text}".rstrip())
+                page_meta.append({
+                    "page": idx + 1,
+                    "pageCount": page_count,
+                    "engine": "pdfplumber",
+                    "status": "TEXT_EXTRACTED" if text.strip() else "NO_TEXT_LAYER",
+                    "charCount": char_count,
+                })
+                if log and log_every > 0 and ((idx + 1) == 1 or (idx + 1) % log_every == 0 or (idx + 1) == pages_to_read):
+                    log("info", "PDF fallback parse progress", filename=filename, page=f"{idx + 1}/{page_count}", chars=total_chars, empty_pages=empty_pages)
+            elapsed = round(time.perf_counter() - started, 3)
+            if log:
+                log("info", "PDF fallback parse finish", filename=filename, engine="pdfplumber", text_layer=True, page_count=page_count, pages_read=pages_to_read, chars=total_chars, empty_pages=empty_pages, elapsed_sec=elapsed, truncated_by_limit=page_count > pages_to_read)
+            return "\n\n".join(parts), page_count, page_meta, {
+                "engine": "pdfplumber",
+                "noOcr": True,
+                "pageCount": page_count,
+                "pagesRead": pages_to_read,
+                "charCount": total_chars,
+                "emptyPages": empty_pages,
+                "elapsedSec": elapsed,
+                "truncatedByLimit": page_count > pages_to_read,
+            }
+    except Exception as exc:
+        if log:
+            log("error", "pdfplumber fallback parse failed", filename=filename, error=str(exc))
+        return "", None, [], {"engine": "pdfplumber", "noOcr": True, "error": str(exc)}
+
+
+def _read_pdf_tables_with_pdfplumber(
+    content: bytes,
+    filename: str = "",
+    log: Callable[..., None] | None = None,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    if not _env_bool("PDF_EXTRACT_TABLES", True):
+        if log:
+            log("info", "PDF table extraction skipped", filename=filename, reason="PDF_EXTRACT_TABLES=false")
+        return rows, {"enabled": False, "rowCount": 0}
+
+    try:
+        import pdfplumber
+    except Exception as exc:
+        if log:
+            log("warning", "pdfplumber table import failed", filename=filename, error=str(exc))
+        return rows, {"enabled": True, "error": str(exc), "rowCount": 0}
+
+    started = time.perf_counter()
+    try:
+        with pdfplumber.open(io.BytesIO(content)) as pdf:
+            page_count = len(pdf.pages)
+            pages_to_read = _limit_pages(page_count, "PDF_TABLE_MAX_PAGES")
+            configured_max_rows = _env_int("PDF_TABLE_MAX_ROWS", 5000)
+            max_rows = configured_max_rows if configured_max_rows > 0 else 10**9
+            log_every = _env_int("PDF_LOG_EVERY_PAGES", 0)
+            if log:
+                log("info", "PDF table extraction start", filename=filename, engine="pdfplumber", text_layer=True, page_count=page_count, pages_to_read=pages_to_read)
+            for idx, page in enumerate(pdf.pages[:pages_to_read]):
+                table_count = 0
+                for table in page.extract_tables() or []:
+                    table_count += 1
+                    parsed = rows_to_table(table)
+                    rows.extend(parsed)
+                    if len(rows) >= max_rows:
+                        rows = rows[:max_rows]
+                        if log:
+                            log("warning", "PDF table row limit reached", filename=filename, row_limit=max_rows, page=idx + 1)
+                        elapsed = round(time.perf_counter() - started, 3)
+                        return rows, {"enabled": True, "engine": "pdfplumber", "pageCount": page_count, "pagesRead": idx + 1, "rowCount": len(rows), "elapsedSec": elapsed, "rowLimitReached": True}
+                if log and log_every > 0 and ((idx + 1) == 1 or (idx + 1) % log_every == 0 or (idx + 1) == pages_to_read):
+                    log("info", "PDF table extraction progress", filename=filename, page=f"{idx + 1}/{page_count}", rows=len(rows), tables_on_page=table_count)
+            elapsed = round(time.perf_counter() - started, 3)
+            if log:
+                log("info", "PDF table extraction finish", filename=filename, engine="pdfplumber", page_count=page_count, pages_read=pages_to_read, rows=len(rows), elapsed_sec=elapsed, truncated_by_limit=page_count > pages_to_read)
+            return rows, {"enabled": True, "engine": "pdfplumber", "pageCount": page_count, "pagesRead": pages_to_read, "rowCount": len(rows), "elapsedSec": elapsed, "truncatedByLimit": page_count > pages_to_read}
+    except Exception as exc:
+        if log:
+            log("warning", "PDF table extraction failed", filename=filename, error=str(exc))
+        return rows, {"enabled": True, "error": str(exc), "rowCount": len(rows)}
+
+
+def read_pdf(
+    content: bytes,
+    filename: str = "",
+    log: Callable[..., None] | None = None,
+) -> Tuple[str, List[Dict[str, Any]], int | None, List[Dict[str, Any]], Dict[str, Any]]:
+    preferred = os.getenv("PDF_TEXT_ENGINE", "pymupdf").strip().lower()
+    if preferred not in {"pymupdf", "pdfplumber"}:
+        preferred = "pymupdf"
+
+    if preferred == "pdfplumber":
+        text, page_count, page_meta, text_metrics = _read_pdf_text_with_pdfplumber(content, filename=filename, log=log)
+        if len(text.strip()) < 80:
+            fallback_text, fallback_count, fallback_pages, fallback_metrics = _read_pdf_with_pymupdf(content, filename=filename, log=log)
+            if len(fallback_text.strip()) > len(text.strip()):
+                text, page_count, page_meta, text_metrics = fallback_text, fallback_count, fallback_pages, fallback_metrics
+    else:
+        text, page_count, page_meta, text_metrics = _read_pdf_with_pymupdf(content, filename=filename, log=log)
+        if len(text.strip()) < 80:
+            fallback_text, fallback_count, fallback_pages, fallback_metrics = _read_pdf_text_with_pdfplumber(content, filename=filename, log=log)
+            if len(fallback_text.strip()) > len(text.strip()):
+                text, page_count, page_meta, text_metrics = fallback_text, fallback_count, fallback_pages, fallback_metrics
+
+    rows, table_metrics = _read_pdf_tables_with_pdfplumber(content, filename=filename, log=log)
+
+    ocr_metrics: Dict[str, Any] = {"enabled": _ocr_enabled(), "ocrUsed": False}
+    should_ocr = _ocr_enabled() and (_env_bool("OCR_FORCE", False) or (len(text.strip()) < _ocr_min_text_chars() and not rows))
+    if should_ocr:
+        ocr_text, ocr_rows, ocr_pages, ocr_metrics = _read_pdf_with_ocr_fallback(content, filename=filename, page_count=page_count, log=log)
+        if ocr_text.strip():
+            text = (text + "\n\n" + ocr_text).strip() if text.strip() else ocr_text
+        if ocr_rows:
+            rows = ocr_rows if not rows else [*rows, *ocr_rows]
+        if ocr_pages:
+            page_meta = page_meta or []
+            page_meta.extend(ocr_pages)
+
+    metrics = {"text": text_metrics, "tables": table_metrics, "ocr": ocr_metrics, "ocrUsed": bool(ocr_metrics.get("ocrUsed"))}
+    return text, rows, page_count, page_meta, metrics
+
+
+
+# -----------------------------------------------------------------------------
+# PP-Structure / PaddleOCR fallback
+# -----------------------------------------------------------------------------
+
+PADDLE_OCR_ENGINE = None
+PADDLE_STRUCTURE_ENGINE = None
+
+
+def _ocr_enabled() -> bool:
+    return _env_bool("OCR_ENABLED", True)
+
+
+def _ocr_lang() -> str:
+    return os.getenv("OCR_LANG", "korean").strip() or "korean"
+
+
+def _ocr_dpi() -> int:
+    return max(_env_int("OCR_DPI", 160), 96)
+
+
+def _ocr_max_pages(total_pages: int) -> int:
+    # 0 또는 음수는 전체 페이지 OCR. 기본값 10은 스캔 PDF에서 속도 폭주를 막기 위한 값이다.
+    limit = _env_int("OCR_MAX_PAGES", 10)
+    if limit <= 0:
+        return total_pages
+    return min(total_pages, limit)
+
+
+def _ocr_min_text_chars() -> int:
+    return max(_env_int("OCR_MIN_TEXT_CHARS", 80), 0)
+
+
+def _get_paddle_ocr_engine():
+    global PADDLE_OCR_ENGINE
+    if PADDLE_OCR_ENGINE is not None:
+        return PADDLE_OCR_ENGINE
+    from paddleocr import PaddleOCR
+    try:
+        PADDLE_OCR_ENGINE = PaddleOCR(use_angle_cls=True, lang=_ocr_lang(), show_log=False)
+    except TypeError:
+        # PaddleOCR 3.x 계열 일부 옵션 호환 처리
+        PADDLE_OCR_ENGINE = PaddleOCR(lang=_ocr_lang())
+    return PADDLE_OCR_ENGINE
+
+
+def _get_pp_structure_engine():
+    global PADDLE_STRUCTURE_ENGINE
+    if PADDLE_STRUCTURE_ENGINE is not None:
+        return PADDLE_STRUCTURE_ENGINE
+    from paddleocr import PPStructure
+    try:
+        PADDLE_STRUCTURE_ENGINE = PPStructure(show_log=False, lang=_ocr_lang())
+    except TypeError:
+        PADDLE_STRUCTURE_ENGINE = PPStructure(lang=_ocr_lang())
+    return PADDLE_STRUCTURE_ENGINE
+
+
+def _image_bytes_to_numpy(image_bytes: bytes):
+    from PIL import Image
+    import numpy as np
+
+    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    return np.array(image)
+
+
+def _render_pdf_page_to_png(content: bytes, page_index: int, dpi: int) -> bytes:
+    import fitz  # PyMuPDF
+
+    doc = fitz.open(stream=content, filetype="pdf")
+    page = doc.load_page(page_index)
+    zoom = dpi / 72.0
+    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+    return pix.tobytes("png")
+
+
+def _flatten_paddle_ocr_result(result: Any) -> List[Tuple[str, float]]:
+    """PaddleOCR 2.x/3.x 응답 차이를 최대한 흡수해 (text, score) 목록으로 변환한다."""
+    pairs: List[Tuple[str, float]] = []
+
+    def walk(node: Any) -> None:
+        if node is None:
+            return
+        if isinstance(node, dict):
+            text = node.get("text") or node.get("rec_text") or node.get("transcription")
+            score = node.get("score") or node.get("confidence") or node.get("rec_score") or 0
+            if text:
+                try:
+                    pairs.append((str(text), float(score or 0)))
+                except Exception:
+                    pairs.append((str(text), 0.0))
+            for value in node.values():
+                if isinstance(value, (list, tuple, dict)):
+                    walk(value)
+            return
+        if isinstance(node, (list, tuple)):
+            if len(node) >= 2 and isinstance(node[1], (list, tuple)) and len(node[1]) >= 1 and isinstance(node[1][0], str):
+                text = node[1][0]
+                score = node[1][1] if len(node[1]) > 1 else 0
+                try:
+                    pairs.append((str(text), float(score or 0)))
+                except Exception:
+                    pairs.append((str(text), 0.0))
+                return
+            for item in node:
+                walk(item)
+
+    walk(result)
+    # 중복 제거: PP-Structure/PaddleOCR 응답을 같이 훑으면 같은 문자가 중복될 수 있다.
+    seen = set()
+    deduped: List[Tuple[str, float]] = []
+    for text, score in pairs:
+        clean = re.sub(r"\s+", " ", text).strip()
+        if not clean or clean in seen:
+            continue
+        seen.add(clean)
+        deduped.append((clean, score))
+    return deduped
+
+
+def _html_table_to_rows(html: str) -> List[Dict[str, Any]]:
+    if not html:
+        return []
+    table_rows: List[List[str]] = []
+    tr_matches = re.findall(r"<tr[^>]*>(.*?)</tr>", html, flags=re.I | re.S)
+    for tr in tr_matches:
+        cells = re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", tr, flags=re.I | re.S)
+        cleaned = []
+        for cell in cells:
+            value = re.sub(r"<[^>]+>", " ", cell)
+            value = re.sub(r"\s+", " ", value).strip()
+            cleaned.append(value)
+        if any(cleaned):
+            table_rows.append(cleaned)
+    return rows_to_table(table_rows)
+
+
+def _extract_pp_structure_rows(image_np: Any, log: Callable[..., None] | None = None, filename: str = "") -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    if not _env_bool("OCR_USE_PP_STRUCTURE", True):
+        return [], {"enabled": False, "reason": "OCR_USE_PP_STRUCTURE=false"}
+    try:
+        engine = _get_pp_structure_engine()
+        result = engine(image_np)
+    except Exception as exc:
+        if log:
+            log("warning", "PP-Structure failed", filename=filename, error=str(exc))
+        return [], {"enabled": True, "engine": "PP-Structure", "error": str(exc), "rowCount": 0}
+
+    rows: List[Dict[str, Any]] = []
+    block_count = 0
+    for block in result or []:
+        block_count += 1
+        if not isinstance(block, dict):
+            continue
+        block_type = str(block.get("type") or "").lower()
+        res = block.get("res")
+        html = ""
+        if isinstance(res, dict):
+            html = str(res.get("html") or res.get("html_table") or "")
+        elif isinstance(res, str):
+            html = res
+        if "table" in block_type or "<table" in html.lower():
+            rows.extend(_html_table_to_rows(html))
+    return rows, {"enabled": True, "engine": "PP-Structure", "blockCount": block_count, "rowCount": len(rows)}
+
+
+def read_image_with_ocr(
+    content: bytes,
+    filename: str = "",
+    page_label: str | int | None = None,
+    log: Callable[..., None] | None = None,
+) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
+    """이미지 1장을 PP-Structure/PaddleOCR로 처리한다.
+
+    반환값은 (text, rows, metrics). 이미지 LLM은 절대 호출하지 않는다.
+    """
+    if not _ocr_enabled():
+        return "", [], {"enabled": False, "ocrUsed": False, "reason": "OCR_ENABLED=false"}
+
+    started = time.perf_counter()
+    try:
+        image_np = _image_bytes_to_numpy(content)
+    except Exception as exc:
+        if log:
+            log("warning", "OCR image decode failed", filename=filename, page=page_label, error=str(exc))
+        return "", [], {"enabled": True, "ocrUsed": False, "engine": "PIL", "error": str(exc)}
+
+    rows: List[Dict[str, Any]] = []
+    structure_metrics: Dict[str, Any] = {"enabled": False}
+    if _env_bool("OCR_USE_PP_STRUCTURE", True):
+        rows, structure_metrics = _extract_pp_structure_rows(image_np, log=log, filename=filename)
+
+    try:
+        ocr = _get_paddle_ocr_engine()
+        if hasattr(ocr, "ocr"):
+            result = ocr.ocr(image_np, cls=True)
+        elif hasattr(ocr, "predict"):
+            result = ocr.predict(image_np)
+        else:
+            raise RuntimeError("PaddleOCR engine has neither ocr() nor predict().")
+        pairs = _flatten_paddle_ocr_result(result)
+        text = "\n".join(t for t, _ in pairs)
+        avg_conf = round(sum(score for _, score in pairs) / len(pairs), 4) if pairs else 0.0
+    except Exception as exc:
+        if log:
+            log("warning", "PaddleOCR text extraction failed", filename=filename, page=page_label, error=str(exc))
+        return "", rows, {
+            "enabled": True,
+            "ocrUsed": bool(rows),
+            "engine": "PaddleOCR",
+            "structure": structure_metrics,
+            "error": str(exc),
+            "rowCount": len(rows),
+        }
+
+    if not rows:
+        rows = infer_rows_from_text(text, filename or "ocr-image")
+
+    elapsed = round(time.perf_counter() - started, 3)
+    if log:
+        log("info", "OCR image parse finish", filename=filename, page=page_label, chars=len(text), rows=len(rows), confidence=avg_conf, elapsed_sec=elapsed)
+    return text, rows, {
+        "enabled": True,
+        "ocrUsed": True,
+        "engine": "PP-Structure/PaddleOCR" if structure_metrics.get("enabled") else "PaddleOCR",
+        "structure": structure_metrics,
+        "charCount": len(text),
+        "rowCount": len(rows),
+        "confidence": avg_conf,
+        "elapsedSec": elapsed,
+    }
+
+
+def _read_pdf_with_ocr_fallback(
+    content: bytes,
+    filename: str = "",
+    page_count: int | None = None,
+    log: Callable[..., None] | None = None,
+) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+    if not _ocr_enabled():
+        return "", [], [], {"enabled": False, "ocrUsed": False, "reason": "OCR_ENABLED=false"}
+
+    started = time.perf_counter()
+    try:
+        import fitz  # noqa: F401  # PyMuPDF import check
+    except Exception as exc:
+        if log:
+            log("warning", "PDF OCR skipped", filename=filename, reason="PyMuPDF import failed", error=str(exc))
+        return "", [], [], {"enabled": True, "ocrUsed": False, "error": str(exc)}
+
+    if page_count is None:
+        try:
+            import fitz
+            doc = fitz.open(stream=content, filetype="pdf")
+            page_count = int(doc.page_count or 0)
+        except Exception:
+            page_count = 0
+
+    pages_to_ocr = _ocr_max_pages(int(page_count or 0))
+    dpi = _ocr_dpi()
+    text_parts: List[str] = []
+    all_rows: List[Dict[str, Any]] = []
+    page_meta: List[Dict[str, Any]] = []
+
+    if log:
+        log("info", "PDF OCR fallback start", filename=filename, engine="PP-Structure/PaddleOCR", page_count=page_count, pages_to_ocr=pages_to_ocr, dpi=dpi)
+
+    try:
+        import fitz
+        doc = fitz.open(stream=content, filetype="pdf")
+        zoom = dpi / 72.0
+        matrix = fitz.Matrix(zoom, zoom)
+    except Exception as exc:
+        if log:
+            log("warning", "PDF OCR render open failed", filename=filename, error=str(exc))
+        return "", [], [], {"enabled": True, "ocrUsed": False, "engine": "PP-Structure/PaddleOCR", "error": str(exc)}
+
+    for idx in range(pages_to_ocr):
+        try:
+            page = doc.load_page(idx)
+            pix = page.get_pixmap(matrix=matrix, alpha=False)
+            png = pix.tobytes("png")
+            page_text, page_rows, metrics = read_image_with_ocr(png, filename=filename, page_label=idx + 1, log=log)
+        except Exception as exc:
+            page_text, page_rows, metrics = "", [], {"ocrUsed": False, "error": str(exc)}
+        text_parts.append(f"[page {idx + 1} / {page_count} OCR]\n{page_text}".rstrip())
+        all_rows.extend(page_rows)
+        page_meta.append({
+            "page": idx + 1,
+            "pageCount": page_count,
+            "engine": "PP-Structure/PaddleOCR",
+            "status": "OCR_EXTRACTED" if page_text.strip() or page_rows else "OCR_EMPTY",
+            "charCount": len(page_text),
+            "rowCount": len(page_rows),
+            "metrics": metrics,
+        })
+
+    elapsed = round(time.perf_counter() - started, 3)
+    metrics = {
+        "enabled": True,
+        "ocrUsed": True,
+        "engine": "PP-Structure/PaddleOCR",
+        "pageCount": page_count,
+        "pagesRead": pages_to_ocr,
+        "charCount": sum(len(part) for part in text_parts),
+        "rowCount": len(all_rows),
+        "dpi": dpi,
+        "elapsedSec": elapsed,
+        "truncatedByLimit": bool(page_count and page_count > pages_to_ocr),
+    }
+    if log:
+        log("info", "PDF OCR fallback finish", filename=filename, pages_ocr=pages_to_ocr, chars=metrics["charCount"], rows=len(all_rows), elapsed_sec=elapsed)
+    return "\n\n".join(text_parts), all_rows, page_meta, metrics
 
 
 def read_docx(content: bytes) -> Tuple[str, List[Dict[str, Any]]]:
@@ -385,13 +1713,15 @@ def infer_rows_from_text(text: str, filename: str) -> List[Dict[str, Any]]:
     이전 버전처럼 본문에 숫자나 '견적서'라는 단어가 일부 있다는 이유로 임의 행을 만들지 않는다.
     표 형태가 명확하지 않으면 빈 배열을 반환하고, 분석 요약/확인 필요로 처리한다.
     """
+    if is_reference_or_guideline_document(text):
+        return extract_reference_guideline_rows(text, user_request="")
+    if is_narrative_document(text):
+        return []
+
     table_rows = parse_delimited_text(text)
     table_rows = filter_grounded_rows(table_rows, text)
     if table_rows:
         return table_rows
-
-    if is_narrative_document(text):
-        return []
 
     rows: List[Dict[str, Any]] = []
     # 예: 품목명 규격 수량 단위 단가 금액 형태가 한 줄에 존재할 때만 추정한다.
@@ -427,7 +1757,11 @@ def infer_rows_from_text(text: str, filename: str) -> List[Dict[str, Any]]:
 
 
 def validate_rows(rows: List[Dict[str, Any]], table_type: str = "NORMAL_TABLE") -> List[Dict[str, Any]]:
-    issues = []
+    # 기준서/일반 표준단가표는 업체별 비교표가 아니므로 행별 단위 경고를 남발하지 않는다.
+    if table_type in {"IMAGE_TABLE", "GENERAL_TABLE", "OCR_TABLE", "REFERENCE_GUIDELINE_TABLE", "GUIDELINE_SUMMARY_TABLE", "STANDARD_MARKET_PRICE_TABLE"}:
+        return []
+
+    issues: List[Dict[str, Any]] = []
     for idx, row in enumerate(rows):
         qty = to_number(row.get("quantity"))
         unit_price = to_number(row.get("unit_price"))
@@ -441,7 +1775,9 @@ def validate_rows(rows: List[Dict[str, Any]], table_type: str = "NORMAL_TABLE") 
                 "fieldLabel": "금액",
                 "message": f"{idx + 1}행 금액이 수량×단가와 다릅니다. 계산값={qty * unit_price:,.0f}, 입력값={amount:,.0f}",
             })
-        if not row.get("item_name") and not row.get("vendor_name"):
+
+        # 실제 업체별 비교표에서만 핵심 식별값 누락을 경고한다.
+        if table_type == "PRICE_COMPARISON" and not row.get("item_name") and not row.get("vendor_name"):
             issues.append({
                 "rowIndex": idx,
                 "issueType": "MISSING_KEY_FIELD",
@@ -450,36 +1786,44 @@ def validate_rows(rows: List[Dict[str, Any]], table_type: str = "NORMAL_TABLE") 
                 "fieldLabel": "품목명",
                 "message": f"{idx + 1}행의 품목명 또는 업체명을 확인하세요.",
             })
-        if row.get("unit_group") in {"package", "lump_sum", "material_count", "unknown"}:
+
+        # 단위 인식 자체가 낮은 경우만 경고한다. 본/개소/공㎥/㎡/㎥ 등 건설 표준단위는 정상 단위다.
+        if row.get("unit") and float(row.get("unit_confidence") or 0) < 0.5:
             issues.append({
                 "rowIndex": idx,
-                "issueType": "UNIT_REVIEW_REQUIRED",
-                "severity": "WARNING",
+                "issueType": "UNIT_PARSE_LOW_CONFIDENCE",
+                "severity": "INFO",
                 "fieldKey": "unit",
                 "fieldLabel": "단위",
-                "message": f"{idx + 1}행 단위 '{row.get('unit_original') or row.get('unit')}'는 환산 기준이 없으면 직접 단가 비교가 어렵습니다.",
+                "message": f"{idx + 1}행 단위 '{row.get('unit_original') or row.get('unit')}' 인식값을 확인하세요.",
             })
 
     if table_type == "PRICE_COMPARISON":
         grouped: Dict[str, set[str]] = {}
-        for row in rows:
-            item_key = str(row.get("item_name") or "").strip()
-            if not item_key:
-                continue
-            grouped.setdefault(item_key, set()).add(str(row.get("unit_normalized") or row.get("unit") or "").strip())
-        for item_name, units in grouped.items():
-            real_units = {u for u in units if u}
-            if len(real_units) >= 2:
-                issues.append({
-                    "rowIndex": None,
-                    "issueType": "UNIT_MISMATCH_BETWEEN_VENDORS",
-                    "severity": "WARNING",
-                    "fieldKey": "unit",
-                    "fieldLabel": "단위",
-                    "message": f"'{item_name}' 품목은 업체별 단위가 달라 직접 단가 비교 전에 환산 기준 확인이 필요합니다. 단위={', '.join(sorted(real_units))}",
-                })
+        vendor_count = sum(1 for row in rows if str(row.get("vendor_name") or "").strip())
+        # 업체명이 2개 이상 있는 진짜 비교표에서만 동일 품목·규격 단위 불일치를 경고한다.
+        if vendor_count >= 2:
+            for row in rows:
+                item_key = str(row.get("item_name") or "").strip()
+                spec_key = str(row.get("spec") or "").strip()
+                if not item_key:
+                    continue
+                key = f"{item_key}|{spec_key}"
+                grouped.setdefault(key, set()).add(str(row.get("unit_normalized") or row.get("unit") or "").strip())
+            for key, units in grouped.items():
+                real_units = {u for u in units if u}
+                if len(real_units) >= 2:
+                    item_name, spec = key.split("|", 1)
+                    label = f"{item_name} / {spec}" if spec else item_name
+                    issues.append({
+                        "rowIndex": None,
+                        "issueType": "UNIT_MISMATCH_BETWEEN_VENDORS",
+                        "severity": "WARNING",
+                        "fieldKey": "unit",
+                        "fieldLabel": "단위",
+                        "message": f"'{label}' 항목은 업체별 단위가 달라 직접 단가 비교 전에 환산 기준 확인이 필요합니다. 단위={', '.join(sorted(real_units))}",
+                    })
     return issues
-
 
 def _truncate(text: str, limit: int) -> str:
     if len(text) <= limit:
@@ -498,7 +1842,7 @@ def should_call_llm(user_request: str, combined_text: str, rows: List[Dict[str, 
     if cfg.use_mode == "off":
         return False
     request_text = user_request or ""
-    if table_type == "PRICE_COMPARISON":
+    if table_type in {"PRICE_COMPARISON", MULTI_VENDOR_COMPARE_TABLE_TYPE}:
         return True
     if file_count >= 2:
         return True
@@ -531,7 +1875,7 @@ template_id={template_id or ''}
 [표 후보 JSON]
 {compact_rows}
 
-[PDF/문서 추출 텍스트]
+[PyMuPDF/pdfplumber/PP-Structure/OCR 추출 텍스트]
 {text_part}
 
 [반환 JSON 스키마]
@@ -579,10 +1923,11 @@ template_id={template_id or ''}
 [중요 규칙]
 1. 원문에 없는 업체명/품목명/규격/수량/단위/단가/금액을 절대 만들어내지 말 것.
 2. 문서가 유스케이스 명세서, 보고서, 요구사항서, 설명 문서이면 견적서/단가표로 분류하지 말고 table.rows는 빈 배열로 둔다.
-3. 본문에 예시로 "견적서", "단가표"라는 단어가 있어도 실제 제목/표 구조가 아니면 견적서로 판단하지 않는다.
-4. 실제 표 행이 없으면 rows를 만들지 말고 issues에 TABLE_NOT_FOUND 또는 NO_BUSINESS_TABLE을 추가한다.
-5. 단위는 원문 단위를 unit_original에 보존하고, EA/개/PCS는 개, M/미터는 m, BOX/박스는 BOX, LOT는 LOT, 식은 식으로 정규화한다.
-6. BOX, SET, LOT, 식, 본, 롤, 포처럼 환산 기준이 필요한 단위는 issues에 UNIT_REVIEW_REQUIRED를 추가한다.
+3. 기준서/지침서이면 업체명·품목명·금액을 만들지 말고 section, basis_item, application_basis, calculation_method, unit_price_basis, source_page, remark 구조의 REFERENCE_GUIDELINE_TABLE로 정리한다.
+4. 본문에 예시로 "견적서", "단가표"라는 단어가 있어도 실제 제목/표 구조가 아니면 견적서로 판단하지 않는다.
+5. 실제 표 행이 없으면 rows를 만들지 말고 issues에 TABLE_NOT_FOUND 또는 NO_BUSINESS_TABLE을 추가한다.
+5. 단위는 원문 단위를 unit_original에 보존하고, EA/개/PCS는 개, M/m2/m3는 m/㎡/㎥, 공m3는 공㎥, 본/개소/hr는 본/개소/시간으로 정규화한다.
+6. 본/개소/공㎥/㎡/㎥는 건설 표준 단위이므로 행별 환산 경고를 만들지 않는다. 업체별 동일 품목·동일 규격인데 단위가 서로 다를 때만 UNIT_MISMATCH_BETWEEN_VENDORS를 추가한다.
 7. 수량×단가와 금액이 다르면 AMOUNT_MISMATCH issue를 추가한다.
 8. 업체별 단위가 다른 단가 비교는 최저가를 확정하지 말고 확인 필요로 둔다.
 9. 행/열이 애매하면 추측하지 말고 rows에 넣지 않는다.
@@ -610,15 +1955,18 @@ def normalize_llm_result(llm_result: Dict[str, Any], fallback_rows: List[Dict[st
         normalized_rows = filter_grounded_rows(fallback_rows, source_text)
 
     table_type = table.get("tableType") or table.get("table_type") or fallback_table_type
-    if table_type not in {"PRICE_COMPARISON", "NORMAL_TABLE"}:
+    if table_type not in {"PRICE_COMPARISON", "NORMAL_TABLE", "REFERENCE_GUIDELINE_TABLE", "GUIDELINE_SUMMARY_TABLE", "STANDARD_MARKET_PRICE_TABLE", MULTI_VENDOR_COMPARE_TABLE_TYPE}:
         table_type = fallback_table_type
+    if is_reference_or_guideline_document(source_text) and (normalized_rows or fallback_table_type in REFERENCE_TABLE_TYPES):
+        table_type = "REFERENCE_GUIDELINE_TABLE"
     if not normalized_rows:
-        table_type = "NORMAL_TABLE"
+        table_type = "REFERENCE_GUIDELINE_TABLE" if fallback_table_type in REFERENCE_TABLE_TYPES else "NORMAL_TABLE"
 
+    default_cols_for_type = REFERENCE_GUIDELINE_COLUMNS if table_type in REFERENCE_TABLE_TYPES else (STANDARD_MARKET_PRICE_COLUMNS if table_type in STANDARD_MARKET_TABLE_TYPES else DEFAULT_COLUMNS)
     normalized_table = {
-        "tableName": table.get("tableName") or table.get("table_name") or "문서 표 후보",
+        "tableName": table.get("tableName") or table.get("table_name") or ("기준서 항목 표" if table_type in REFERENCE_TABLE_TYPES else ("업체별 단가 비교표" if table_type == MULTI_VENDOR_COMPARE_TABLE_TYPE else "문서 표 후보")),
         "tableType": table_type,
-        "columns": table.get("columns") if isinstance(table.get("columns"), list) else DEFAULT_COLUMNS,
+        "columns": table.get("columns") if isinstance(table.get("columns"), list) and table.get("columns") else default_cols_for_type,
         "rows": normalized_rows,
     }
 
@@ -683,8 +2031,14 @@ async def analyze_uploads(files: List[UploadFile], user_request: str, output_mod
     parsed_files = []
     all_rows: List[Dict[str, Any]] = []
     combined_text_parts = []
+    all_parse_logs: List[Dict[str, Any]] = []
+    total_page_count = 0
+    total_text_chars = 0
 
     for file in files:
+        original_filename = repair_mojibake_filename(file.filename)
+        file_logs, file_log = _new_parse_logger(f"ANALYZE:{original_filename}")
+        file_log("info", "File received", filename=original_filename, content_type=file.content_type or "")
         saved = await save_upload_file(file, "documents")
         target_path = validate_storage_path(saved["filePath"])
         content = target_path.read_bytes()
@@ -692,70 +2046,182 @@ async def analyze_uploads(files: List[UploadFile], user_request: str, output_mod
         text = ""
         rows: List[Dict[str, Any]] = []
         page_count = None
+        pages_meta: List[Dict[str, Any]] = []
+        parse_metrics: Dict[str, Any] = {"ocrUsed": False}
 
         if suffix in {".xlsx", ".xlsm"}:
+            file_log("info", "Spreadsheet parse start", filename=saved["originalName"], engine="openpyxl")
             text, rows = read_xlsx(content)
+            parse_metrics = {"engine": "openpyxl", "rowCount": len(rows), "charCount": len(text), "ocrUsed": False}
+            file_log("info", "Spreadsheet parse finish", filename=saved["originalName"], rows=len(rows), chars=len(text))
         elif suffix == ".pdf":
-            text, rows, page_count = read_pdf(content)
+            text, rows, page_count, pages_meta, parse_metrics = read_pdf(content, filename=saved["originalName"], log=file_log)
+        elif suffix in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}:
+            file_log("info", "Image OCR parse start", filename=saved["originalName"], engine="PP-Structure/PaddleOCR")
+            text, rows, image_metrics = read_image_with_ocr(content, filename=saved["originalName"], log=file_log)
+            page_count = 1
+            pages_meta = [{
+                "page": 1,
+                "pageCount": 1,
+                "engine": image_metrics.get("engine") or "PP-Structure/PaddleOCR",
+                "status": "OCR_EXTRACTED" if text.strip() or rows else "OCR_EMPTY",
+                "charCount": len(text),
+                "rowCount": len(rows),
+            }]
+            parse_metrics = image_metrics
         elif suffix == ".docx":
+            file_log("info", "DOCX parse start", filename=saved["originalName"], engine="python-docx")
             text, rows = read_docx(content)
+            parse_metrics = {"engine": "python-docx", "rowCount": len(rows), "charCount": len(text), "ocrUsed": False}
+            file_log("info", "DOCX parse finish", filename=saved["originalName"], rows=len(rows), chars=len(text))
         elif suffix in {".txt", ".csv", ".tsv", ".md", ".json"}:
+            file_log("info", "Plain text parse start", filename=saved["originalName"], suffix=suffix)
             text = decode_text(content)
+            parse_metrics = {"engine": "text-decode", "charCount": len(text), "ocrUsed": False}
+            file_log("info", "Plain text parse finish", filename=saved["originalName"], chars=len(text))
         else:
+            file_log("warning", "Unknown extension parsed as text", filename=saved["originalName"], suffix=suffix)
             text = decode_text(content)
+            parse_metrics = {"engine": "text-decode", "charCount": len(text), "ocrUsed": False}
 
         if not rows:
             rows = infer_rows_from_text(text, saved["originalName"] or "file")
         rows = [enrich_row_units(row) for row in rows]
+        file_log("info", "File parse summary", filename=saved["originalName"], pages=page_count or 0, chars=len(text), table_rows=len(rows), ocr_used=bool(parse_metrics.get("ocrUsed")))
         all_rows.extend(rows)
         combined_text_parts.append(text)
+        all_parse_logs.extend(file_logs)
+        total_page_count += int(page_count or 0)
+        total_text_chars += len(text or "")
         parsed_files.append({
             **saved,
             "pageCount": page_count,
             "page_count": page_count,
             "extractedText": text,
             "extracted_text": text,
-            "pages": [],
+            "pages": pages_meta,
+            "parseLogs": file_logs,
+            "parse_logs": file_logs,
+            "parseMetrics": parse_metrics,
+            "parse_metrics": parse_metrics,
+            "parsedRows": rows,
+            "rows": rows,
         })
 
     combined_text = "\n\n".join(combined_text_parts)
-    all_rows = filter_grounded_rows(all_rows, combined_text)
     profile = infer_document_profile(combined_text, user_request)
-    wants_price_compare = any(word in (user_request or "") for word in ["단가", "비교", "가격", "견적"])
-    has_price_rows = bool(all_rows) and profile.get("documentType") in {"견적서/단가표"}
-    table_type = "PRICE_COMPARISON" if (wants_price_compare and bool(all_rows)) or has_price_rows else "NORMAL_TABLE"
-    document_type = profile.get("documentType") or ("단가 비교 자료" if table_type == "PRICE_COMPARISON" else "업무 문서")
+    wants_price_compare = any(word in (user_request or "") for word in ["단가", "비교", "가격", "견적", "업체", "회사", "최저"])
+    multi_compare_table = build_multi_vendor_price_comparison(parsed_files, user_request=user_request)
+    is_standard_market_doc = is_standard_market_price_document(combined_text)
 
-    model_name = "lite-rule-parser-no-ocr"
-    prompt_version = "lite-v3-pdf-table-unit-rule"
+    if multi_compare_table:
+        all_rows = multi_compare_table.get("rows", [])
+        table_type = MULTI_VENDOR_COMPARE_TABLE_TYPE
+        document_type = "업체별 단가 비교 자료"
+        profile = {
+            "documentType": document_type,
+            "purpose": "여러 업체 견적서의 업체 단가와 표준시장단가 기준값을 공종별로 비교",
+            "confidence": 0.88,
+        }
+    else:
+        if is_standard_market_doc:
+            text_market_rows = extract_standard_market_rows_from_text(combined_text)
+            all_rows = [
+                row for row in all_rows
+                if str(row.get("item_name", "")).strip()
+                and str(row.get("unit", "")).strip()
+                and str(row.get("unit_price", "")).strip()
+            ]
+            all_rows = merge_standard_market_rows(all_rows, text_market_rows)
+            for row in all_rows:
+                row.pop("remark", None)
+            all_rows = filter_grounded_rows(all_rows, combined_text)
+        elif is_reference_or_guideline_document(combined_text):
+            reference_rows = extract_reference_guideline_rows(combined_text, user_request=user_request)
+            if reference_rows:
+                all_rows = reference_rows
+        all_rows = filter_grounded_rows(all_rows, combined_text)
+        is_reference_doc = is_reference_or_guideline_document(combined_text) and not is_standard_market_doc
+        has_price_rows = bool(all_rows) and profile.get("documentType") in {"견적서/단가표"} and not is_reference_doc
+        if is_standard_market_doc:
+            table_type = "STANDARD_MARKET_PRICE_TABLE"
+        elif is_reference_doc:
+            table_type = "REFERENCE_GUIDELINE_TABLE"
+        else:
+            table_type = "PRICE_COMPARISON" if (wants_price_compare and bool(all_rows)) or has_price_rows else "NORMAL_TABLE"
+        document_type = profile.get("documentType") or ("단가 비교 자료" if table_type == "PRICE_COMPARISON" else "업무 문서")
+
+
+    # 사용자가 특정 공종/품목을 입력한 경우, 전체 표 생성 후가 아니라
+    # 실제 추출 행과 교차하는 입력어 기준으로 먼저 결과를 좁힌다.
+    # 하드코딩 목록은 사용하지 않는다.
+    if table_type != MULTI_VENDOR_COMPARE_TABLE_TYPE:
+        request_focus_terms = _extract_focus_terms(user_request or "", all_rows, all_rows)
+        if request_focus_terms:
+            filtered_rows = _filter_rows_by_focus(all_rows, request_focus_terms)
+            if filtered_rows:
+                all_rows = filtered_rows
+
+    model_name = "pymupdf-pdfplumber-ppstructure-rule-parser"
+    prompt_version = "pymupdf-pdfplumber-ppstructure-v1"
     llm_used = False
     llm_error = ""
     analysis = {
         "documentType": document_type,
         "purpose": profile.get("purpose") or "문서 데이터 엑셀화",
         "summary": (
-            f"첨부 파일 {len(files)}개에서 텍스트와 표 후보 {len(all_rows)}행을 추출했습니다. "
-            f"요청 내용은 '{user_request}'이며, 산출 방식은 {output_mode}입니다. "
-            "원문에 근거가 없는 품목·금액·단가는 생성하지 않습니다."
+            f"첨부 파일 {len(files)}개, 총 {total_page_count}페이지에서 PyMuPDF/pdfplumber/PP-Structure 기반으로 텍스트 {total_text_chars:,}자를 추출했습니다. "
+            + (f"여러 업체 견적서의 업체 단가와 표준시장단가 기준값을 비교하여 {len(all_rows)}행의 업체별 단가 비교표를 생성했습니다. " if table_type == MULTI_VENDOR_COMPARE_TABLE_TYPE else (f"표준시장단가 자료로 판단하여 공종별 단가 행 {len(all_rows)}행을 표로 정리했습니다. " if table_type in STANDARD_MARKET_TABLE_TYPES else (f"기준서/지침서 문서로 판단하여 원문에 있는 기준·단가·산정 문장 {len(all_rows)}행을 표로 정리했습니다. " if table_type in REFERENCE_TABLE_TYPES else f"표 후보 {len(all_rows)}행을 확인했습니다. ")))
+            + f"요청 내용은 '{user_request}'이며, 산출 방식은 {output_mode}입니다. "
+            + "원문에 근거가 없는 품목·금액·단가는 생성하지 않습니다."
         ),
         "confidence": profile.get("confidence") if profile else (0.86 if all_rows else 0.58),
         "keyValues": [
             *extract_key_values_from_text(combined_text),
             {"label": "파일 수", "value": len(files)},
+            {"label": "PDF 총 페이지", "value": total_page_count},
+            {"label": "파싱 글자 수", "value": total_text_chars},
+            {"label": "OCR 사용", "value": "필요 시 PP-Structure/PaddleOCR"},
             {"label": "표 후보 행", "value": len(all_rows)},
             {"label": "저장 위치", "value": "ai-server"},
             {"label": "LLM 모드", "value": get_llm_config().use_mode},
+            *([{"label": "비교 모드", "value": "업체 견적단가 + 표준시장단가 기준값 병합"}] if table_type == MULTI_VENDOR_COMPARE_TABLE_TYPE else []),
+            *([{"label": "비교 업체 수", "value": (multi_compare_table.get("meta", {}) or {}).get("vendorCount", 0)}] if multi_compare_table else []),
         ],
     }
-    table = {
-        "tableName": "문서 표 후보",
-        "tableType": table_type,
-        "columns": DEFAULT_COLUMNS,
-        "rows": all_rows,
-    }
+    if multi_compare_table:
+        table = multi_compare_table
+        table_columns = table.get("columns", [])
+    else:
+        table_columns = REFERENCE_GUIDELINE_COLUMNS if table_type in REFERENCE_TABLE_TYPES else (STANDARD_MARKET_PRICE_COLUMNS if table_type in STANDARD_MARKET_TABLE_TYPES else DEFAULT_COLUMNS)
+        table_columns = prune_empty_columns(table_columns, all_rows)
+        table = {
+            "tableName": "기준서 항목 표" if table_type in REFERENCE_TABLE_TYPES else ("표준시장단가 표" if table_type in STANDARD_MARKET_TABLE_TYPES else "문서 표 후보"),
+            "tableType": table_type,
+            "columns": table_columns,
+            "rows": all_rows,
+        }
     issues = validate_rows(all_rows, table_type=table_type)
+    for parsed in parsed_files:
+        table_metrics = ((parsed.get("parseMetrics") or {}).get("tables") or {}) if isinstance(parsed, dict) else {}
+        if table_metrics.get("rowLimitReached"):
+            issues.append({
+                "rowIndex": None,
+                "issueType": "TABLE_ROW_LIMIT_REACHED",
+                "severity": "INFO",
+                "fieldKey": "table",
+                "fieldLabel": "표 추출",
+                "message": f"표 행 제한({table_metrics.get('rowCount')}행)에 도달하여 {table_metrics.get('pagesRead')}페이지까지 표를 추출했습니다. 전체 표가 필요하면 PDF_TABLE_MAX_ROWS 값을 늘리세요.",
+            })
+    result_tables: List[Dict[str, Any]] = [table]
 
-    if should_call_llm(user_request, combined_text, all_rows, len(files), table_type):
+    # 텍스트/pdfplumber/PP-Structure 후에도 표 행이 없을 때만 qwen2.5:7b 텍스트 LLM을 보조적으로 호출한다.
+    current_rows_for_llm: List[Dict[str, Any]] = []
+    for result_table in result_tables:
+        if isinstance(result_table, dict):
+            current_rows_for_llm.extend(result_table.get("rows", []) or [])
+
+    if not current_rows_for_llm and should_call_llm(user_request, combined_text, all_rows, len(files), table_type):
         cfg = get_llm_config()
         prompt = build_llm_prompt(user_request, output_mode, template_id, combined_text, all_rows)
         try:
@@ -763,7 +2229,7 @@ async def analyze_uploads(files: List[UploadFile], user_request: str, output_mod
             llm_analysis, llm_table, llm_issues = normalize_llm_result(llm_result, all_rows, table_type, combined_text, user_request)
             analysis = llm_analysis
             table = llm_table
-            # LLM 이슈 + 시스템 검증 이슈를 합친다. 중복은 message 기준으로 제거한다.
+            result_tables = [table]
             system_issues = validate_rows(table.get("rows", []), table_type=table.get("tableType", table_type))
             dedup: Dict[str, Dict[str, Any]] = {}
             for issue in [*llm_issues, *system_issues]:
@@ -794,16 +2260,64 @@ async def analyze_uploads(files: List[UploadFile], user_request: str, output_mod
                 "message": "Ollama 로컬 LLM 호출에 실패하여 규칙 기반 분석 결과를 사용했습니다. Ollama 실행 여부와 모델 설치 여부를 확인하세요.",
             })
 
+    if current_rows_for_llm and not llm_used:
+        cfg = get_llm_config()
+        should_refine_with_llm = (
+            cfg.use_mode == "always"
+            or (cfg.use_mode == "auto" and table_type == MULTI_VENDOR_COMPARE_TABLE_TYPE)
+        ) and should_call_llm(user_request, combined_text, all_rows, len(files), table_type)
+        if should_refine_with_llm:
+            # 표 행은 규칙/pdfplumber 결과를 유지하고, qwen2.5:7b는 요청 의도/요약 보정에만 사용한다.
+            # 대용량 표 전체를 LLM으로 다시 만들게 하면 속도와 정확도가 모두 떨어질 수 있다.
+            prompt = build_llm_prompt(user_request, output_mode, template_id, combined_text, all_rows[:80])
+            try:
+                llm_result = await call_local_llm_json(prompt, cfg)
+                llm_analysis, _llm_table, llm_issues = normalize_llm_result(llm_result, all_rows, table_type, combined_text, user_request)
+                for key in ["documentType", "purpose", "summary", "confidence"]:
+                    if llm_analysis.get(key) not in (None, ""):
+                        analysis[key] = llm_analysis.get(key)
+                if llm_analysis.get("keyValues"):
+                    analysis.setdefault("keyValues", []).extend(llm_analysis.get("keyValues")[:8])
+                issues = [*issues, *llm_issues]
+                llm_used = True
+                model_name = f"ollama:{cfg.model}+rule-parser"
+                prompt_version = "ollama-analysis-refine-v1"
+                analysis.setdefault("keyValues", []).extend([
+                    {"label": "LLM", "value": "요약/요청 해석 사용"},
+                    {"label": "모델", "value": cfg.model},
+                ])
+            except Exception as exc:
+                llm_error = str(exc)
+                analysis.setdefault("keyValues", []).extend([
+                    {"label": "LLM", "value": "요약 보정 실패/fallback"},
+                    {"label": "LLM 오류", "value": llm_error[:120]},
+                ])
+                issues.insert(0, {
+                    "rowIndex": None,
+                    "issueType": "LLM_ANALYSIS_REFINE_FAILED",
+                    "severity": "INFO",
+                    "fieldKey": "analysis",
+                    "fieldLabel": "문서분석",
+                    "message": "표 데이터는 규칙 기반으로 유지했고, qwen2.5:7b 요약 보정은 실패했습니다.",
+                })
+        else:
+            analysis.setdefault("keyValues", [])
+            analysis["keyValues"].append({"label": "LLM", "value": "표 추출 성공으로 생략"})
+
     # 표 행이 없는데 LLM/규칙 파서가 값을 만들지 못한 경우, 빈 표를 유지하고 확인 필요만 표시한다.
-    current_rows = table.get("rows", []) if isinstance(table, dict) else []
+    current_rows = []
+    for result_table in result_tables:
+        if isinstance(result_table, dict):
+            current_rows.extend(result_table.get("rows", []) or [])
     if not current_rows and not any(issue.get("issueType") == "NO_BUSINESS_TABLE" for issue in issues):
+        is_ref_table = any(isinstance(t, dict) and (t.get("tableType") in REFERENCE_TABLE_TYPES) for t in result_tables)
         issues.append({
             "rowIndex": None,
             "issueType": "NO_BUSINESS_TABLE",
             "severity": "INFO",
             "fieldKey": "table",
             "fieldLabel": "표 데이터",
-            "message": "원문에서 견적/단가표 형태의 품목·수량·단가 행은 확인되지 않았습니다. 근거 없는 표 행은 생성하지 않았습니다.",
+            "message": "원문에서 기준서 표로 정리할 수 있는 기준 문장을 찾지 못했습니다." if is_ref_table else "원문에서 견적/단가표 형태의 품목·수량·단가 행은 확인되지 않았습니다. 근거 없는 표 행은 생성하지 않았습니다.",
         })
         analysis["summary"] = analysis.get("summary") or "문서 내용은 확인되었지만 업무 표 행은 추출되지 않았습니다."
 
@@ -817,7 +2331,16 @@ async def analyze_uploads(files: List[UploadFile], user_request: str, output_mod
         "llmUsed": llm_used,
         "llmError": llm_error,
         "analysis": analysis,
-        "tables": [table],
+        "tables": result_tables,
         "issues": issues,
         "files": parsed_files,
+        "parseLogs": all_parse_logs,
+        "parse_logs": all_parse_logs,
+        "parseMetrics": {
+            "fileCount": len(files),
+            "totalPages": total_page_count,
+            "totalChars": total_text_chars,
+            "ocrUsed": any(bool((pf.get("parseMetrics") or {}).get("ocrUsed")) for pf in parsed_files),
+            "textForLlmTruncatedToChars": get_llm_config().context_chars,
+        },
     }

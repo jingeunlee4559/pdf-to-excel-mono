@@ -107,19 +107,19 @@ export default function TemplatePage() {
 
   return (
     <div className="space-y-5">
-      <section className="overflow-hidden rounded-[30px] bg-slate-950 p-6 text-white shadow-soft md:p-7">
+      <section className="overflow-hidden rounded-[30px] border border-brand-100 bg-gradient-to-br from-brand-50 via-white to-emerald-50 p-6 text-slate-900 shadow-soft md:p-7">
         <div className="flex flex-col gap-5 lg:flex-row lg:items-center lg:justify-between">
           <div>
-            <span className="inline-flex rounded-full bg-white/10 px-3 py-1.5 text-xs font-black text-slate-200 ring-1 ring-white/10">시스템 관리자</span>
+            <span className="inline-flex rounded-full border border-brand-100 bg-white/70 px-3 py-1.5 text-xs font-black text-brand-700 ring-1 ring-brand-100">시스템 관리자</span>
             <h2 className="mt-4 text-2xl font-black tracking-tight md:text-3xl">템플릿 관리</h2>
-            <p className="mt-2 max-w-3xl text-sm font-semibold leading-6 text-slate-300">
+            <p className="mt-2 max-w-3xl text-sm font-semibold leading-6 text-slate-600">
               자사 엑셀 양식을 등록하면 파일은 backend가 아닌 ai-server 저장소에 저장됩니다. 등록 후 매핑 페이지에서 실제 엑셀 화면을 보면서 셀 위치를 연결하세요.
             </p>
           </div>
           <button
             type="button"
             onClick={() => fileInputRef.current?.click()}
-            className="inline-flex h-12 items-center justify-center gap-2 rounded-2xl bg-white px-5 text-sm font-black text-slate-950 shadow-card transition hover:bg-brand-50"
+            className="inline-flex h-12 items-center justify-center gap-2 rounded-2xl bg-gradient-to-r from-brand-500 to-brand-400 px-5 text-sm font-black text-white shadow-glow transition hover:from-brand-600 hover:to-brand-500"
           >
             <UploadCloud size={17} />
             엑셀 파일 선택
@@ -192,7 +192,7 @@ export default function TemplatePage() {
             <button
               type="submit"
               disabled={saving}
-              className="flex h-12 w-full items-center justify-center rounded-2xl bg-slate-950 px-4 text-sm font-black text-white shadow-card transition hover:bg-brand-700 disabled:bg-slate-300"
+              className="flex h-12 w-full items-center justify-center rounded-2xl bg-gradient-to-r from-brand-500 to-brand-400 px-4 text-sm font-black text-white shadow-glow transition hover:from-brand-600 hover:to-brand-500 disabled:from-slate-300 disabled:to-slate-300"
             >
               {saving ? '등록 중...' : '+ 템플릿 등록 후 매핑하기'}
             </button>

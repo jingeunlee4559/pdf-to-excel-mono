@@ -15,7 +15,7 @@ export default function DashboardPage() {
           <h2 className="mt-5 max-w-3xl text-3xl font-black leading-tight tracking-[-0.04em] text-slate-950 lg:text-5xl">업무 문서를 올리고, 필요한 표만 검토해서 엑셀로 만드세요.</h2>
           <p className="mt-4 max-w-2xl text-sm leading-7 text-slate-600 lg:text-base">현재 버전은 OCR과 영수증 전용 로직을 제거하고, 사용자가 준 화면 흐름에 필요한 기능만 남겼습니다.</p>
           <div className="mt-6 flex flex-col gap-2 sm:flex-row">
-            <Link to="/documents/workspace" className="rounded-2xl bg-brand-600 px-5 py-3 text-center text-sm font-black text-white shadow-card hover:bg-brand-700">문서 작업 시작</Link>
+            <Link to="/documents/workspace" className="rounded-2xl bg-gradient-to-r from-brand-500 to-brand-400 px-5 py-3 text-center text-sm font-black text-white shadow-glow hover:from-brand-600 hover:to-brand-500">문서 작업 시작</Link>
             <Link to="/documents/history" className="rounded-2xl bg-slate-100 px-5 py-3 text-center text-sm font-black text-slate-700 hover:bg-slate-200">작업 이력 보기</Link>
           </div>
         </div>

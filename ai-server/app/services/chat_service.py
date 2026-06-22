@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from typing import Any, Dict, List, Optional
 
 from app.services.llm_client import call_local_llm_json, get_llm_config
+
+
+def _chat_llm_enabled() -> bool:
+    raw = os.getenv("CHAT_LLM_ENABLED", "true")
+    return raw.strip().lower() in {"1", "true", "y", "yes", "on"}
 
 
 def _num(value: Any) -> float:
@@ -170,11 +176,11 @@ def _fallback_answer(message: str, context: Optional[Dict[str, Any]] = None, llm
 
     return {
         **base,
-        "answer": "요청을 확인했습니다. 문서 파일을 첨부하면 표 추출, 단가 비교, 금액 검증, 엑셀 생성 흐름으로 도와드릴 수 있습니다.",
+        "answer": ("요청을 확인했습니다. 현재 분석된 문서와 표 기준으로 이어서 처리할 수 있습니다." if has_document else "요청을 확인했습니다. 문서 파일을 첨부하면 표 추출, 단가 비교, 금액 검증, 엑셀 생성 흐름으로 도와드릴 수 있습니다."),
         "intent": intent,
-        "needsFile": False,
+        "needsFile": not has_document,
         "action": "NONE",
-        "recommendedTab": None,
+        "recommendedTab": "analysis" if has_document else None,
         "quickReplies": ["이 문서 뭐야?", "단가만 비교해줘", "확인 필요한 부분만 보여줘"],
     }
 
@@ -264,6 +270,9 @@ async def answer_chat(message: str, context: Optional[Dict[str, Any]] = None) ->
     msg = (message or "").strip()
     if not msg:
         return _fallback_answer("", context)
+
+    if not _chat_llm_enabled():
+        return _fallback_answer(msg, context, "CHAT_LLM_ENABLED=false")
 
     cfg = get_llm_config()
     if not cfg.enabled:

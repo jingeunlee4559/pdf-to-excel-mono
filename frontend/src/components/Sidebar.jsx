@@ -21,7 +21,7 @@ export default function Sidebar({ open, onClose }) {
   return (
     <>
       <div
-        className={`fixed inset-0 z-40 bg-slate-950/45 backdrop-blur-sm transition lg:hidden ${open ? 'block' : 'hidden'}`}
+        className={`fixed inset-0 z-40 bg-slate-700/30 backdrop-blur-sm transition lg:hidden ${open ? 'block' : 'hidden'}`}
         onClick={onClose}
       />
 
@@ -31,7 +31,7 @@ export default function Sidebar({ open, onClose }) {
         lg:translate-x-0 lg:w-[86px] lg:hover:w-[286px] lg:shadow-none`}
       >
         <div className="flex h-[76px] shrink-0 items-center gap-3 border-b border-slate-100 px-4">
-          <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-[22px] bg-gradient-to-br from-slate-950 via-brand-700 to-emerald-500 text-sm font-black text-white shadow-glow">
+          <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-[22px] bg-gradient-to-br from-brand-500 via-brand-400 to-emerald-400 text-sm font-black text-white shadow-glow">
             AI
           </div>
           <div className="min-w-0 overflow-hidden whitespace-nowrap transition-all duration-300 lg:w-0 lg:opacity-0 lg:group-hover/sidebar:w-[190px] lg:group-hover/sidebar:opacity-100">
@@ -62,7 +62,7 @@ export default function Sidebar({ open, onClose }) {
                 className={({ isActive }) =>
                   `flex h-[56px] items-center rounded-[20px] px-3 transition-all duration-200 ${
                     isActive
-                      ? 'bg-slate-950 text-white shadow-card'
+                      ? 'bg-gradient-to-r from-brand-500 to-brand-400 text-white shadow-glow'
                       : 'text-slate-600 hover:bg-brand-50 hover:text-brand-700'
                   }`
                 }
@@ -78,7 +78,7 @@ export default function Sidebar({ open, onClose }) {
                     </span>
                     <span className="ml-3 min-w-0 overflow-hidden whitespace-nowrap transition-all duration-300 lg:w-0 lg:opacity-0 lg:group-hover/sidebar:w-[180px] lg:group-hover/sidebar:opacity-100">
                       <span className="block truncate text-sm font-black">{label}</span>
-                      <span className={`mt-0.5 block truncate text-xs font-bold ${isActive ? 'text-slate-300' : 'text-slate-400'}`}>{desc}</span>
+                      <span className={`mt-0.5 block truncate text-xs font-bold ${isActive ? 'text-white/80' : 'text-slate-400'}`}>{desc}</span>
                     </span>
                   </>
                 )}
@@ -89,7 +89,7 @@ export default function Sidebar({ open, onClose }) {
 
         <div className="shrink-0 border-t border-slate-100 p-3">
           <div className="flex h-[62px] items-center rounded-[22px] bg-slate-50 px-3">
-            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-brand-600 text-sm font-black text-white">
+            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-gradient-to-br from-brand-500 to-brand-300 text-sm font-black text-white shadow-glow">
               {user?.userName?.[0] || user?.loginId?.[0] || 'U'}
             </div>
             <div className="ml-3 min-w-0 overflow-hidden whitespace-nowrap transition-all duration-300 lg:w-0 lg:opacity-0 lg:group-hover/sidebar:w-[180px] lg:group-hover/sidebar:opacity-100">

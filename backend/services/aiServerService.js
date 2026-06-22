@@ -1,5 +1,6 @@
 const axios = require('axios');
 const FormData = require('form-data');
+const { repairMojibakeFilename } = require('../middleware/uploadMiddleware');
 
 function aiBaseUrl() {
   return (process.env.AI_SERVER_URL || 'http://127.0.0.1:8000').replace(/\/$/, '');
@@ -9,7 +10,7 @@ function appendUploadFile(form, fieldName, file) {
   if (!file) return;
   if (file.buffer) {
     form.append(fieldName, file.buffer, {
-      filename: file.originalname || file.filename || 'upload.bin',
+      filename: repairMojibakeFilename(file.originalname || file.filename || 'upload.bin'),
       contentType: file.mimetype || 'application/octet-stream',
       knownLength: file.size || file.buffer.length
     });
@@ -46,11 +47,11 @@ async function analyzeWithAiServer({ files, userRequest, outputMode, templateId 
   form.append('output_mode', outputMode || 'FREE_FORM');
   if (templateId) form.append('template_id', String(templateId));
   for (const file of files || []) appendUploadFile(form, 'files', file);
-  return postForm('/api/analyze', form, 180000);
+  return postForm('/api/analyze', form, Number(process.env.AI_ANALYZE_TIMEOUT_MS || 300000));
 }
 
 async function chatWithAiServer({ message, context }) {
-  return postJson('/api/chat', { message: message || '', context: context || {} }, 120000);
+  return postJson('/api/chat', { message: message || '', context: context || {} }, Number(process.env.AI_CHAT_TIMEOUT_MS || 30000));
 }
 
 async function getExcelPreview({ filePath, sheetName, maxRows = 80, maxCols = 26 }) {

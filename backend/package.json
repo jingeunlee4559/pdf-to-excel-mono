@@ -1,7 +1,7 @@
 {
   "name": "document-automation-backend",
   "version": "1.0.0",
-  "description": "AI 업무문서 자동화 시스템 백엔드 API - OCR 제외 버전",
+  "description": "AI 업무문서 자동화 시스템 백엔드 API - qwen2.5:7b + PyMuPDF/pdfplumber + PP-Structure/OCR",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {

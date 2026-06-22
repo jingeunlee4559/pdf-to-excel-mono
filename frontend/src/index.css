@@ -3,16 +3,19 @@
 @theme {
   --font-sans: Pretendard, Inter, system-ui, Apple SD Gothic Neo, Malgun Gothic, sans-serif;
 
-  --color-brand-50: #eef6ff;
-  --color-brand-100: #dbeafe;
-  --color-brand-500: #2563eb;
-  --color-brand-600: #1d4ed8;
-  --color-brand-700: #1e40af;
-  --color-brand-900: #0f172a;
+  --color-brand-50: #f0f9ff;
+  --color-brand-100: #e0f2fe;
+  --color-brand-200: #bae6fd;
+  --color-brand-300: #7dd3fc;
+  --color-brand-400: #38bdf8;
+  --color-brand-500: #0ea5e9;
+  --color-brand-600: #0284c7;
+  --color-brand-700: #0369a1;
+  --color-brand-900: #075985;
 
-  --shadow-soft: 0 18px 50px rgba(15, 23, 42, 0.08);
-  --shadow-card: 0 8px 24px rgba(15, 23, 42, 0.06);
-  --shadow-glow: 0 18px 44px rgba(37, 99, 235, 0.16);
+  --shadow-soft: 0 18px 50px rgba(2, 132, 199, 0.09);
+  --shadow-card: 0 8px 24px rgba(2, 132, 199, 0.07);
+  --shadow-glow: 0 18px 44px rgba(14, 165, 233, 0.22);
 }
 
 :root { color-scheme: light; }
@@ -22,7 +25,7 @@ html, body, #root { min-height: 100%; }
 body {
   margin: 0;
   background:
-    radial-gradient(circle at 0% 0%, rgba(37, 99, 235, 0.12), transparent 34%),
+    radial-gradient(circle at 0% 0%, rgba(14, 165, 233, 0.14), transparent 34%),
     radial-gradient(circle at 100% 0%, rgba(16, 185, 129, 0.12), transparent 34%),
     #f6f8fc;
   color: #1e293b;
@@ -33,9 +36,9 @@ body {
 .scroll-thin::-webkit-scrollbar-track { background: transparent; }
 
 .editable:focus {
-  outline: 2px solid #2563eb;
+  outline: 2px solid #0ea5e9;
   outline-offset: -2px;
-  background: #eff6ff;
+  background: #f0f9ff;
 }
 
 .safe-bottom { padding-bottom: env(safe-area-inset-bottom); }

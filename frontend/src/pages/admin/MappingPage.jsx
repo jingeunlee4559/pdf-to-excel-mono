@@ -220,7 +220,7 @@ export default function MappingPage() {
             </select>
             <div className="flex flex-wrap gap-2">
               <button onClick={() => loadPreview(selectedTemplateId, sheetName)} className="inline-flex h-11 items-center justify-center gap-2 rounded-2xl border border-slate-200 bg-white px-4 text-xs font-black text-slate-700 hover:bg-slate-50"><RefreshCw size={15} /> 새로고침</button>
-              <button onClick={saveMappings} disabled={saving || !mappings.length} className="inline-flex h-11 items-center justify-center gap-2 rounded-2xl bg-brand-600 px-4 text-xs font-black text-white shadow-card hover:bg-brand-700 disabled:bg-slate-300"><Save size={15} /> {saving ? '저장 중...' : '매핑 저장'}</button>
+              <button onClick={saveMappings} disabled={saving || !mappings.length} className="inline-flex h-11 items-center justify-center gap-2 rounded-2xl bg-gradient-to-r from-brand-500 to-brand-400 px-4 text-xs font-black text-white shadow-glow hover:from-brand-600 hover:to-brand-500 disabled:from-slate-300 disabled:to-slate-300"><Save size={15} /> {saving ? '저장 중...' : '매핑 저장'}</button>
             </div>
           </div>
         </div>
@@ -244,8 +244,8 @@ export default function MappingPage() {
 
           <div className="mt-5 rounded-[24px] border border-slate-200 bg-slate-50 p-3">
             <div className="mb-3 grid grid-cols-2 gap-2 rounded-2xl bg-white p-1 shadow-sm ring-1 ring-slate-200">
-              <button onClick={() => setMappingType('SINGLE_CELL')} className={`h-11 rounded-xl text-sm font-black transition ${mappingType === 'SINGLE_CELL' ? 'bg-slate-950 text-white' : 'text-slate-500 hover:bg-slate-50'}`}>단일 셀</button>
-              <button onClick={() => setMappingType('REPEAT_COLUMN')} className={`h-11 rounded-xl text-sm font-black transition ${mappingType === 'REPEAT_COLUMN' ? 'bg-slate-950 text-white' : 'text-slate-500 hover:bg-slate-50'}`}>반복 컬럼</button>
+              <button onClick={() => setMappingType('SINGLE_CELL')} className={`h-11 rounded-xl text-sm font-black transition ${mappingType === 'SINGLE_CELL' ? 'bg-brand-500 text-white shadow-glow' : 'text-slate-500 hover:bg-brand-50 hover:text-brand-700'}`}>단일 셀</button>
+              <button onClick={() => setMappingType('REPEAT_COLUMN')} className={`h-11 rounded-xl text-sm font-black transition ${mappingType === 'REPEAT_COLUMN' ? 'bg-brand-500 text-white shadow-glow' : 'text-slate-500 hover:bg-brand-50 hover:text-brand-700'}`}>반복 컬럼</button>
             </div>
             <label className="flex h-11 items-center gap-2 rounded-2xl border border-slate-200 bg-white px-3 focus-within:border-brand-500">
               <Search size={16} className="text-slate-400" />

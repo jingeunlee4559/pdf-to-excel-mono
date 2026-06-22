@@ -1,10 +1,11 @@
-fastapi==0.115.6
-uvicorn[standard]==0.34.0
-python-multipart==0.0.20
-pydantic==2.10.4
-pypdf==5.1.0
-openpyxl==3.1.5
-python-docx==1.1.2
-# PDF 표/블록 추출 강화용: 설치 실패 시 기능은 pypdf 기반으로 fallback 됩니다.
-pdfplumber==0.11.7
-pymupdf==1.26.3
+fastapi>=0.110
+uvicorn[standard]>=0.27
+python-multipart>=0.0.9
+pymupdf>=1.24
+pdfplumber>=0.11
+openpyxl>=3.1
+python-docx>=1.1
+paddleocr>=2.7
+paddlepaddle>=2.6
+pillow>=10.0
+numpy>=1.26

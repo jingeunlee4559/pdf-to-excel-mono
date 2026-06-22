@@ -12,10 +12,50 @@ const defaultColumns = [
   { key: 'remark', label: '비고' }
 ];
 
+const referenceGuidelineColumns = [
+  { key: 'section', label: '구분/장절' },
+  { key: 'basis_item', label: '기준 항목' },
+  { key: 'application_basis', label: '적용 기준' },
+  { key: 'calculation_method', label: '계산/적용 방식' },
+  { key: 'unit_price_basis', label: '단가 기준' },
+  { key: 'source_page', label: '근거 페이지' },
+  { key: 'remark', label: '비고' }
+];
+
+const standardMarketColumns = [
+  { key: 'construction_code', label: '공종코드' },
+  { key: 'item_name', label: '공종명칭' },
+  { key: 'spec', label: '규격' },
+  { key: 'unit', label: '단위' },
+  { key: 'unit_price', label: '단가' },
+  { key: 'labor_ratio', label: '노무비율' },
+  { key: 'remark', label: '비고' }
+];
+
+const referenceTableTypes = new Set(['REFERENCE_GUIDELINE_TABLE', 'GUIDELINE_SUMMARY_TABLE']);
+const standardMarketTableTypes = new Set(['STANDARD_MARKET_PRICE_TABLE']);
+const multiVendorCompareTableTypes = new Set(['MULTI_VENDOR_PRICE_COMPARISON']);
+
+function columnsForTableType(tableType) {
+  if (referenceTableTypes.has(tableType)) return referenceGuidelineColumns;
+  if (standardMarketTableTypes.has(tableType)) return standardMarketColumns;
+  if (multiVendorCompareTableTypes.has(tableType)) return defaultColumns; // AI 서버가 동적 업체 컬럼을 내려주므로 fallback만 둔다.
+  return defaultColumns;
+}
+
+
+function pruneEmptyColumns(columns = [], rows = []) {
+  if (!Array.isArray(columns) || !columns.length) return defaultColumns;
+  if (!Array.isArray(rows) || !rows.length) return columns;
+  const visible = columns.filter((col) => rows.some((row) => String(row?.[col.key] ?? '').trim() !== ''));
+  return visible.length ? visible : columns;
+}
+
 function fallbackAnalysis(files, userRequest) {
   const rows = files.map((file, index) => ({
-    vendor_name: index === 0 ? 'A업체' : `업체${index + 1}`,
+    vendor_name: '',
     item_name: path.basename(file.originalname || `file_${index + 1}`, path.extname(file.originalname || '')),
+    source_file_name: file.originalname || `file_${index + 1}`,
     spec: '',
     quantity: '1',
     unit: '',
@@ -63,27 +103,39 @@ function toNumber(value) {
   return Number.isFinite(num) ? num : 0;
 }
 
-const REVIEW_UNITS = new Set(['BOX', 'SET', 'LOT', '식', '본', '롤', '포', '봉', '박스']);
+const REVIEW_UNITS = new Set(['BOX', 'SET', 'LOT', '식', '롤', '포', '봉', '박스']);
 
 function normalizeUnit(value) {
-  const text = String(value || '').trim();
+  const text = String(value || '').replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim();
   if (!text) return '';
-  const compact = text.replace(/\s+/g, '').toUpperCase();
+  const compact = text
+    .replace(/㎥/g, 'm3')
+    .replace(/㎡/g, 'm2')
+    .replace(/m²/gi, 'm2')
+    .replace(/m³/gi, 'm3')
+    .replace(/\s+/g, '')
+    .toUpperCase();
   const map = {
-    EA: '개', PCS: '개', PC: '개', '개': '개', '매': '개', '장': '개', '대': '개', '조': '개',
+    EA: '개', PCS: '개', PC: '개', '개': '개', '매': '개', '장': '개', '대': '개', '조': '개', '개소': '개소',
     M: 'm', '미터': 'm', MM: 'mm', CM: 'cm', KM: 'km',
-    M2: '㎡', '㎡': '㎡', '평': '평', M3: '㎥', '㎥': '㎥',
+    M2: '㎡', 'M^2': '㎡', '평': '평', M3: '㎥', 'M^3': '㎥', '공M3': '공㎥', '공M^3': '공㎥', '공㎥': '공㎥',
     KG: 'kg', G: 'g', TON: 'ton', '톤': 'ton',
     BOX: 'BOX', '박스': 'BOX', SET: 'SET', '세트': 'SET', LOT: 'LOT', '식': '식', '본': '본', '롤': '롤', '포': '포', '봉': '봉',
     HR: '시간', H: '시간', '시간': '시간', MD: 'MD', '공수': 'MD', '인': '인', '명': '인'
   };
+  if (/^공M3$/i.test(compact)) return '공㎥';
+  if (/^M2$/i.test(compact)) return '㎡';
+  if (/^M3$/i.test(compact)) return '㎥';
+  if (/개소$/.test(text)) return '개소';
   return map[compact] || text;
 }
+
 
 function validateTable(table) {
   const issues = [];
   const rows = table.rows || [];
   const tableType = table.tableType || table.table_type || 'NORMAL_TABLE';
+  if (referenceTableTypes.has(tableType) || standardMarketTableTypes.has(tableType) || multiVendorCompareTableTypes.has(tableType)) return issues;
   const unitsByItem = new Map();
 
   rows.forEach((row, index) => {
@@ -103,7 +155,7 @@ function validateTable(table) {
       });
     }
 
-    if (normalizedUnit && REVIEW_UNITS.has(normalizedUnit)) {
+    if (tableType === 'PRICE_COMPARISON' && normalizedUnit && REVIEW_UNITS.has(normalizedUnit)) {
       issues.push({
         rowIndex: index,
         issueType: 'UNIT_REVIEW_REQUIRED',
@@ -115,13 +167,13 @@ function validateTable(table) {
     }
 
     const itemName = String(row.item_name || '').trim();
-    if (tableType === 'PRICE_COMPARISON' && itemName && normalizedUnit) {
+    if (tableType === 'PRICE_COMPARISON' && itemName && normalizedUnit && String(row.vendor_name || '').trim()) {
       if (!unitsByItem.has(itemName)) unitsByItem.set(itemName, new Set());
       unitsByItem.get(itemName).add(normalizedUnit);
     }
   });
 
-  if (tableType === 'PRICE_COMPARISON') {
+  if (tableType === 'PRICE_COMPARISON' && rows.filter((row) => String(row.vendor_name || '').trim()).length >= 2) {
     for (const [itemName, units] of unitsByItem.entries()) {
       if (units.size >= 2) {
         issues.push({
@@ -254,4 +306,4 @@ async function chatWithDocuments({ message, context }) {
 }
 
 
-module.exports = { analyzeDocuments, validateTable, defaultColumns, chatWithDocuments };
+module.exports = { analyzeDocuments, validateTable, defaultColumns, referenceGuidelineColumns, standardMarketColumns, columnsForTableType, pruneEmptyColumns, chatWithDocuments };

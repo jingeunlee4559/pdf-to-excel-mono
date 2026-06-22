@@ -26,11 +26,8 @@ export default function Header({ onMenuClick }) {
         </div>
 
         <div className="flex items-center gap-2 sm:gap-3">
-          <div className="hidden items-center gap-2 rounded-2xl border border-emerald-100 bg-emerald-50 px-3 py-2 text-xs font-black text-emerald-700 md:flex">
-            ai-server 저장 방식
-          </div>
           <div className="flex items-center gap-2 rounded-2xl bg-white px-2.5 py-2 shadow-card ring-1 ring-slate-200">
-            <div className="flex h-8 w-8 items-center justify-center rounded-full bg-slate-950 text-xs font-black text-white">{user?.userName?.[0] || 'U'}</div>
+            <div className="flex h-8 w-8 items-center justify-center rounded-full bg-gradient-to-br from-brand-500 to-brand-300 text-xs font-black text-white shadow-glow">{user?.userName?.[0] || 'U'}</div>
             <div className="hidden sm:block">
               <p className="text-xs font-black text-slate-900">{user?.userName || '사용자'}</p>
               <p className="text-[11px] font-bold text-slate-400">{user?.roleName || user?.roleCode}</p>
@@ -39,7 +36,7 @@ export default function Header({ onMenuClick }) {
           <button
             type="button"
             onClick={logoutUser}
-            className="flex h-10 items-center gap-2 rounded-2xl bg-slate-950 px-3 text-xs font-black text-white transition hover:bg-brand-700 sm:px-4"
+            className="flex h-10 items-center gap-2 rounded-2xl bg-gradient-to-r from-brand-500 to-brand-400 px-3 text-xs font-black text-white shadow-glow transition hover:from-brand-600 hover:to-brand-500 sm:px-4"
           >
             <LogOut size={15} />
             <span className="hidden sm:inline">로그아웃</span>
