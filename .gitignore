@@ -1,0 +1,22 @@
+# 모든 하위 폴더의 .env 제외
+.env
+**/.env
+*.env
+
+# 단, 예시 파일은 추적하고 싶다면 (선택)
+!.env.example
+!**/.env.example
+
+# node_modules도 같이 무시 (frontend에 이미 있음)
+node_modules/
+**/node_modules/
+
+# Python 가상환경 (ai-server용)
+venv/
+**/venv/
+__pycache__/
+**/__pycache__/
+
+# 기타 흔한 무시 대상
+.DS_Store
+*.log
