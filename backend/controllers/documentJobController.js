@@ -7,6 +7,8 @@ const asyncHandler = require('../utils/asyncHandler');
 const { parseJson } = require('../utils/mapper');
 const { analyzeDocuments, validateTable, defaultColumns, columnsForTableType, pruneEmptyColumns, chatWithDocuments } = require('../services/analysisService');
 const { createExcelFile, createMappedTemplateExcel } = require('../services/excelService');
+const { getTemplateRecommendationsForJob, saveRecommendationHistory, getTemplateDesignCandidatesForJob, createAiGeneratedTemplateForJob } = require('../services/templateRecommendationService');
+const { Counter, CandidateField, StandardField, TableEditLog } = require('../models');
 const { verifyToken } = require('../utils/jwt');
 
 
@@ -155,7 +157,7 @@ async function loadJob(jobId, user) {
   const [issues] = await pool.query('SELECT * FROM review_issues WHERE job_id = ? ORDER BY id', [jobId]);
   const [excels] = await pool.query('SELECT * FROM generated_excels WHERE job_id = ? ORDER BY id DESC', [jobId]);
 
-  return {
+  const jobDetail = {
     id: job.id,
     title: job.title,
     userRequest: job.user_request,
@@ -200,6 +202,10 @@ async function loadJob(jobId, user) {
         llmUsed: rawAnalysis.llmUsed || false,
         llmIntentUsed: rawAnalysis.llmIntentUsed || false,
         llmIntent: rawAnalysis.llmIntent || null,
+        drafts: rawAnalysis.drafts || {},
+        reportDraft: rawAnalysis.reportDraft || rawAnalysis.drafts?.report || null,
+        meetingDraft: rawAnalysis.meetingDraft || rawAnalysis.drafts?.meeting || null,
+        officialLetterDraft: rawAnalysis.officialLetterDraft || rawAnalysis.drafts?.officialLetter || null,
         llmModel: analysis.llm_model,
         promptVersion: analysis.prompt_version,
         raw: rawAnalysis
@@ -241,6 +247,34 @@ async function loadJob(jobId, user) {
       downloadedAt: excel.downloaded_at,
     }))
   };
+
+  try {
+    jobDetail.aiTemplateRecommendations = await getTemplateRecommendationsForJob(jobDetail);
+  } catch (error) {
+    console.warn('[AI_TEMPLATE_RECOMMENDATION_FAILED]', error.message);
+    jobDetail.aiTemplateRecommendations = [];
+  }
+  try {
+    jobDetail.aiTemplateDesignCandidates = getTemplateDesignCandidatesForJob(jobDetail);
+  } catch (error) {
+    console.warn('[AI_TEMPLATE_DESIGN_CANDIDATES_FAILED]', error.message);
+    jobDetail.aiTemplateDesignCandidates = [];
+  }
+  try {
+    const candidates = await CandidateField.find({ job_id: Number(jobDetail.id), active_yn: 'Y' }).sort({ id: 1 }).lean();
+    jobDetail.candidateFields = candidates.map((item) => ({
+      id: item.id,
+      tableId: item.table_id,
+      originalLabel: item.original_label,
+      suggestedFieldKey: item.suggested_field_key,
+      suggestedDataType: item.suggested_data_type,
+      status: item.status,
+      confidence: item.confidence,
+    }));
+  } catch (error) {
+    jobDetail.candidateFields = [];
+  }
+  return jobDetail;
 }
 
 async function replaceIssues(conn, jobId, tableId, issues) {
@@ -370,7 +404,8 @@ function buildServerChatContext(job, selectedTableId = null, requestContext = {}
       fileProfiles: job.analysis.fileProfiles || job.analysis.raw?.fileProfiles || [],
       llmUsage: job.analysis.llmUsage || job.analysis.raw?.llmUsage || null,
       llmUsed: job.analysis.llmUsed || job.analysis.raw?.llmUsed || false,
-      llmIntentUsed: job.analysis.llmIntentUsed || job.analysis.raw?.llmIntentUsed || false
+      llmIntentUsed: job.analysis.llmIntentUsed || job.analysis.raw?.llmIntentUsed || false,
+      drafts: job.analysis.drafts || job.analysis.raw?.drafts || {}
     } : null,
     table: selectedTable ? {
       id: selectedTable.id,
@@ -1387,7 +1422,7 @@ function describeTableEdit(edit) {
   if (edit.type === 'ADD_COLUMNS') return `${edit.keys.map(labelOf).join(', ')} 컬럼을 다시 추가했습니다.`;
   if (edit.type === 'NOOP_COLUMNS_ALREADY_VISIBLE') return `${edit.keys.map(labelOf).join(', ')} 컬럼은 이미 표에 표시되어 있습니다.`;
   if (edit.type === 'SORT_ROWS') return edit.sort === 'UNIT_PRICE_DESC' ? '단가 높은 순으로 표를 정렬했습니다.' : '단가 낮은 순으로 표를 정렬했습니다.';
-  if (edit.type === 'APPLY_REQUESTED_QUANTITY') return `요청 수량 ${edit.requestedQuantity?.value || ''}${edit.requestedQuantity?.unit || ''}을 표와 자사양식 산출 기준에 반영했습니다.`;
+  if (edit.type === 'APPLY_REQUESTED_QUANTITY') return `요청 수량 ${edit.requestedQuantity?.value || ''}${edit.requestedQuantity?.unit || ''}을 표와 등록양식 산출 기준에 반영했습니다.`;
   if (edit.type === 'REMOVE_VENDOR_COLUMNS') return `${(edit.vendorNames || []).join(', ')} 업체 컬럼을 제외하고 현재 표를 다시 구성했습니다.`;
   if (edit.type === 'RESTORE_VENDOR_COLUMNS') return `${(edit.vendorNames || []).join(', ')} 업체 컬럼을 다시 추가하고 최저 업체/금액을 재계산했습니다.`;
   if (edit.type === 'SELECT_VENDOR_COLUMNS') return `${(edit.vendorNames || []).join(', ')} 업체만 남기고 표를 다시 정리했습니다.`;
@@ -1712,6 +1747,77 @@ const getJob = asyncHandler(async (req, res) => {
   res.json({ job });
 });
 
+
+
+async function nextModelSeq(name) {
+  const counter = await Counter.findOneAndUpdate({ name }, { $inc: { seq: 1 } }, { new: true, upsert: true, setDefaultsOnInsert: true }).lean();
+  return counter.seq;
+}
+
+function normalizeSuggestedFieldKey(label = '') {
+  const raw = String(label || '').trim();
+  const known = {
+    '납기일': 'delivery_date', '공급조건': 'supply_condition', '제조사': 'manufacturer', '모델명': 'model_name',
+    '할인율': 'discount_rate', '부가세': 'vat_amount', '설치비': 'install_cost', '운반비': 'transport_cost',
+    '회의일자': 'meeting_date', '참석자': 'attendees', '안건': 'agenda', '결정사항': 'decision', '조치사항': 'action_item',
+    '수신': 'recipient', '참조': 'reference', '발신': 'sender', '본문': 'body', '내용': 'content', '요약': 'summary'
+  };
+  if (known[raw]) return known[raw];
+  return raw
+    .replace(/\s+/g, '_')
+    .replace(/[^a-zA-Z0-9가-힣_]/g, '')
+    .replace(/_+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .toLowerCase() || `custom_${Date.now()}`;
+}
+
+function inferDataTypeFromColumn(col = {}, rows = []) {
+  const key = String(col.key || '').toLowerCase();
+  const label = String(col.label || '').toLowerCase();
+  if (/(date|일자|날짜|납기)/i.test(`${key} ${label}`)) return 'DATE';
+  if (/(amount|price|cost|total|rate|quantity|qty|금액|단가|비용|합계|수량|율)/i.test(`${key} ${label}`)) return 'NUMBER';
+  const values = (rows || []).map((row) => row?.[col.key]).filter((v) => v !== undefined && v !== null && String(v).trim() !== '').slice(0, 10);
+  if (values.length && values.every((v) => /^[-+]?\d[\d,]*(\.\d+)?$/.test(String(v).trim()))) return 'NUMBER';
+  return 'TEXT';
+}
+
+async function saveCandidateFieldsForTable({ jobId, tableId, columns = [], rows = [], editedBy = null }) {
+  const standardFields = await StandardField.find({ active_yn: 'Y' }).select('field_key field_label').lean();
+  const standardKeySet = new Set(standardFields.map((field) => String(field.field_key)));
+  const standardLabelSet = new Set(standardFields.map((field) => String(field.field_label || '').trim()).filter(Boolean));
+  const candidates = [];
+  for (const col of columns || []) {
+    const key = String(col.key || '').trim();
+    const label = String(col.label || key || '').trim();
+    if (!key || standardKeySet.has(key) || standardLabelSet.has(label)) continue;
+    const suggested = normalizeSuggestedFieldKey(label || key);
+    candidates.push({ key, label, suggested, dataType: inferDataTypeFromColumn(col, rows) });
+  }
+  for (const item of candidates) {
+    await CandidateField.updateOne(
+      { job_id: Number(jobId), table_id: tableId ? Number(tableId) : null, suggested_field_key: item.suggested },
+      {
+        $set: {
+          original_label: item.label,
+          suggested_data_type: item.dataType,
+          source: editedBy ? 'USER_EDIT' : 'AI_DETECTED',
+          status: 'PENDING',
+          active_yn: 'Y',
+        },
+        $setOnInsert: {
+          id: Date.now() + Math.floor(Math.random() * 100000),
+          job_id: Number(jobId),
+          table_id: tableId ? Number(tableId) : null,
+          suggested_field_key: item.suggested,
+          confidence: 0.72,
+        }
+      },
+      { upsert: true }
+    );
+  }
+  return candidates;
+}
+
 const updateTable = asyncHandler(async (req, res) => {
   const job = await loadJob(req.params.id, req.user);
   if (!job) return res.status(404).json({ message: '작업을 찾을 수 없습니다.' });
@@ -1720,8 +1826,20 @@ const updateTable = asyncHandler(async (req, res) => {
   if (!table) return res.status(404).json({ message: '수정할 표가 없습니다.' });
 
   const rows = req.body.rows || [];
-  const columns = pruneEmptyColumns(req.body.columns || table.columns || defaultColumns, rows);
+  const columns = req.body.columns || table.columns || defaultColumns;
   const issues = validateTable({ columns, rows, tableType: table.tableType });
+  await saveCandidateFieldsForTable({ jobId: job.id, tableId: table.id, columns, rows, editedBy: req.user.id });
+  try {
+    await TableEditLog.create({
+      id: Date.now() + Math.floor(Math.random() * 100000),
+      job_id: Number(job.id),
+      table_id: table.id ? Number(table.id) : null,
+      action: 'UPDATE_TABLE',
+      before_value: { columnCount: (table.columns || []).length, rowCount: (table.rows || []).length },
+      after_value: { columnCount: columns.length, rowCount: rows.length },
+      edited_by: req.user.id || null,
+    });
+  } catch (_) {}
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
@@ -1774,16 +1892,16 @@ function normalizeTemplateId(value) {
 async function loadTemplateWithMappings(templateId) {
   if (!templateId) return { template: null, mappings: [] };
   const [[template]] = await pool.query(`SELECT * FROM excel_templates WHERE id = ? AND active_yn = 'Y'`, [templateId]);
-  if (!template) throw new Error('선택한 자사 양식을 찾을 수 없습니다.');
+  if (!template) throw new Error('선택한 등록 양식을 찾을 수 없습니다.');
   const [[mappingRow]] = await pool.query(
     `SELECT * FROM excel_template_mappings WHERE template_id = ? AND active_yn = 'Y' ORDER BY id DESC LIMIT 1`,
     [templateId]
   );
   const mappingJson = parseJson(mappingRow?.mapping_json, { mappings: [] });
-  return { template, mappings: Array.isArray(mappingJson.mappings) ? mappingJson.mappings : [] };
+  return { template, mappings: Array.isArray(mappingJson.mappings) ? mappingJson.mappings : [], mappingJson };
 }
 
-async function generateExcelForJob({ job, tableId, fileName, outputMode = null, templateId = null, sourceSessionId = null, sourceMessageId = null, authorName = '', templateLayoutMode = 'COMPACT_VENDOR_GROUPS' }) {
+async function generateExcelForJob({ job, tableId, fileName, outputMode = null, templateId = null, sourceSessionId = null, sourceMessageId = null, authorName = '', templateLayoutMode = 'COMPACT_VENDOR_GROUPS', design = null, designId = null }) {
   const table = tableId ? job.tables.find((item) => Number(item.id) === Number(tableId)) : job.tables[0];
   if (!table) throw new Error('엑셀로 만들 표 데이터가 없습니다.');
 
@@ -1793,13 +1911,14 @@ async function generateExcelForJob({ job, tableId, fileName, outputMode = null, 
 
   let excel;
   if (effectiveTemplateId) {
-    const { template, mappings } = await loadTemplateWithMappings(effectiveTemplateId);
-    if (!mappings.length) throw new Error('자사 양식 매핑이 저장되어 있지 않습니다. 매핑 페이지에서 먼저 저장하세요.');
+    const { template, mappings, mappingJson } = await loadTemplateWithMappings(effectiveTemplateId);
+    if (!mappings.length && !mappingJson?.aiGenerated && !String(mappingJson?.layout || '').startsWith('AI_GENERATED')) throw new Error('등록 양식 매핑이 저장되어 있지 않습니다. 매핑 페이지에서 먼저 저장하세요.');
     excel = await createMappedTemplateExcel({
       jobId: job.id,
       fileName,
       template,
       mappings,
+      mappingJson,
       columns: table.columns,
       rows: table.rows,
       job: { ...job, tables: [table] },
@@ -1807,7 +1926,7 @@ async function generateExcelForJob({ job, tableId, fileName, outputMode = null, 
       templateLayoutMode: templateLayoutMode || 'COMPACT_VENDOR_GROUPS'
     });
   } else {
-    excel = await createExcelFile({ jobId: job.id, fileName, columns: table.columns, rows: table.rows });
+    excel = await createExcelFile({ jobId: job.id, fileName, columns: table.columns, rows: table.rows, job: { ...job, tables: [table] }, authorName, mappingJson: design || {}, designId });
   }
 
   const [result] = await pool.query(
@@ -1818,6 +1937,61 @@ async function generateExcelForJob({ job, tableId, fileName, outputMode = null, 
   await pool.query('UPDATE document_jobs SET status = ? WHERE id = ?', ['GENERATED', job.id]);
   return { id: result.insertId, fileName: excel.fileName, jobId: job.id, outputMode: effectiveOutputMode, templateApplied: Boolean(effectiveTemplateId) };
 }
+
+
+const createAiTemplate = asyncHandler(async (req, res) => {
+  const job = await loadJob(req.params.id, req.user);
+  if (!job) return res.status(404).json({ message: '작업을 찾을 수 없습니다.' });
+  const result = await createAiGeneratedTemplateForJob({
+    job,
+    tableId: req.body.tableId || req.body.table_id || null,
+    user: req.user,
+    designOverride: req.body.design || req.body.designJson || null,
+  });
+  const refreshedJob = await loadJob(job.id, req.user);
+  res.status(201).json({
+    template: result.template,
+    design: result.design,
+    recommendation: result.recommendation,
+    job: refreshedJob,
+    message: 'DB 표준필드 기반 AI 새 양식을 생성했습니다.',
+  });
+});
+
+
+const updateCandidateField = asyncHandler(async (req, res) => {
+  const job = await loadJob(req.params.id, req.user);
+  if (!job) return res.status(404).json({ message: '작업을 찾을 수 없습니다.' });
+  const candidate = await CandidateField.findOne({ id: Number(req.params.fieldId), job_id: Number(job.id) });
+  if (!candidate) return res.status(404).json({ message: '신규 컬럼 후보를 찾을 수 없습니다.' });
+  const action = String(req.body.action || '').toUpperCase();
+  if (action === 'ADD_STANDARD') {
+    const exists = await StandardField.findOne({ field_key: candidate.suggested_field_key }).lean();
+    if (!exists) {
+      await StandardField.create({
+        id: await nextModelSeq('standard_fields'),
+        field_key: candidate.suggested_field_key,
+        field_label: req.body.fieldLabel || candidate.original_label,
+        field_group: req.body.fieldGroup || 'DETAIL',
+        data_type: req.body.dataType || candidate.suggested_data_type || 'TEXT',
+        description: '문서 분석 중 발견되어 사용자가 표준필드로 확정한 컬럼',
+        active_yn: 'Y',
+        sort_order: Number(req.body.sortOrder || 900),
+      });
+    }
+    candidate.status = 'ADDED_STANDARD';
+    candidate.matched_standard_field = candidate.suggested_field_key;
+  } else if (action === 'USE_CUSTOM') {
+    candidate.status = 'CUSTOM_ONLY';
+  } else if (action === 'EXCLUDE') {
+    candidate.status = 'EXCLUDED';
+    candidate.active_yn = 'N';
+  } else {
+    return res.status(400).json({ message: '지원하지 않는 후보 컬럼 처리 방식입니다.' });
+  }
+  await candidate.save();
+  res.json({ job: await loadJob(job.id, req.user), candidate: candidate.toObject() });
+});
 
 const generateExcel = asyncHandler(async (req, res) => {
   const job = await loadJob(req.params.id, req.user);
@@ -1831,7 +2005,9 @@ const generateExcel = asyncHandler(async (req, res) => {
     templateId: outputMode === 'COMPANY_TEMPLATE' ? (req.body.templateId ?? req.body.template_id ?? null) : null,
     sourceSessionId: req.body.chatSessionId || null,
     authorName: req.user.userName || req.user.loginId || '',
-    templateLayoutMode: outputMode === 'COMPANY_TEMPLATE' ? (req.body.templateLayoutMode || 'COMPACT_VENDOR_GROUPS') : null
+    templateLayoutMode: outputMode === 'COMPANY_TEMPLATE' ? (req.body.templateLayoutMode || 'COMPACT_VENDOR_GROUPS') : null,
+    design: outputMode === 'FREE_FORM' ? (req.body.design || null) : null,
+    designId: outputMode === 'FREE_FORM' ? (req.body.designId || req.body.design_id || null) : null
   });
   res.status(201).json({ excel });
 });
@@ -1981,6 +2157,8 @@ module.exports = {
   getJob,
   updateTable,
   revalidateJob,
+  createAiTemplate,
+  updateCandidateField,
   generateExcel,
   downloadExcel,
   listDownloads,

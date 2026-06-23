@@ -54,6 +54,17 @@ async function chatWithAiServer({ message, context }) {
   return postJson('/api/chat', { message: message || '', context: context || {} }, Number(process.env.AI_CHAT_TIMEOUT_MS || 120000));
 }
 
+async function designTemplateWithAiServer({ userRequest, analysis, columns, rows, standardFields, layoutRegistry }) {
+  return postJson('/api/template/design', {
+    user_request: userRequest || '',
+    analysis: analysis || {},
+    columns: columns || [],
+    rows: rows || [],
+    standard_fields: standardFields || [],
+    layout_registry: layoutRegistry || []
+  }, Number(process.env.AI_TEMPLATE_DESIGN_TIMEOUT_MS || 120000));
+}
+
 async function getExcelPreview({ filePath, sheetName, maxRows = 80, maxCols = 26 }) {
   const { data } = await axios.post(
     `${aiBaseUrl()}/api/excel/preview`,
@@ -63,4 +74,25 @@ async function getExcelPreview({ filePath, sheetName, maxRows = 80, maxCols = 26
   return data;
 }
 
-module.exports = { uploadFileToAiServer, analyzeWithAiServer, chatWithAiServer, getExcelPreview };
+async function generateExcelWithAiServer({ jobId, fileName, outputMode, template, mappings, mappingJson, columns, rows, job, authorName, templateLayoutMode, designId }) {
+  return postJson('/api/excel/generate', {
+    job_id: jobId,
+    file_name: fileName || null,
+    output_mode: outputMode || 'FREE_FORM',
+    template: template || null,
+    mappings: mappings || [],
+    mapping_json: mappingJson || {},
+    columns: columns || [],
+    rows: rows || [],
+    job: job || {},
+    author_name: authorName || '',
+    template_layout_mode: templateLayoutMode || 'COMPACT_VENDOR_GROUPS',
+    design_id: designId || null,
+  }, Number(process.env.AI_EXCEL_GENERATE_TIMEOUT_MS || 180000));
+}
+
+async function createTemplateSkeletonWithAiServer({ design, fileName }) {
+  return postJson('/api/template/skeleton', { design: design || {}, file_name: fileName || null }, Number(process.env.AI_TEMPLATE_SKELETON_TIMEOUT_MS || 120000));
+}
+
+module.exports = { uploadFileToAiServer, analyzeWithAiServer, chatWithAiServer, designTemplateWithAiServer, generateExcelWithAiServer, createTemplateSkeletonWithAiServer, getExcelPreview };

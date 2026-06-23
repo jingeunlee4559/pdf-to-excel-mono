@@ -52,6 +52,16 @@ REFERENCE_GUIDELINE_COLUMNS = [
     {"key": "remark", "label": "비고"},
 ]
 
+TEXT_VENDOR_COMPARISON_COLUMNS = [
+    {"key": "vendor_name", "label": "업체명"},
+    {"key": "total_amount", "label": "총 견적금액"},
+    {"key": "price_diff", "label": "표준단가 대비"},
+    {"key": "diff_rate", "label": "대비율"},
+    {"key": "remark", "label": "검토의견"},
+]
+
+TEXT_VENDOR_COMPARISON_TABLE_TYPE = "TEXT_VENDOR_COMPARISON_REPORT"
+
 REFERENCE_TABLE_TYPES = {"REFERENCE_GUIDELINE_TABLE", "GUIDELINE_SUMMARY_TABLE"}
 STANDARD_MARKET_TABLE_TYPES = {"STANDARD_MARKET_PRICE_TABLE"}
 
@@ -1382,6 +1392,13 @@ def infer_document_profile(text: str, user_request: str = "") -> Dict[str, Any]:
     lower = text.lower()
     compact = compact_text(text)
 
+    if is_text_only_vendor_comparison_report(text):
+        return {
+            "documentType": "업체별 단가 비교 검토보고서",
+            "purpose": "서술형 업체별 단가 비교 결과와 확인 필요 사항 검토",
+            "confidence": 0.9,
+        }
+
     if is_standard_market_price_document(text):
         return {
             "documentType": "표준시장단가표",
@@ -1564,6 +1581,297 @@ def is_standard_market_price_document(text: str) -> bool:
     compact = compact_text(text)
     markers = ["건설공사표준시장단가", "표준시장단가", "공종코드", "공종명칭", "노무비율"]
     return ("표준시장단가" in compact and "공종코드" in compact and "노무비율" in compact) or sum(1 for marker in markers if compact_text(marker) in compact) >= 3
+
+
+def is_text_only_vendor_comparison_report(text: str) -> bool:
+    compact = compact_text(text)
+    has_compare_title = "업체별단가비교검토보고서" in compact or ("업체별" in compact and "단가비교" in compact and "검토보고서" in compact)
+    has_text_only_policy = any(marker in compact for marker in ["텍스트전용", "문장형텍스트", "표형식자료를사용하지", "행열색상강조요약표등은모두제외", "문단형태로만기술"])
+    has_vendor_totals = "총견적금액" in compact and "표준시장단가" in compact and "최저가" in compact
+    return bool(has_compare_title and (has_text_only_policy or has_vendor_totals))
+
+
+def extract_text_vendor_total_rows(text: str) -> List[Dict[str, Any]]:
+    """서술형 업체별 비교보고서의 총괄 비교 문장에서 업체 총액 행만 보수적으로 추출한다.
+
+    표가 없는 문서에서 임의 품목 행을 만들지 않기 위한 요약용 행이다.
+    개별 공종/업체 단가가 원문에 모두 있지 않으면 확정 단가 비교표로 사용하지 않는다.
+    """
+    rows: List[Dict[str, Any]] = []
+    seen = set()
+    section_match = re.search(r"3\.\s*총괄\s*비교\s*결과(?P<section>.*?)(?:\n\s*4\.|4\.\s*세부)", text, re.S)
+    source_text = section_match.group("section") if section_match else text[:12000]
+    # 예: ㈜한국전기가 12,198,571원으로 ... 표준시장단가 대비 -966,869원, -7.3%
+    patterns = [
+        re.compile(
+            r"(?P<vendor>(?:[A-Z]회사\s*)?(?:㈜|\(주\)|주식회사)?[가-힣A-Za-z0-9·ㆍ]+(?:전기|설비|시스템|일렉|기술)?(?:㈜)?)"
+            r"(?:의)?\s*(?:총\s*)?견적금액은\s*(?P<amount>[0-9]{1,3}(?:,[0-9]{3})+)원"
+            r"(?P<context>.{0,180}?)(?:비교하면|대비)\s*(?P<diff>[+\-]?[0-9]{1,3}(?:,[0-9]{3})+)원\s*,\s*(?P<rate>[+\-]?[0-9]+(?:\.\d+)?)%",
+            re.S,
+        ),
+        re.compile(
+            r"(?P<vendor>(?:[A-Z]회사\s*)?(?:㈜|\(주\)|주식회사)?[가-힣A-Za-z0-9·ㆍ]+(?:전기|설비|시스템|일렉|기술)?(?:㈜)?)"
+            r"(?:가|이|은|는)?\s*(?P<amount>[0-9]{1,3}(?:,[0-9]{3})+)원으로(?P<context>.{0,180}?)(?:대비|비교하여|비교하면)\s*(?P<diff>[+\-]?[0-9]{1,3}(?:,[0-9]{3})+)원\s*,\s*(?P<rate>[+\-]?[0-9]+(?:\.\d+)?)%",
+            re.S,
+        ),
+    ]
+    for pattern in patterns:
+        for m in pattern.finditer(source_text):
+            vendor = clean_cell_text(m.group("vendor"))
+            vendor = re.sub(r"^[A-Z]회사\s*", "", vendor).strip()
+            vendor = re.sub(r"(의|가|이|은|는)$", "", vendor).strip()
+            amount = clean_number(m.group("amount"))
+            diff = clean_number(m.group("diff"))
+            rate = f"{m.group('rate')}%"
+            key = compact_text(f"{vendor}{amount}{diff}{rate}")
+            if not vendor or key in seen:
+                continue
+            seen.add(key)
+            context = _clean_line(m.group("context"), limit=120) if '_clean_line' in globals() else clean_cell_text(m.group("context"))[:120]
+            remark = "가격 측면 우선 검토 대상" if "가장 낮" in context or "우선 검토" in context else "공종별 편차 및 조건 재확인 필요"
+            rows.append({
+                "vendor_name": vendor,
+                "total_amount": amount,
+                "price_diff": diff,
+                "diff_rate": rate,
+                "remark": remark,
+            })
+    return rows[:20]
+
+
+def _extract_requested_quantity_value(user_request: str) -> Tuple[str, str]:
+    """사용자 요청의 수량을 추출한다. 예: '각 수량 50개' -> ('50', '개')."""
+    text = str(user_request or "")
+    patterns = [
+        r"(?:각\s*)?(?:수량|수량은)\s*(?P<qty>[0-9]+(?:\.[0-9]+)?)\s*(?P<unit>개|대|식|m|M|EA|ea|본|장|조)?",
+        r"(?P<qty>[0-9]+(?:\.[0-9]+)?)\s*(?P<unit>개|대|식|m|M|EA|ea|본|장|조)\s*(?:씩|로)?",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text)
+        if m:
+            return clean_number(m.group('qty')), (m.groupdict().get('unit') or '').strip()
+    return "", ""
+
+
+def _extract_requested_item_terms(user_request: str) -> List[str]:
+    """사용자 요청에서 공종/품목명으로 보이는 토큰을 추출한다."""
+    text = str(user_request or "")
+    if not text.strip():
+        return []
+    terms: List[str] = []
+    # '유입변압기설치', '기중차단기 설치'처럼 설치/포설/배선/조립이 붙은 공종명을 우선 추출한다.
+    for m in re.finditer(r"[가-힣A-Za-z0-9·ㆍ()]+\s*(?:설치|포설|배선|조립|제작|철거|교체|시공)", text):
+        term = compact_text(m.group(0))
+        if len(term) >= 3:
+            terms.append(term)
+    cleaned = re.sub(r"(비교|단가|금액|수량|각|업체|회사|견적|표|정리|만들어|해줘|해줄래|그리고|랑|와|과|별로|기준|개|대|식|로|으로)", " ", text)
+    cleaned = re.sub(r"[0-9]+(?:\.[0-9]+)?", " ", cleaned)
+    for piece in re.split(r"[\s,，/]+", cleaned):
+        token = compact_text(piece)
+        if len(token) >= 4 and not any(stop in token for stop in ["대한전기", "파워시스템", "한국전기", "스마트일렉", "전기기술"]):
+            terms.append(token)
+    return list(dict.fromkeys(terms))
+
+
+def _extract_text_report_vendor_master(text: str) -> List[Dict[str, Any]]:
+    """서술형 비교보고서의 업체 기본사항에서 A/B/C/D/E 업체명을 추출한다."""
+    vendors: List[Dict[str, Any]] = []
+    seen = set()
+    section_match = re.search(r"2\.\s*업체\s*기본사항(?P<section>.*?)(?:\n\s*3\.|3\.\s*총괄)", text, re.S)
+    source = section_match.group('section') if section_match else text[:8000]
+    pattern = re.compile(r"(?P<alias>[A-Z])회사\s+(?P<name>(?:㈜|\(주\)|주식회사)?[가-힣A-Za-z0-9·ㆍ]+(?:㈜)?)")
+    for m in pattern.finditer(source):
+        alias = f"{m.group('alias').upper()}회사"
+        name = clean_cell_text(m.group('name'))
+        name = re.sub(r"(의|가|이|은|는)$", "", name).strip()
+        key = compact_text(name)
+        if not name or key in seen:
+            continue
+        seen.add(key)
+        vendors.append({"alias": alias, "name": name, "compareKey": key})
+    return vendors
+
+
+def _select_text_report_vendors(text: str, user_request: str) -> List[Dict[str, Any]]:
+    all_vendors = _extract_text_report_vendor_master(text)
+    if not all_vendors:
+        return []
+    request_terms = _request_vendor_terms_from_message(user_request)
+    compact_request = compact_text(user_request)
+    selected: List[Dict[str, Any]] = []
+    for vendor in all_vendors:
+        vendor_terms = [compact_text(vendor.get('name')), compact_text(vendor.get('alias'))]
+        if any(term and term in compact_request for term in vendor_terms):
+            selected.append(vendor)
+            continue
+        for req in request_terms:
+            if any(req and term and (req in term or term in req) for term in vendor_terms):
+                selected.append(vendor)
+                break
+    if selected:
+        return selected
+    requested_count = _requested_vendor_count(user_request)
+    if requested_count:
+        return all_vendors[:requested_count]
+    return all_vendors
+
+
+def _split_item_name_and_spec(item_text: str) -> Tuple[str, str]:
+    item = clean_cell_text(item_text)
+    # 마지막 규격 토큰을 분리한다. 예: '유입변압기설치 300kVA' -> ('유입변압기설치', '300kVA')
+    m = re.match(r"(?P<name>.*?)(?:\s+(?P<spec>[0-9][0-9A-Za-z.,/×xX㎡㎥㎜㎝㎏kKmMvVaA\- ]+))$", item)
+    if m and m.group('name').strip():
+        return clean_cell_text(m.group('name')), clean_cell_text(m.group('spec'))
+    return item, ""
+
+
+def extract_text_vendor_item_rows(text: str, user_request: str = "") -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """표가 없는 비교보고서에서 공종별 최저/최고 견적 문장을 행으로 추출한다.
+
+    중요: 원문에 특정 업체의 단가가 직접 적힌 경우에만 해당 업체 단가를 채운다.
+    요청 업체가 최저/최고 업체로 등장하지 않는 행은 '확인 필요'로 남긴다.
+    """
+    selected_vendors = _select_text_report_vendors(text, user_request)
+    requested_terms = _extract_requested_item_terms(user_request)
+    request_qty, request_unit = _extract_requested_quantity_value(user_request)
+    rows: List[Dict[str, Any]] = []
+    seen = set()
+    page_header = r"(?:\s*전기공사\s*업체별\s*단가\s*비교\s*검토보고서\s*-\s*텍스트\s*전용\s*샘플\s*\d+\s*)?"
+    vendor_pat = r"(?:[A-Z]회사\s*)?(?:㈜|\(주\)|주식회사)?[가-힣A-Za-z0-9·ㆍ]+(?:㈜)?"
+    pattern = re.compile(
+        r"공종코드\s*(?P<code>[A-Z]{2}[0-9]{3}\.[0-9]{5})\s*항목은\s*"
+        r"(?P<item>.*?)에\s*관한\s*단가\s*검토\s*건이다\.\s*"
+        r"적용\s*단위는\s*(?P<unit>[^\s\.]+)이고\s*표준시장단가는\s*(?P<std>[0-9]{1,3}(?:,[0-9]{3})+)원이다\.\s*"
+        r"이번\s*비교에서\s*최저\s*견적은\s*(?P<low_vendor>" + vendor_pat + r")의" + page_header + r"\s*(?P<low_price>[0-9]{1,3}(?:,[0-9]{3})+)원이며,\s*"
+        r"최고\s*견적은\s*(?P<high_vendor>" + vendor_pat + r")의" + page_header + r"\s*(?P<high_price>[0-9]{1,3}(?:,[0-9]{3})+)원이다\."
+        r"(?P<context>.{0,220}?)"
+        r"(?=공종코드\s*[A-Z]{2}[0-9]{3}\.|[가-힣A-Za-z0-9·ㆍ()]+\s*\([A-Z]{2}[0-9]{2}\*\)에 대한 검토 의견|$)",
+        re.S,
+    )
+    for m in pattern.finditer(text):
+        full_item = clean_cell_text(m.group('item'))
+        compact_item = compact_text(full_item)
+        if requested_terms and not any(term in compact_item or compact_item in term for term in requested_terms):
+            continue
+        item_name, spec = _split_item_name_and_spec(full_item)
+        low_vendor = clean_cell_text(m.group('low_vendor'))
+        high_vendor = clean_cell_text(m.group('high_vendor'))
+        low_vendor = re.sub(r"^[A-Z]회사\s*", "", low_vendor).strip()
+        high_vendor = re.sub(r"^[A-Z]회사\s*", "", high_vendor).strip()
+        low_vendor = re.sub(r"(의|가|이|은|는)$", "", low_vendor).strip()
+        high_vendor = re.sub(r"(의|가|이|은|는)$", "", high_vendor).strip()
+        low_price = clean_number(m.group('low_price'))
+        high_price = clean_number(m.group('high_price'))
+        vendor_prices: Dict[str, Any] = {}
+        vendor_amounts: Dict[str, Any] = {}
+        direct_vendor_map = {
+            compact_text(low_vendor): low_price,
+            compact_text(high_vendor): high_price,
+        }
+        # 선택 업체가 있으면 그 업체만, 없으면 최저/최고 업체를 표시한다.
+        vendors_for_row = selected_vendors or [
+            {"name": low_vendor, "compareKey": compact_text(low_vendor)},
+            {"name": high_vendor, "compareKey": compact_text(high_vendor)},
+        ]
+        for vendor in vendors_for_row:
+            name = clean_cell_text(vendor.get('name'))
+            c_name = compact_text(name)
+            matched_price = ""
+            for direct_name, price in direct_vendor_map.items():
+                if c_name and direct_name and (c_name in direct_name or direct_name in c_name):
+                    matched_price = price
+                    break
+            vendor_prices[name] = matched_price if matched_price else "확인 필요"
+            if request_qty and matched_price:
+                vendor_amounts[name] = int(float(request_qty) * to_number(matched_price))
+            elif request_qty:
+                vendor_amounts[name] = "확인 필요"
+        code = clean_cell_text(m.group('code'))
+        key = compact_text(f"{code}{full_item}{low_vendor}{high_vendor}")
+        if key in seen:
+            continue
+        seen.add(key)
+        remark_parts = []
+        if request_qty:
+            remark_parts.append(f"사용자 요청 수량 {request_qty}{request_unit or ''} 적용")
+        if request_unit and clean_cell_text(m.group('unit')) and compact_text(request_unit) != compact_text(m.group('unit')):
+            remark_parts.append(f"원문 단위 {clean_cell_text(m.group('unit'))}와 요청 단위 {request_unit} 확인 필요")
+        if any(value == "확인 필요" for value in vendor_prices.values()):
+            remark_parts.append("원문에 해당 업체 단가가 직접 제시되지 않은 칸은 확인 필요")
+        rows.append(enrich_row_units({
+            "construction_code": code,
+            "item_name": item_name,
+            "spec": spec,
+            "quantity": request_qty or "",
+            "unit": clean_cell_text(m.group('unit')),
+            "standard_unit_price": clean_number(m.group('std')),
+            "lowest_vendor": low_vendor,
+            "highest_vendor": high_vendor,
+            "vendor_prices": vendor_prices,
+            "vendor_amounts": vendor_amounts,
+            "remark": " / ".join(remark_parts) if remark_parts else "문장 기반 최저/최고 견적 추출",
+        }))
+    return rows[:80], selected_vendors
+
+
+def build_text_vendor_comparison_item_table(text: str, user_request: str = "") -> Dict[str, Any] | None:
+    if not is_text_only_vendor_comparison_report(text):
+        return None
+    rows, selected_vendors = extract_text_vendor_item_rows(text, user_request=user_request)
+    if not rows:
+        return None
+    vendors_meta = []
+    for idx, vendor in enumerate(selected_vendors or []):
+        vendors_meta.append({
+            "index": idx,
+            "name": vendor.get('name'),
+            "vendorName": vendor.get('name'),
+            "label": vendor.get('name'),
+        })
+    # 선택 업체가 없으면 첫 행의 vendor_prices 키를 기준으로 미리보기 업체를 구성한다.
+    if not vendors_meta and rows:
+        for idx, name in enumerate((rows[0].get('vendor_prices') or {}).keys()):
+            vendors_meta.append({"index": idx, "name": name, "vendorName": name, "label": name})
+    return {
+        "tableName": "서술형 업체별 단가 비교표",
+        "tableType": TEXT_VENDOR_COMPARISON_TABLE_TYPE,
+        "columns": [
+            {"key": "construction_code", "label": "공종코드"},
+            {"key": "item_name", "label": "품목명"},
+            {"key": "spec", "label": "규격"},
+            {"key": "quantity", "label": "수량"},
+            {"key": "unit", "label": "단위"},
+            {"key": "standard_unit_price", "label": "표준단가"},
+            {"key": "lowest_vendor", "label": "최저업체"},
+            {"key": "highest_vendor", "label": "최고업체"},
+            {"key": "remark", "label": "검토의견"},
+        ],
+        "rows": rows,
+        "meta": {
+            "sourceMode": "text_only_vendor_comparison_item_rows",
+            "vendors": vendors_meta,
+            "templateLayoutMode": "COMPACT_VENDOR_GROUPS",
+            "notice": "표가 없는 보고서에서 공종별 최저/최고 견적 문장을 추출했습니다. 요청 업체 단가가 원문에 직접 없으면 확인 필요로 표시합니다.",
+            "requestedText": user_request or "",
+        },
+    }
+
+
+def build_text_vendor_comparison_summary_table(text: str, user_request: str = "") -> Dict[str, Any] | None:
+    if not is_text_only_vendor_comparison_report(text):
+        return None
+    rows = extract_text_vendor_total_rows(text)
+    return {
+        "tableName": "서술형 업체별 단가 비교 요약",
+        "tableType": TEXT_VENDOR_COMPARISON_TABLE_TYPE,
+        "columns": TEXT_VENDOR_COMPARISON_COLUMNS,
+        "rows": rows,
+        "meta": {
+            "sourceMode": "text_only_vendor_comparison_report",
+            "notice": "표가 없는 보고서에서 총괄 업체별 금액만 추출했습니다. 개별 공종 단가는 원문에 명시된 범위에서만 확인해야 합니다.",
+            "requestedText": user_request or "",
+        },
+    }
 
 
 def _split_text_pages(text: str) -> List[Dict[str, Any]]:
@@ -2678,6 +2986,8 @@ def infer_rows_from_text(text: str, filename: str) -> List[Dict[str, Any]]:
     이전 버전처럼 본문에 숫자나 '견적서'라는 단어가 일부 있다는 이유로 임의 행을 만들지 않는다.
     표 형태가 명확하지 않으면 빈 배열을 반환하고, 분석 요약/확인 필요로 처리한다.
     """
+    if is_text_only_vendor_comparison_report(text):
+        return []
     if is_reference_or_guideline_document(text):
         return extract_reference_guideline_rows(text, user_request="")
     if is_narrative_document(text):
@@ -2723,7 +3033,7 @@ def infer_rows_from_text(text: str, filename: str) -> List[Dict[str, Any]]:
 
 def validate_rows(rows: List[Dict[str, Any]], table_type: str = "NORMAL_TABLE") -> List[Dict[str, Any]]:
     # 기준서/일반 표준단가표는 업체별 비교표가 아니므로 행별 단위 경고를 남발하지 않는다.
-    if table_type in {"IMAGE_TABLE", "GENERAL_TABLE", "OCR_TABLE", "REFERENCE_GUIDELINE_TABLE", "GUIDELINE_SUMMARY_TABLE", "STANDARD_MARKET_PRICE_TABLE"}:
+    if table_type in {"IMAGE_TABLE", "GENERAL_TABLE", "OCR_TABLE", "REFERENCE_GUIDELINE_TABLE", "GUIDELINE_SUMMARY_TABLE", "STANDARD_MARKET_PRICE_TABLE", TEXT_VENDOR_COMPARISON_TABLE_TYPE}:
         return []
 
     issues: List[Dict[str, Any]] = []
@@ -3174,14 +3484,14 @@ def normalize_llm_result(llm_result: Dict[str, Any], fallback_rows: List[Dict[st
         normalized_rows = filter_grounded_rows(fallback_rows, source_text)
 
     table_type = table.get("tableType") or table.get("table_type") or fallback_table_type
-    if table_type not in {"PRICE_COMPARISON", "NORMAL_TABLE", "REFERENCE_GUIDELINE_TABLE", "GUIDELINE_SUMMARY_TABLE", "STANDARD_MARKET_PRICE_TABLE", MULTI_VENDOR_COMPARE_TABLE_TYPE}:
+    if table_type not in {"PRICE_COMPARISON", "NORMAL_TABLE", "REFERENCE_GUIDELINE_TABLE", "GUIDELINE_SUMMARY_TABLE", "STANDARD_MARKET_PRICE_TABLE", TEXT_VENDOR_COMPARISON_TABLE_TYPE, MULTI_VENDOR_COMPARE_TABLE_TYPE}:
         table_type = fallback_table_type
     if is_reference_or_guideline_document(source_text) and (normalized_rows or fallback_table_type in REFERENCE_TABLE_TYPES):
         table_type = "REFERENCE_GUIDELINE_TABLE"
     if not normalized_rows:
         table_type = "REFERENCE_GUIDELINE_TABLE" if fallback_table_type in REFERENCE_TABLE_TYPES else "NORMAL_TABLE"
 
-    default_cols_for_type = REFERENCE_GUIDELINE_COLUMNS if table_type in REFERENCE_TABLE_TYPES else (STANDARD_MARKET_PRICE_COLUMNS if table_type in STANDARD_MARKET_TABLE_TYPES else DEFAULT_COLUMNS)
+    default_cols_for_type = REFERENCE_GUIDELINE_COLUMNS if table_type in REFERENCE_TABLE_TYPES else (STANDARD_MARKET_PRICE_COLUMNS if table_type in STANDARD_MARKET_TABLE_TYPES else (TEXT_VENDOR_COMPARISON_COLUMNS if table_type == TEXT_VENDOR_COMPARISON_TABLE_TYPE else DEFAULT_COLUMNS))
     normalized_table = {
         "tableName": table.get("tableName") or table.get("table_name") or ("기준서 항목 표" if table_type in REFERENCE_TABLE_TYPES else "문서 표 후보"),
         "tableType": table_type,
@@ -3244,6 +3554,318 @@ def normalize_llm_result(llm_result: Dict[str, Any], fallback_rows: List[Dict[st
         })
 
     return normalized_analysis, normalized_table, normalized_issues
+
+
+def _first_text(*values: Any) -> str:
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, list):
+            parts = []
+            for item in value:
+                if isinstance(item, dict):
+                    parts.append(str(item.get("value") or item.get("content") or item.get("text") or ""))
+                else:
+                    parts.append(str(item or ""))
+            text = "\n".join(part.strip() for part in parts if part and str(part).strip()).strip()
+            if text:
+                return text
+            continue
+        if isinstance(value, dict):
+            text = str(value.get("value") or value.get("content") or value.get("text") or value.get("summary") or "").strip()
+            if text:
+                return text
+            continue
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _clean_business_sentence(value: Any) -> str:
+    text = clean_cell_text(value)
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"^[•\-–—*\s]+", "", text).strip()
+    return text
+
+
+def _looks_like_user_format_request(value: Any) -> bool:
+    text = _clean_business_sentence(value)
+    if not text:
+        return False
+    prompt_tokens = [
+        "정리해줘", "작성해줘", "만들어줘", "써줘", "출력해줘",
+        "회사 업무보고서 형식", "회사 보고서 형식", "핵심 내용만",
+        "보고 목적·", "검토 결과·", "조치 계획 중심",
+        "원문에 없는 내용", "임의로 만들지", "확인 필요로 표시",
+    ]
+    return any(token in text for token in prompt_tokens)
+
+
+def _safe_document_purpose(value: Any) -> str:
+    text = _clean_business_sentence(value)
+    if not text or _looks_like_user_format_request(text):
+        return ""
+    generic_values = {
+        compact_text("문서 데이터 엑셀화 목적"),
+        compact_text("문서 내용 요약 및 표 데이터 추출 가능 여부 확인"),
+        compact_text("문서 데이터 엑셀화"),
+    }
+    if compact_text(text) in generic_values:
+        return ""
+    return text
+
+
+def _infer_report_purpose_from_document(analysis: Dict[str, Any], combined_text: str, topics: List[str]) -> str:
+    source = " ".join([
+        _clean_business_sentence(analysis.get("documentType") or analysis.get("document_type") or ""),
+        _clean_business_sentence(analysis.get("summary") or ""),
+        _clean_business_sentence(combined_text[:3000]),
+        " ".join(topics or []),
+    ])
+    if any(word in source for word in ["점검", "안전", "위험", "현장", "감리", "지적사항"]):
+        return "첨부 문서의 현장 점검 내용과 확인 필요 사항을 검토하기 위한 보고입니다."
+    if any(word in source for word in ["견적", "단가", "금액", "업체", "비교", "견적서"]):
+        return "첨부 문서의 견적·단가·업체 비교 내용을 검토하기 위한 보고입니다."
+    if any(word in source for word in ["회의", "안건", "결정", "조치사항", "협의"]):
+        return "첨부 문서의 논의 내용과 후속 조치 사항을 정리하기 위한 보고입니다."
+    if any(word in source for word in ["작업일보", "작업일지", "공정", "물량"]):
+        return "첨부 문서의 작업 현황과 후속 관리 사항을 정리하기 위한 보고입니다."
+    return "첨부 문서의 주요 내용과 확인 필요 사항을 업무 보고 형식으로 정리하기 위한 보고입니다."
+
+
+def _split_business_sentences(text: str, limit: int = 8) -> List[str]:
+    normalized = str(text or "").replace("\r", "\n")
+    chunks: List[str] = []
+    for line in normalized.splitlines():
+        line = _clean_business_sentence(line)
+        if not line:
+            continue
+        # 너무 긴 줄은 문장 단위로 한 번 더 나눈다.
+        pieces = re.split(r"(?<=[.。!?])\s+|(?<=다\.)\s+|(?<=요\.)\s+", line)
+        for piece in pieces:
+            item = _clean_business_sentence(piece)
+            if 8 <= len(item) <= 220:
+                chunks.append(item)
+            elif len(item) > 220:
+                chunks.append(item[:220].rstrip() + "…")
+        if len(chunks) >= limit:
+            break
+    # 중복 제거
+    out: List[str] = []
+    seen = set()
+    for chunk in chunks:
+        key = compact_text(chunk)
+        if key and key not in seen:
+            seen.add(key)
+            out.append(chunk)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _bullet_text(items: List[str], empty: str = "") -> str:
+    clean_items = [_clean_business_sentence(item) for item in items if _clean_business_sentence(item)]
+    if not clean_items:
+        return empty
+    return "\n".join(f"• {item}" for item in clean_items)
+
+
+def _extract_document_title_from_text(text: str, user_request: str = "") -> str:
+    request = _clean_business_sentence(user_request)
+    # 사용자가 특정 제목을 짧게 지정한 경우만 제목 근거로 사용한다.
+    # "회사 업무보고서 형식으로 정리해줘" 같은 작성 지시는 제목/보고목적에 넣지 않는다.
+    if request and not _looks_like_user_format_request(request):
+        m = re.search(r"([가-힣A-Za-z0-9·ㆍ\s/()\-]{4,60})(보고서|회의록|공문|검토서)", request)
+        if m:
+            return _clean_business_sentence(m.group(0))[:70]
+    for line in str(text or "").splitlines()[:40]:
+        line = _clean_business_sentence(line)
+        if 4 <= len(line) <= 70 and any(token in line for token in ["보고서", "회의록", "검토", "현황", "공문", "작업일보", "지시사항"]):
+            return line[:70]
+    if request and not _looks_like_user_format_request(request):
+        return request[:60]
+    return "업무 문서 검토 보고서"
+
+
+def _extract_key_topics(text: str, user_request: str = "", limit: int = 6) -> List[str]:
+    source = f"{user_request}\n{text[:6000]}"
+    topics: List[str] = []
+    patterns = [
+        r"([가-힣A-Za-z0-9·ㆍ/()\-\s]{2,40})(?:\s*[:：]\s*)([가-힣A-Za-z0-9·ㆍ/()\-\s]{2,80})",
+        r"(설계변경|협력업체|작업일보|물량|일정|감리\s*지적사항|발주처\s*회의\s*지시사항|임시전력\s*안전점검|안전점검|EPS\s*변경|위험요인)",
+    ]
+    for pattern in patterns:
+        for m in re.finditer(pattern, source, re.I):
+            value = _clean_business_sentence(" ".join(g for g in m.groups() if g))
+            if value and len(value) >= 2:
+                topics.append(value)
+    # 일반 명사성 키워드 보강. 단, 단일어만 있을 때는 보고서 본문에서 '확인항목'으로만 사용한다.
+    for line in _split_business_sentences(source, limit=30):
+        if any(word in line for word in ["설계변경", "협력업체", "작업일보", "물량", "일정", "감리", "발주처", "회의", "지시", "안전", "점검", "위험", "EPS"]):
+            topics.append(line)
+    out: List[str] = []
+    seen = set()
+    for topic in topics:
+        key = compact_text(topic)
+        if key and key not in seen:
+            seen.add(key)
+            out.append(topic)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _extract_action_candidates(text: str, issues: List[Dict[str, Any]], user_request: str = "", limit: int = 6) -> List[Dict[str, str]]:
+    source_lines = _split_business_sentences(f"{user_request}\n{text[:9000]}", limit=80)
+    action_words = ["조치", "처리", "미종결", "지시", "점검", "보완", "확인", "검토", "협의", "변경", "수립", "제출", "보고", "관리", "요청"]
+    stop_exact = {"물량", "일정", "품질", "안전", "회의", "작업일보", "협력업체"}
+    candidates: List[str] = []
+    for line in source_lines:
+        compact = compact_text(line)
+        if compact in {compact_text(x) for x in stop_exact}:
+            continue
+        if len(line) < 8:
+            continue
+        if any(word in line for word in action_words):
+            candidates.append(line)
+    for issue in issues or []:
+        message = _clean_business_sentence(issue.get("message") or issue.get("fieldLabel") or "")
+        if message and len(message) >= 8:
+            candidates.append(message)
+    if not candidates:
+        topics = _extract_key_topics(text, user_request=user_request, limit=4)
+        for topic in topics:
+            if any(word in topic for word in ["미종결", "지시", "점검", "변경", "위험", "감리", "발주처"]):
+                candidates.append(f"{topic}에 대한 담당자 지정 및 처리 현황 확인")
+    out: List[Dict[str, str]] = []
+    seen = set()
+    for candidate in candidates:
+        candidate = _clean_business_sentence(candidate)
+        key = compact_text(candidate)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        # 문장 자체가 너무 제목형이면 업무 지시문으로 바꾼다. 원문 항목명은 보존한다.
+        if not any(word in candidate for word in ["확인", "조치", "처리", "검토", "점검", "보완", "제출", "보고", "협의", "수립"]):
+            action_text = f"{candidate} 관련 처리 필요 여부 확인"
+        else:
+            action_text = candidate
+        out.append({
+            "action_item": action_text[:180],
+            "owner": "확인 필요",
+            "due_date": "미정",
+            "status": "확인 필요",
+            "remark": "원문 근거 확인 후 담당자/기한 확정",
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _make_business_drafts(
+    user_request: str,
+    analysis: Dict[str, Any],
+    table: Dict[str, Any],
+    issues: List[Dict[str, Any]],
+    combined_text: str,
+    file_profiles: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    rows = table.get("rows") if isinstance(table, dict) and isinstance(table.get("rows"), list) else []
+    row_count = len(rows)
+    file_count = len(file_profiles or [])
+    title = _extract_document_title_from_text(combined_text, user_request)
+    topics = _extract_key_topics(combined_text, user_request=user_request, limit=6)
+    sentences = _split_business_sentences(combined_text, limit=6)
+    actions = _extract_action_candidates(combined_text, issues, user_request=user_request, limit=6)
+
+    request_text = _clean_business_sentence(user_request)
+    purpose = _first_text(
+        _safe_document_purpose(analysis.get("purpose")),
+        _safe_document_purpose(analysis.get("documentPurpose") or analysis.get("document_purpose")),
+        _infer_report_purpose_from_document(analysis, combined_text, topics),
+    )
+    source_overview_parts = []
+    if file_count:
+        source_overview_parts.append(f"첨부 파일 {file_count}건을 기준으로 검토했습니다.")
+    page_total = sum(int(item.get("pageCount") or item.get("page_count") or 0) for item in file_profiles or [] if isinstance(item, dict))
+    if page_total:
+        source_overview_parts.append(f"확인된 총 페이지 수는 {page_total}페이지입니다.")
+    if row_count:
+        source_overview_parts.append(f"표 후보 {row_count}행을 함께 확인했습니다.")
+    else:
+        source_overview_parts.append("견적/단가표 형태의 반복 행은 별도로 확인되지 않았습니다.")
+
+    review_items = []
+    if topics:
+        review_items.extend(topics[:5])
+    if sentences:
+        review_items.extend(sentences[:3])
+    if not review_items:
+        review_items.append(_clean_business_sentence(analysis.get("summary") or "첨부 문서의 본문 내용을 기준으로 검토했습니다."))
+
+    issue_items = []
+    if actions:
+        issue_items.extend([item["action_item"] for item in actions[:4]])
+    if issues:
+        issue_items.extend([_clean_business_sentence(item.get("message") or item.get("fieldLabel") or "") for item in issues[:4]])
+    issue_items = [item for item in issue_items if item]
+    if not issue_items:
+        issue_items.append("원문에서 별도의 확정 결론보다 검토·확인 대상 중심의 내용이 확인됩니다.")
+
+    if actions:
+        action_plan = _bullet_text([f"{item['action_item']} / 담당자: {item['owner']} / 기한: {item['due_date']}" for item in actions])
+    else:
+        action_plan = "• 원문에 명시된 후속 조치사항은 확인되지 않았습니다. 필요 시 담당자와 기한을 지정하여 후속 관리하세요."
+
+    report = {
+        "report_title": title if "보고" in title else f"{title} 보고서",
+        "report_purpose": purpose,
+        "summary": _bullet_text([*source_overview_parts, *review_items[:5]]),
+        "issue_summary": _bullet_text(issue_items[:5]),
+        "review_opinion": _bullet_text(issue_items[:5]),
+        "action_plan": action_plan,
+        "footer_note": "본 보고서는 첨부 문서에서 추출된 내용 기준의 초안입니다. 최종 제출 전 원문, 수치, 담당자, 기한을 확인하세요.",
+    }
+
+    meeting = {
+        "meeting_title": title if "회의" in title else f"{title} 검토 회의록",
+        "meeting_date": "",
+        "meeting_place": "",
+        "attendees": "",
+        "agenda": _bullet_text([purpose, *topics[:4]], empty=purpose),
+        "discussion": _bullet_text([*source_overview_parts, *review_items[:5]]),
+        "decision": "원문에 명시된 최종 결정사항은 확인되지 않았습니다. 회의 확정 후 결정사항을 입력하세요.",
+        "remark": "문서 분석 결과 기준 회의록 초안입니다. 참석자, 장소, 최종 결정사항은 회의 후 확정 입력하세요.",
+        "action_items": actions,
+    }
+
+    body_lines = [
+        "1. 귀 부서의 업무 협조에 감사드립니다.",
+        f"2. {purpose}",
+        "3. 주요 검토 내용은 아래와 같습니다.",
+        *[f"   - {item}" for item in review_items[:4]],
+    ]
+    if actions:
+        body_lines.extend(["4. 아래 사항에 대한 확인 및 조치를 요청드립니다.", *[f"   - {item['action_item']}" for item in actions[:4]]])
+    else:
+        body_lines.append("4. 원문에 명시된 별도 조치사항은 확인되지 않았으나, 필요 시 담당자 지정 후 후속 관리 바랍니다.")
+    official = {
+        "letter_title": "공 문",
+        "document_no": "",
+        "recipient": "수신처 확인 필요",
+        "reference": "",
+        "document_title": title,
+        "body": "\n".join(body_lines),
+        "attachment_note": "첨부 문서 참조",
+        "sender": "공사팀",
+    }
+
+    return {
+        "report": report,
+        "meeting": meeting,
+        "officialLetter": official,
+    }
 
 
 async def analyze_uploads(files: List[UploadFile], user_request: str, output_mode: str, template_id: str | None) -> Dict[str, Any]:
@@ -3334,10 +3956,21 @@ async def analyze_uploads(files: List[UploadFile], user_request: str, output_mod
     profile = infer_document_profile(combined_text, user_request)
     file_profiles = build_file_profiles(parsed_files, user_request=user_request, llm_intent=llm_intent)
     wants_price_compare = any(word in (user_request or "") for word in ["단가", "비교", "가격", "견적", "업체", "회사", "최저"]) or intent_name == "COMPANY_COMPARISON"
-    multi_compare_table = build_multi_vendor_price_comparison(parsed_files, user_request=user_request, llm_intent=llm_intent)
-    if not multi_compare_table:
-        multi_compare_table = build_single_file_multi_vendor_price_comparison(parsed_files, user_request=user_request, llm_intent=llm_intent)
-    is_standard_market_doc = is_standard_market_price_document(combined_text) and not _request_wants_company_comparison(user_request, llm_intent)
+    text_only_compare_report = is_text_only_vendor_comparison_report(combined_text)
+    multi_compare_table = None
+    if not text_only_compare_report:
+        multi_compare_table = build_multi_vendor_price_comparison(parsed_files, user_request=user_request, llm_intent=llm_intent)
+        if not multi_compare_table:
+            multi_compare_table = build_single_file_multi_vendor_price_comparison(parsed_files, user_request=user_request, llm_intent=llm_intent)
+    narrative_compare_table = None
+    if text_only_compare_report:
+        # 표가 없는 비교보고서에서 사용자가 특정 품목/업체/표 생성을 요청하면
+        # 총괄 금액 행이 아니라 공종별 문장 기반 비교 행을 먼저 만든다.
+        # 원문에 없는 특정 업체 단가는 만들지 않고 확인 필요로 남긴다.
+        narrative_compare_table = build_text_vendor_comparison_item_table(combined_text, user_request=user_request)
+        if not narrative_compare_table:
+            narrative_compare_table = build_text_vendor_comparison_summary_table(combined_text, user_request=user_request)
+    is_standard_market_doc = is_standard_market_price_document(combined_text) and not _request_wants_company_comparison(user_request, llm_intent) and not text_only_compare_report
 
     if multi_compare_table:
         all_rows = multi_compare_table.get("rows", [])
@@ -3347,6 +3980,15 @@ async def analyze_uploads(files: List[UploadFile], user_request: str, output_mod
             "documentType": document_type,
             "purpose": "업체별 견적 단가를 공종별로 비교",
             "confidence": 0.88,
+        }
+    elif narrative_compare_table:
+        all_rows = narrative_compare_table.get("rows", [])
+        table_type = TEXT_VENDOR_COMPARISON_TABLE_TYPE
+        document_type = "업체별 단가 비교 검토보고서"
+        profile = {
+            "documentType": document_type,
+            "purpose": "서술형 업체별 단가 비교 결과와 확인 필요 사항 검토",
+            "confidence": 0.9,
         }
     else:
         if is_standard_market_doc:
@@ -3385,7 +4027,7 @@ async def analyze_uploads(files: List[UploadFile], user_request: str, output_mod
         "purpose": profile.get("purpose") or "문서 데이터 엑셀화",
         "summary": (
             f"첨부 파일 {len(files)}개, 총 {total_page_count}페이지에서 PyMuPDF/pdfplumber/PP-Structure 기반으로 텍스트 {total_text_chars:,}자를 추출했습니다. "
-            + (f"업체 견적 단가를 비교하여 {len(all_rows)}행의 업체별 단가 비교표를 생성했습니다. " if table_type == MULTI_VENDOR_COMPARE_TABLE_TYPE else (f"표준시장단가 자료로 판단하여 공종별 단가 행 {len(all_rows)}행을 표로 정리했습니다. " if table_type in STANDARD_MARKET_TABLE_TYPES else (f"기준서/지침서 문서로 판단하여 원문에 있는 기준·단가·산정 문장 {len(all_rows)}행을 표로 정리했습니다. " if table_type in REFERENCE_TABLE_TYPES else f"표 후보 {len(all_rows)}행을 확인했습니다. ")))
+            + (f"업체 견적 단가를 비교하여 {len(all_rows)}행의 업체별 단가 비교표를 생성했습니다. " if table_type == MULTI_VENDOR_COMPARE_TABLE_TYPE else (f"표가 없는 서술형 비교보고서로 판단하여 총괄 업체별 비교 요약 {len(all_rows)}행을 추출했습니다. " if table_type == TEXT_VENDOR_COMPARISON_TABLE_TYPE else (f"표준시장단가 자료로 판단하여 공종별 단가 행 {len(all_rows)}행을 표로 정리했습니다. " if table_type in STANDARD_MARKET_TABLE_TYPES else (f"기준서/지침서 문서로 판단하여 원문에 있는 기준·단가·산정 문장 {len(all_rows)}행을 표로 정리했습니다. " if table_type in REFERENCE_TABLE_TYPES else f"표 후보 {len(all_rows)}행을 확인했습니다. "))))
             + f"요청 내용은 '{user_request}'이며, 산출 방식은 {output_mode}입니다. "
             + "원문에 근거가 없는 품목·금액·단가는 생성하지 않습니다."
         ),
@@ -3412,22 +4054,36 @@ async def analyze_uploads(files: List[UploadFile], user_request: str, output_mod
             *([{"label": "검색 키워드", "value": ", ".join(map(str, intent_keywords))}] if intent_keywords else []),
             *([{"label": "LLM 의도분석 오류", "value": llm_intent_error[:120]}] if llm_intent_error else []),
             *([{"label": "비교 모드", "value": "업체별 견적 단가 비교"}] if table_type == MULTI_VENDOR_COMPARE_TABLE_TYPE else []),
+            *([{"label": "비교 모드", "value": "서술형 업체별 비교보고서 요약"}] if table_type == TEXT_VENDOR_COMPARISON_TABLE_TYPE else []),
             *([{"label": "비교 업체 수", "value": (multi_compare_table.get("meta", {}) or {}).get("vendorCount", 0)}] if multi_compare_table else []),
         ],
     }
     if multi_compare_table:
         table = multi_compare_table
         table_columns = table.get("columns", [])
+    elif narrative_compare_table:
+        table = narrative_compare_table
+        table_columns = table.get("columns", [])
     else:
-        table_columns = REFERENCE_GUIDELINE_COLUMNS if table_type in REFERENCE_TABLE_TYPES else (STANDARD_MARKET_PRICE_COLUMNS if table_type in STANDARD_MARKET_TABLE_TYPES else DEFAULT_COLUMNS)
+        table_columns = REFERENCE_GUIDELINE_COLUMNS if table_type in REFERENCE_TABLE_TYPES else (STANDARD_MARKET_PRICE_COLUMNS if table_type in STANDARD_MARKET_TABLE_TYPES else (TEXT_VENDOR_COMPARISON_COLUMNS if table_type == TEXT_VENDOR_COMPARISON_TABLE_TYPE else DEFAULT_COLUMNS))
         table_columns = prune_empty_columns(table_columns, all_rows)
         table = {
-            "tableName": "기준서 항목 표" if table_type in REFERENCE_TABLE_TYPES else ("표준시장단가 표" if table_type in STANDARD_MARKET_TABLE_TYPES else "문서 표 후보"),
+            "tableName": "기준서 항목 표" if table_type in REFERENCE_TABLE_TYPES else ("표준시장단가 표" if table_type in STANDARD_MARKET_TABLE_TYPES else ("서술형 업체별 단가 비교 요약" if table_type == TEXT_VENDOR_COMPARISON_TABLE_TYPE else "문서 표 후보")),
             "tableType": table_type,
             "columns": table_columns,
             "rows": all_rows,
         }
     issues = validate_rows(all_rows, table_type=table_type)
+    business_drafts = _make_business_drafts(user_request, analysis, table, issues, combined_text, file_profiles)
+    analysis["drafts"] = business_drafts
+    analysis["reportDraft"] = business_drafts.get("report")
+    analysis["meetingDraft"] = business_drafts.get("meeting")
+    analysis["officialLetterDraft"] = business_drafts.get("officialLetter")
+    if isinstance(table, dict):
+        meta = dict(table.get("meta") or {})
+        meta["drafts"] = business_drafts
+        meta["draftPolicy"] = "업무 양식 미리보기용 초안. 원문에 없는 담당자/기한은 확인 필요 또는 미정으로 표시"
+        table["meta"] = meta
     for parsed in parsed_files:
         table_metrics = ((parsed.get("parseMetrics") or {}).get("tables") or {}) if isinstance(parsed, dict) else {}
         if table_metrics.get("rowLimitReached"):
@@ -3511,6 +4167,17 @@ async def analyze_uploads(files: List[UploadFile], user_request: str, output_mod
             analysis.setdefault("keyValues", []).extend([
                 {"label": "LLM 구조화", "value": "실패 → 원문 파서 결과 유지"},
             ])
+
+    # LLM이 analysis 객체를 보정해도 업무 양식 초안은 유지한다.
+    if "business_drafts" in locals():
+        analysis["drafts"] = business_drafts
+        analysis["reportDraft"] = business_drafts.get("report")
+        analysis["meetingDraft"] = business_drafts.get("meeting")
+        analysis["officialLetterDraft"] = business_drafts.get("officialLetter")
+        if isinstance(table, dict):
+            meta = dict(table.get("meta") or {})
+            meta["drafts"] = business_drafts
+            table["meta"] = meta
 
     # LLM/파서 역할을 화면에서 명확히 구분한다.
     analysis.setdefault("keyValues", []).extend([

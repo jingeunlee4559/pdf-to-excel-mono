@@ -139,6 +139,35 @@ const extractedTableSchema = numericIdSchema({
   status: { type: String, default: 'DRAFT', index: true },
 });
 
+
+const candidateFieldSchema = numericIdSchema({
+  job_id: { type: Number, required: true, index: true },
+  table_id: { type: Number, default: null, index: true },
+  original_label: { type: String, required: true },
+  suggested_field_key: { type: String, required: true, index: true },
+  suggested_data_type: { type: String, default: 'TEXT' },
+  matched_standard_field: { type: String, default: null },
+  confidence: { type: Number, default: 0.7 },
+  source: { type: String, default: 'AI_OR_USER' },
+  status: { type: String, default: 'PENDING', index: true },
+  active_yn: { type: String, default: 'Y', index: true },
+});
+candidateFieldSchema.index({ job_id: 1, table_id: 1, suggested_field_key: 1 }, { unique: false });
+
+const tableEditLogSchema = numericIdSchema(
+  {
+    job_id: { type: Number, required: true, index: true },
+    table_id: { type: Number, default: null, index: true },
+    action: { type: String, required: true, index: true },
+    row_id: { type: String, default: null },
+    column_key: { type: String, default: null, index: true },
+    before_value: { type: Schema.Types.Mixed, default: null },
+    after_value: { type: Schema.Types.Mixed, default: null },
+    edited_by: { type: Number, default: null, index: true },
+  },
+  { timestamps: { createdAt: 'created_at', updatedAt: false }, versionKey: false, minimize: false }
+);
+
 const reviewIssueSchema = numericIdSchema(
   {
     job_id: { type: Number, required: true, index: true },
@@ -174,6 +203,26 @@ const generatedExcelSchema = numericIdSchema(
   { timestamps: { createdAt: 'created_at', updatedAt: false }, versionKey: false, minimize: false }
 );
 
+
+const documentTemplateRecommendationSchema = numericIdSchema(
+  {
+    job_id: { type: Number, required: true, index: true },
+    template_id: { type: Number, default: null, index: true },
+    recommendation_type: { type: String, default: 'EXISTING_TEMPLATE', index: true },
+    template_name: { type: String, default: null },
+    template_type: { type: String, default: null, index: true },
+    score: { type: Number, default: 0, index: true },
+    rank: { type: Number, default: 0, index: true },
+    reason_json: { type: Schema.Types.Mixed, default: [] },
+    matched_fields_json: { type: Schema.Types.Mixed, default: [] },
+    missing_fields_json: { type: Schema.Types.Mixed, default: [] },
+    design_json: { type: Schema.Types.Mixed, default: null },
+    status: { type: String, default: 'RECOMMENDED', index: true },
+    applied_yn: { type: String, default: 'N', index: true },
+  },
+  { timestamps: { createdAt: 'created_at', updatedAt: false }, versionKey: false, minimize: false }
+);
+
 const documentChatSessionSchema = numericIdSchema({
   user_id: { type: Number, required: true, index: true },
   active_job_id: { type: Number, default: null, index: true },
@@ -205,8 +254,11 @@ const DocumentJob = mongoose.models.DocumentJob || mongoose.model('DocumentJob',
 const SourceFile = mongoose.models.SourceFile || mongoose.model('SourceFile', sourceFileSchema, 'source_files');
 const DocumentAnalysisResult = mongoose.models.DocumentAnalysisResult || mongoose.model('DocumentAnalysisResult', documentAnalysisResultSchema, 'document_analysis_results');
 const ExtractedTable = mongoose.models.ExtractedTable || mongoose.model('ExtractedTable', extractedTableSchema, 'extracted_tables');
+const CandidateField = mongoose.models.CandidateField || mongoose.model('CandidateField', candidateFieldSchema, 'candidate_fields');
+const TableEditLog = mongoose.models.TableEditLog || mongoose.model('TableEditLog', tableEditLogSchema, 'table_edit_logs');
 const ReviewIssue = mongoose.models.ReviewIssue || mongoose.model('ReviewIssue', reviewIssueSchema, 'review_issues');
 const GeneratedExcel = mongoose.models.GeneratedExcel || mongoose.model('GeneratedExcel', generatedExcelSchema, 'generated_excels');
+const DocumentTemplateRecommendation = mongoose.models.DocumentTemplateRecommendation || mongoose.model('DocumentTemplateRecommendation', documentTemplateRecommendationSchema, 'document_template_recommendations');
 const DocumentChatSession = mongoose.models.DocumentChatSession || mongoose.model('DocumentChatSession', documentChatSessionSchema, 'document_chat_sessions');
 const DocumentChatMessage = mongoose.models.DocumentChatMessage || mongoose.model('DocumentChatMessage', documentChatMessageSchema, 'document_chat_messages');
 
@@ -223,8 +275,11 @@ module.exports = {
   SourceFile,
   DocumentAnalysisResult,
   ExtractedTable,
+  CandidateField,
+  TableEditLog,
   ReviewIssue,
   GeneratedExcel,
+  DocumentTemplateRecommendation,
   DocumentChatSession,
   DocumentChatMessage,
 };

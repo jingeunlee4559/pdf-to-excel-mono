@@ -2,6 +2,7 @@ const pool = require('../config/db');
 const asyncHandler = require('../utils/asyncHandler');
 const { parseJson } = require('../utils/mapper');
 const { uploadFileToAiServer, getExcelPreview } = require('../services/aiServerService');
+const { ensureTemplateMappingJson } = require('../utils/templateAutoMapping');
 
 function makeTemplateCode(templateName = 'TEMPLATE') {
   const compact = String(templateName)
@@ -13,7 +14,7 @@ function makeTemplateCode(templateName = 'TEMPLATE') {
   return `${compact || 'TEMPLATE'}_${Date.now()}`.slice(0, 96);
 }
 
-const SYSTEM_SEED_TEMPLATE_CODES = ['NORMAL_TABLE_V1', 'COMPARISON_MATRIX_V1', 'WORK_LOG_TABLE_V1'];
+const SYSTEM_SEED_TEMPLATE_CODES = ['NORMAL_TABLE_V1', 'COMPARISON_MATRIX_V1', 'WORK_LOG_TABLE_V1', 'ESTIMATE_FORM_V1', 'UNIT_PRICE_TABLE_V1', 'BUSINESS_REPORT_V1', 'MEETING_MINUTES_V1', 'OFFICIAL_LETTER_V1'];
 
 function toTemplate(row) {
   const mappingJson = parseJson(row.mapping_json, null);
@@ -21,6 +22,7 @@ function toTemplate(row) {
   return {
     id: row.id,
     templateId: row.id,
+    createdBy: row.created_by,
     templateName: row.template_name,
     templateCode: row.template_code,
     templateType: row.template_type,
@@ -73,11 +75,14 @@ const createTemplate = asyncHandler(async (req, res) => {
       [req.user.id, templateName, safeTemplateCode, templateType || 'NORMAL_TABLE', filePath, originalFileName, mapping.sheetName || mapping.sheet || null, description || null]
     );
 
-    const defaultMapping = {
-      sheetName: mapping.sheetName || mapping.sheet || null,
-      mappings: Array.isArray(mapping.mappings) ? mapping.mappings : [],
-      aiServerStoredName: storedName
-    };
+      const defaultMapping = ensureTemplateMappingJson(
+      {
+        ...mapping,
+        sheetName: mapping.sheetName || mapping.sheet || null,
+        aiServerStoredName: storedName,
+      },
+      { template_name: templateName, template_type: templateType || 'NORMAL_TABLE', default_sheet_name: mapping.sheetName || mapping.sheet || null }
+    );
 
     await conn.query(
       `INSERT INTO excel_template_mappings (template_id, created_by, mapping_name, mapping_version, mapping_json, active_yn)
@@ -85,7 +90,7 @@ const createTemplate = asyncHandler(async (req, res) => {
       [result.insertId, req.user.id, `${templateName} 기본 매핑`, JSON.stringify(defaultMapping)]
     );
     await conn.commit();
-    res.status(201).json({ id: result.insertId, templateId: result.insertId, filePath, message: '자사 양식이 ai-server에 저장되고 등록되었습니다.' });
+    res.status(201).json({ id: result.insertId, templateId: result.insertId, filePath, message: '등록 양식이 ai-server에 저장되고 등록되었습니다.' });
   } catch (error) {
     await conn.rollback();
     if (error.code === 'ER_DUP_ENTRY') return res.status(409).json({ message: '이미 등록된 양식코드입니다.' });
@@ -129,14 +134,17 @@ const getTemplateMappings = asyncHandler(async (req, res) => {
 const saveTemplateMappings = asyncHandler(async (req, res) => {
   const templateId = Number(req.params.id);
   const { sheetName, mappings } = req.body;
-  const [[template]] = await pool.query('SELECT id, template_name FROM excel_templates WHERE id = ? AND active_yn = \'Y\'', [templateId]);
+  const [[template]] = await pool.query('SELECT id, template_name, template_type, default_sheet_name FROM excel_templates WHERE id = ? AND active_yn = \'Y\'', [templateId]);
   if (!template) return res.status(404).json({ message: '템플릿을 찾을 수 없습니다.' });
 
-  const nextMapping = {
-    sheetName: sheetName || null,
-    mappings: Array.isArray(mappings) ? mappings : [],
-    savedAt: new Date().toISOString()
-  };
+  const nextMapping = ensureTemplateMappingJson(
+    {
+      sheetName: sheetName || null,
+      mappings: Array.isArray(mappings) ? mappings : [],
+      savedAt: new Date().toISOString(),
+    },
+    { template_name: template.template_name, template_type: template.template_type, default_sheet_name: sheetName || null }
+  );
 
   const conn = await pool.getConnection();
   try {

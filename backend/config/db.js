@@ -209,8 +209,8 @@ async function query(sql, params = []) {
   if (q.startsWith('select * from excel_templates where id = ?')) {
     return [rows(await ExcelTemplate.findOne({ id: toId(params[0]), active_yn: 'Y' }).lean())];
   }
-  if (q.startsWith('select id, template_name from excel_templates where id = ?')) {
-    return [rows(await ExcelTemplate.findOne({ id: toId(params[0]), active_yn: 'Y' }).select('id template_name').lean())];
+  if (q.startsWith('select id, template_name from excel_templates where id = ?') || q.startsWith('select id, template_name, template_type')) {
+    return [rows(await ExcelTemplate.findOne({ id: toId(params[0]), active_yn: 'Y' }).select('id template_name template_type default_sheet_name').lean())];
   }
   if (q.startsWith('select * from excel_template_mappings where template_id = ?')) {
     return [rows(await ExcelTemplateMapping.findOne({ template_id: toId(params[0]), active_yn: 'Y' }).sort({ id: -1 }).lean())];

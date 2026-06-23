@@ -6,6 +6,8 @@ const {
   getJob,
   updateTable,
   revalidateJob,
+  createAiTemplate,
+  updateCandidateField,
   generateExcel,
   downloadExcel,
   listDownloads,
@@ -30,6 +32,8 @@ router.post('/', authenticate, documentUpload.array('files', 20), createJob);
 router.get('/:id', authenticate, getJob);
 router.put('/:id/table', authenticate, updateTable);
 router.post('/:id/revalidate', authenticate, revalidateJob);
+router.post('/:id/ai-template', authenticate, createAiTemplate);
+router.post('/:id/candidate-fields/:fieldId', authenticate, updateCandidateField);
 router.post('/:id/excels', authenticate, generateExcel);
 router.get('/:id/excels/:excelId/download', downloadExcel);
 

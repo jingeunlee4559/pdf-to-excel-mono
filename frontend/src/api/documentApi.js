@@ -35,6 +35,17 @@ export const revalidateJobApi = async (jobId) => {
   return data;
 };
 
+
+export const createAiTemplateApi = async (jobId, payload = {}) => {
+  const { data } = await api.post(`/document-jobs/${jobId}/ai-template`, payload);
+  return data;
+};
+
+export const updateCandidateFieldApi = async (jobId, fieldId, payload = {}) => {
+  const { data } = await api.post(`/document-jobs/${jobId}/candidate-fields/${fieldId}`, payload);
+  return data;
+};
+
 export const generateExcelApi = async (jobId, payload = {}) => {
   const { data } = await api.post(`/document-jobs/${jobId}/excels`, payload);
   return data;
