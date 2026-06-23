@@ -176,6 +176,7 @@ def _call_ollama_sync(prompt: str, cfg: LlmConfig) -> Dict[str, Any]:
             "temperature": cfg.temperature,
             "top_p": cfg.top_p,
             "num_ctx": _env_int("LLM_NUM_CTX", 8192),
+            "num_predict": _env_int("LLM_NUM_PREDICT", 1024),
         },
         "keep_alive": "10m",
     }
