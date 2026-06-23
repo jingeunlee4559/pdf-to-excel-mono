@@ -196,6 +196,10 @@ async function loadJob(jobId, user) {
         reviewSummary: analysis.review_summary,
         keyValues: rawAnalysis.keyValues || [],
         fileProfiles: rawAnalysis.fileProfiles || [],
+        llmUsage: rawAnalysis.llmUsage || null,
+        llmUsed: rawAnalysis.llmUsed || false,
+        llmIntentUsed: rawAnalysis.llmIntentUsed || false,
+        llmIntent: rawAnalysis.llmIntent || null,
         llmModel: analysis.llm_model,
         promptVersion: analysis.prompt_version,
         raw: rawAnalysis
@@ -363,7 +367,10 @@ function buildServerChatContext(job, selectedTableId = null, requestContext = {}
       tableCount: job.tables?.length || 0,
       issueCount: job.issues?.length || 0,
       keyValues: job.analysis.keyValues || [],
-      fileProfiles: job.analysis.fileProfiles || job.analysis.raw?.fileProfiles || []
+      fileProfiles: job.analysis.fileProfiles || job.analysis.raw?.fileProfiles || [],
+      llmUsage: job.analysis.llmUsage || job.analysis.raw?.llmUsage || null,
+      llmUsed: job.analysis.llmUsed || job.analysis.raw?.llmUsed || false,
+      llmIntentUsed: job.analysis.llmIntentUsed || job.analysis.raw?.llmIntentUsed || false
     } : null,
     table: selectedTable ? {
       id: selectedTable.id,
@@ -431,13 +438,40 @@ function uniqueColumns(columns = []) {
   return out;
 }
 
+function isSummaryCompareColumnKey(key = '') {
+  return ['lowest_vendor', 'lowest_unit_price', 'lowest_amount', 'lowest_vs_standard', 'remark'].includes(String(key || ''));
+}
+
+function isBaseCompareColumnKey(key = '') {
+  return ['construction_code', 'item_name', 'spec', 'quantity', 'request_quantity', 'unit', 'standard_unit_price'].includes(String(key || ''));
+}
+
 function sortColumnsForTable(columns = [], tableType = '') {
+  const cols = uniqueColumns(columns);
   const order = preferredColumnOrder(tableType);
-  const indexOf = (key) => {
-    const idx = order.indexOf(key);
-    return idx >= 0 ? idx : 1000;
+  const baseOrder = ['construction_code', 'item_name', 'spec', 'quantity', 'request_quantity', 'unit', 'standard_unit_price'];
+  const summaryOrder = ['lowest_vendor', 'lowest_unit_price', 'lowest_amount', 'lowest_vs_standard', 'remark'];
+  const originalIndex = new Map(cols.map((col, index) => [col.key, index]));
+
+  const rank = (key) => {
+    const baseIdx = baseOrder.indexOf(key);
+    if (baseIdx >= 0) return baseIdx;
+
+    const normalIdx = order.indexOf(key);
+    if (normalIdx >= 0 && !isSummaryCompareColumnKey(key)) return 50 + normalIdx;
+
+    // 업체 단가/금액처럼 동적으로 생성된 컬럼은 항상 최저 업체/최저 금액 앞에 둔다.
+    if (!isSummaryCompareColumnKey(key)) return 200 + (originalIndex.get(key) ?? 0);
+
+    const summaryIdx = summaryOrder.indexOf(key);
+    return 10000 + (summaryIdx >= 0 ? summaryIdx : 100);
   };
-  return uniqueColumns(columns).sort((a, b) => indexOf(a.key) - indexOf(b.key));
+
+  return cols.sort((a, b) => {
+    const diff = rank(a.key) - rank(b.key);
+    if (diff) return diff;
+    return (originalIndex.get(a.key) ?? 0) - (originalIndex.get(b.key) ?? 0);
+  });
 }
 
 function findColumnKeysInMessage(message, columns = null) {
@@ -465,7 +499,10 @@ function getAvailableColumnsFromRows(rows = []) {
 
 
 function compactForSearch(value) {
-  return String(value || '').replace(/\s+/g, '').toLowerCase();
+  return String(value || '')
+    .replace(/[\s\u00A0]+/g, '')
+    .replace(/[()\[\]{}.,·ㆍ\/\\_"'`~:;|<>-]/g, '')
+    .toLowerCase();
 }
 
 function getRowSearchText(row = {}) {
@@ -533,11 +570,30 @@ function applyRequestedQuantityToRows(rows = [], quantity, targetRowKeys = null)
 }
 
 
-function normalizeVendorLabelForEdit(label = '') {
-  return String(label || '')
-    .replace(/\s*(단가|금액|견적가|견적단가|업체견적단가)$/g, '')
+function stripCompareAliasPrefix(value = '') {
+  return String(value || '')
+    .replace(/^\s*[A-Z]\s*회사\s*[·ㆍ:：\-–—]*\s*/i, '')
+    .replace(/^\s*[A-Z]\s*회사(?=㈜|\(주\)|주식회사|[가-힣A-Za-z0-9])\s*/i, '')
     .trim();
 }
+
+function normalizeVendorLabelForEdit(label = '') {
+  return stripCompareAliasPrefix(String(label || '')
+    .replace(/\s*(단가|금액|견적가|견적단가|업체견적단가)$/g, '')
+    .replace(/\s+/g, ' ')
+    .trim());
+}
+
+function sanitizeKoreanAssistantText(value = '', fallback = '') {
+  const text = String(value || '').trim();
+  if (!text) return fallback;
+  const cjkCount = (text.match(/[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]/g) || []).length;
+  const hangulCount = (text.match(/[가-힣]/g) || []).length;
+  // qwen이 중국어/일본어로 섞어 답하면 사용자 화면에는 규칙 기반 한국어 답변만 보여준다.
+  if (cjkCount >= 2 || (cjkCount >= 1 && hangulCount < 20)) return fallback || text.replace(/[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]+/g, '').trim();
+  return text;
+}
+
 
 function isIgnoredVendorLabelForEdit(label = '') {
   const cleaned = normalizeVendorLabelForEdit(label);
@@ -601,16 +657,167 @@ function inferVendorColumnsForEdit(table = {}, columnsOverride = null) {
   return Array.from(vendors.values());
 }
 
+
+function inferVisibleVendorColumnsForEdit(table = {}, columnsOverride = null) {
+  const columns = Array.isArray(columnsOverride) ? columnsOverride : (table.columns || []);
+  const meta = table?.tableJson?.meta && typeof table.tableJson.meta === 'object' ? table.tableJson.meta : {};
+  // 현재 화면에 보이는 업체는 meta.vendors가 아니라 실제 표시 컬럼으로 판단한다.
+  // 이전 업데이트 과정에서 meta.vendors가 전체 업체로 남아 있으면 "한국전기 추가" 같은 명령을
+  // 이미 표시 중인 업체로 오판하여 컬럼 복구가 실패한다.
+  const visibleTable = {
+    ...table,
+    columns,
+    tableJson: {
+      ...(table.tableJson || {}),
+      meta: {
+        ...meta,
+        vendors: [],
+      },
+    },
+  };
+  return inferVendorColumnsForEdit(visibleTable, columns);
+}
+
+function mergeVendorsByCompareKey(vendors = []) {
+  const byKey = new Map();
+  for (const vendor of vendors || []) {
+    if (!vendor || !vendor.compareKey) continue;
+    const existing = byKey.get(vendor.compareKey) || {};
+    byKey.set(vendor.compareKey, {
+      ...existing,
+      ...vendor,
+      columnKeys: Array.from(new Set([...(existing.columnKeys || []), ...(vendor.columnKeys || [])].filter(Boolean))),
+      labels: Array.from(new Set([...(existing.labels || []), ...(vendor.labels || [])].filter(Boolean))),
+    });
+  }
+  return Array.from(byKey.values());
+}
+
+function vendorSearchKeysForEdit(name = '') {
+  const raw = String(name || '').trim();
+  const noPrefix = stripCompareAliasPrefix(raw);
+  const noCorp = noPrefix.replace(/주식회사|\(주\)|㈜|（주）|유한회사|합자회사|합명회사/g, ' ');
+  const pieces = [raw, noPrefix, noCorp]
+    .flatMap((v) => String(v || '').split(/[\s·ㆍ/()\[\]{}.,_-]+/g))
+    .concat([raw, noPrefix, noCorp])
+    .map((v) => compactForSearch(stripCompareAliasPrefix(v)))
+    .filter((v) => v && v.length >= 2 && !/^(회사|업체|단가|금액|견적|견적가|전기|설비|기술|건설|종합|시스템|이엔지|엔지니어링|주식회사)$/.test(v));
+  const alias = raw.match(/([A-Z])\s*회사/i);
+  if (alias) pieces.push(compactForSearch(alias[0]));
+  return [...new Set(pieces)];
+}
+
+
+function parseNumberForEdit(value) {
+  const num = Number(String(value ?? '').replace(/[^0-9.-]/g, ''));
+  return Number.isFinite(num) ? num : 0;
+}
+
+function formatNumberForEdit(value) {
+  const num = parseNumberForEdit(value);
+  return num ? String(Math.round(num)).replace(/\B(?=(\d{3})+(?!\d))/g, ',') : '';
+}
+
+function recomputeLowestForRows(rows = [], columns = []) {
+  const vendors = inferVendorColumnsForEdit({ columns, rows }, columns)
+    .filter((vendor) => vendor.unitPriceKey || vendor.priceKey || vendor.amountKey);
+  if (!vendors.length) return rows || [];
+  return (rows || []).map((row) => {
+    let best = null;
+    for (const vendor of vendors) {
+      const unitKey = vendor.unitPriceKey || vendor.priceKey;
+      const amountKey = vendor.amountKey;
+      const unitPrice = parseNumberForEdit(unitKey ? row[unitKey] : '');
+      const amount = parseNumberForEdit(amountKey ? row[amountKey] : '');
+      const compareValue = unitPrice || amount;
+      if (!compareValue) continue;
+      if (!best || compareValue < best.compareValue) {
+        best = { vendor: vendor.name, unitPrice, amount, compareValue };
+      }
+    }
+    if (!best) return { ...row, lowest_vendor: '', lowest_unit_price: '', lowest_amount: '' };
+    return {
+      ...row,
+      lowest_vendor: best.vendor,
+      lowest_unit_price: best.unitPrice ? formatNumberForEdit(best.unitPrice) : '',
+      lowest_amount: best.amount ? formatNumberForEdit(best.amount) : (best.unitPrice && parseNumberForEdit(row.quantity || row.request_quantity) ? formatNumberForEdit(best.unitPrice * parseNumberForEdit(row.quantity || row.request_quantity)) : ''),
+    };
+  });
+}
+
+function sourceRowsFromTableMeta(table = {}) {
+  const meta = table?.tableJson?.meta && typeof table.tableJson.meta === 'object' ? table.tableJson.meta : {};
+  return Array.isArray(meta.allRows) && meta.allRows.length ? meta.allRows : [];
+}
+
+function mergeRowsWithSourceValues(rows = [], sourceRows = [], columns = []) {
+  if (!Array.isArray(rows) || !rows.length || !Array.isArray(sourceRows) || !sourceRows.length) return rows || [];
+  const sourceByIdentity = new Map();
+  for (const src of sourceRows) {
+    const key = getRowIdentityKey(src);
+    if (key && !sourceByIdentity.has(key)) sourceByIdentity.set(key, src);
+  }
+  const columnKeys = (columns || []).map((col) => String(col?.key || col || '')).filter(Boolean);
+  const allKeys = columnKeys.length ? columnKeys : Array.from(new Set(sourceRows.flatMap((row) => Object.keys(row || {}))));
+  return (rows || []).map((row) => {
+    const key = getRowIdentityKey(row);
+    const source = key ? sourceByIdentity.get(key) : null;
+    if (!source) return row;
+    const next = { ...row };
+    for (const colKey of allKeys) {
+      const current = next[colKey];
+      const sourceValue = source[colKey];
+      if ((current === undefined || current === null || String(current).trim() === '') && sourceValue !== undefined && sourceValue !== null && String(sourceValue).trim() !== '') {
+        next[colKey] = sourceValue;
+      }
+    }
+    return next;
+  });
+}
+
+function extractRowSearchTerms(message = '') {
+  const cleaned = String(message || '')
+    .replace(/(추가해줘|추가|넣어줘|넣어|포함해줘|포함|같이|함께|보여줘|보여줄래|찾아줘|필터|정리|비교|단가|표|행|항목|공종|업체|회사|기준|수량|각각|으로|로|만|좀|다시|현재|문서|파일|빼줘|빼고|제외|삭제|제거|없애|숨겨줘|숨김)/g, ' ')
+    .replace(/["'`~!@#$%^&*_=+\\|;:<>,.?]/g, ' ')
+    .trim();
+  const terms = cleaned.split(/[\s,\/]+/g).map((v) => v.trim()).filter((v) => compactForSearch(v).length >= 2);
+  const compactWhole = compactForSearch(cleaned);
+  if (compactWhole.length >= 3) terms.unshift(cleaned);
+  return [...new Set(terms)].slice(0, 8);
+}
+
+function rowMatchesSearchTerm(row = {}, term = '') {
+  const rowText = getRowSearchText(row);
+  const t = compactForSearch(term);
+  if (!t) return false;
+  if (rowText.includes(t) || t.includes(rowText)) return true;
+  const itemKey = compactForSearch(row.item_name || '');
+  const specKey = compactForSearch(row.spec || '');
+  const codeKey = compactForSearch(row.construction_code || '');
+  if (itemKey && (itemKey.includes(t) || t.includes(itemKey))) return true;
+  const splitTerms = String(term || '').split(/\s+/g).map(compactForSearch).filter((v) => v.length >= 2);
+  if (splitTerms.length >= 2 && splitTerms.every((part) => rowText.includes(part))) return true;
+  // 공백·기호·분리 표기를 흡수해서 품목명을 비교한다.
+  if (t.length >= 5) {
+    const parts = [itemKey, specKey, codeKey].filter(Boolean).join('');
+    let hitCount = 0;
+    for (const part of [itemKey, specKey].filter(Boolean)) {
+      if (t.includes(part) || part.includes(t.slice(0, Math.min(t.length, 4)))) hitCount += 1;
+    }
+    if (hitCount >= 1 && parts.includes(t.slice(0, Math.min(t.length, 4)))) return true;
+  }
+  return false;
+}
+
 function extractVendorExcludeEdit(message = '', table = {}, columnsOverride = null) {
   const text = String(message || '');
   if (!/(빼|제외|삭제|숨|없애|제거)/i.test(text)) return null;
   const columns = Array.isArray(columnsOverride) ? columnsOverride : (table.columns || []);
-  const vendors = inferVendorColumnsForEdit(table, columns);
+  const vendors = inferVisibleVendorColumnsForEdit(table, columns);
   const compactMessage = compactForSearch(text);
   const targets = vendors.filter((vendor) => {
-    const key = compactForSearch(vendor.name);
-    const shortKey = compactForSearch(String(vendor.name || '').replace(/주식회사|\(주\)|㈜|（주）/g, ''));
-    return key && (compactMessage.includes(key) || (shortKey && compactMessage.includes(shortKey)));
+    const keys = vendorSearchKeysForEdit(vendor.name);
+    return keys.some((key) => key && (compactMessage.includes(key) || key.includes(compactMessage)));
   });
   if (!targets.length) return null;
 
@@ -621,7 +828,7 @@ function extractVendorExcludeEdit(message = '', table = {}, columnsOverride = nu
     if (vendor.amountKey) removeKeys.add(vendor.amountKey);
   });
 
-  const targetKeys = new Set(targets.map((vendor) => vendor.compareKey));
+  const targetKeys = new Set(targets.flatMap((vendor) => vendorSearchKeysForEdit(vendor.name)));
   const nextColumns = (columns || []).filter((col) => {
     const key = String(col.key || '');
     const labelKey = compactForSearch(normalizeVendorLabelForEdit(col.label || key));
@@ -629,18 +836,260 @@ function extractVendorExcludeEdit(message = '', table = {}, columnsOverride = nu
     return !Array.from(targetKeys).some((targetKey) => labelKey && (labelKey.includes(targetKey) || targetKey.includes(labelKey)));
   });
   const oldMeta = table?.tableJson?.meta && typeof table.tableJson.meta === 'object' ? table.tableJson.meta : {};
-  const nextVendors = getTableMetaVendors(table).filter((vendor) => !targetKeys.has(vendor.compareKey));
+  const nextVendors = getTableMetaVendors(table).filter((vendor) => !vendorSearchKeysForEdit(vendor.name).some((key) => targetKeys.has(key)));
+  const nextRows = recomputeLowestForRows(table.rows || [], nextColumns);
   return {
     type: 'REMOVE_VENDOR_COLUMNS',
     vendorNames: targets.map((vendor) => vendor.name),
     columns: nextColumns,
-    rows: table.rows || [],
+    rows: nextRows,
     tableJson: {
       ...(table.tableJson || {}),
       meta: {
         ...oldMeta,
         vendorCount: nextVendors.length,
         vendors: nextVendors,
+      },
+    },
+  };
+}
+
+function hasVendorEditIntent(message = '') {
+  const text = String(message || '');
+  return /(업체|회사|거래처|단가|금액|추가|넣|복구|살려|표시|보여|포함|같이|함께|빼|제외|삭제|숨|없애|제거)/i.test(text);
+}
+
+function vendorHasValuesInRows(vendor = {}, rows = []) {
+  const keys = [vendor.unitPriceKey, vendor.priceKey, vendor.amountKey, ...(vendor.columnKeys || [])]
+    .filter(Boolean)
+    .map(String);
+  if (!keys.length) return false;
+  return (rows || []).some((row) => keys.some((key) => parseNumberForEdit(row?.[key]) > 0 || String(row?.[key] ?? '').trim() !== ''));
+}
+
+function availableVendorNamesForMessage(table = {}) {
+  const meta = table?.tableJson?.meta && typeof table.tableJson.meta === 'object' ? table.tableJson.meta : {};
+  const allColumns = Array.isArray(meta.allColumns) && meta.allColumns.length ? meta.allColumns : (table.columns || []);
+  const sourceRows = Array.isArray(meta.allRows) && meta.allRows.length ? meta.allRows : (table.rows || []);
+  const fullTable = {
+    ...table,
+    columns: allColumns,
+    tableJson: {
+      ...(table.tableJson || {}),
+      meta: {
+        ...meta,
+        vendors: Array.isArray(meta.allVendors) && meta.allVendors.length ? meta.allVendors : (Array.isArray(meta.vendors) ? meta.vendors : []),
+      },
+    },
+  };
+  return inferVendorColumnsForEdit(fullTable, allColumns)
+    .filter((vendor) => vendorHasValuesInRows(vendor, sourceRows))
+    .map((vendor) => vendor.name)
+    .filter(Boolean);
+}
+
+function messageMentionsKnownVendor(message = '', table = {}) {
+  const compactMessage = compactForSearch(message);
+  if (!compactMessage) return false;
+  return availableVendorNamesForMessage(table).some((name) => vendorSearchKeysForEdit(name).some((key) => key && compactMessage.includes(key)));
+}
+
+function buildVendorNoMatchEdit(message = '', table = {}) {
+  if (!hasVendorEditIntent(message)) return null;
+  const text = String(message || '');
+  const hasCompanyWord = /(업체|회사|거래처)/i.test(text);
+  const mentionsKnownVendor = messageMentionsKnownVendor(text, table);
+  if (!hasCompanyWord && !mentionsKnownVendor) return null;
+  const names = availableVendorNamesForMessage(table);
+  return {
+    type: 'VENDOR_EDIT_NO_MATCH',
+    vendorNames: [],
+    availableVendors: names,
+    columns: table.columns || [],
+    rows: table.rows || [],
+  };
+}
+
+function extractVendorRestoreEdit(message = '', table = {}, columnsOverride = null) {
+  const text = String(message || '');
+  if (!/(추가|넣|복구|살려|표시|보여|포함|같이|함께)/i.test(text)) return null;
+
+  const currentColumns = Array.isArray(columnsOverride) ? columnsOverride : (table.columns || []);
+  const meta = table?.tableJson?.meta && typeof table.tableJson.meta === 'object' ? table.tableJson.meta : {};
+  const allColumns = Array.isArray(meta.allColumns) && meta.allColumns.length ? meta.allColumns : currentColumns;
+  if (!Array.isArray(allColumns) || !allColumns.length) return null;
+
+  const currentKeys = new Set((currentColumns || []).map((col) => String(col.key || '')));
+  const currentVendors = inferVisibleVendorColumnsForEdit(table, currentColumns);
+  const currentVendorKeys = new Set(currentVendors.map((vendor) => vendor.compareKey).filter(Boolean));
+  const fullTable = {
+    ...table,
+    columns: allColumns,
+    tableJson: {
+      ...(table.tableJson || {}),
+      meta: {
+        ...meta,
+        vendors: Array.isArray(meta.allVendors) && meta.allVendors.length ? meta.allVendors : (Array.isArray(meta.vendors) ? meta.vendors : []),
+      },
+    },
+  };
+  const sourceRowsForVendor = Array.isArray(meta.allRows) && meta.allRows.length ? meta.allRows : (table.rows || []);
+  const allVendors = inferVendorColumnsForEdit(fullTable, allColumns)
+    .filter((vendor) => vendor && vendor.name && !currentVendorKeys.has(vendor.compareKey))
+    .filter((vendor) => vendorHasValuesInRows(vendor, sourceRowsForVendor));
+  if (!allVendors.length) return null;
+
+  const compactMessage = compactForSearch(text);
+  const targets = allVendors.filter((vendor) => {
+    const keys = vendorSearchKeysForEdit(vendor.name);
+    return keys.some((key) => key && compactMessage.includes(key));
+  });
+  if (!targets.length) return null;
+
+  const targetKeys = new Set();
+  targets.forEach((vendor) => {
+    (vendor.columnKeys || []).forEach((key) => targetKeys.add(String(key || '')));
+    if (vendor.unitPriceKey) targetKeys.add(String(vendor.unitPriceKey));
+    if (vendor.amountKey) targetKeys.add(String(vendor.amountKey));
+    if (vendor.priceKey) targetKeys.add(String(vendor.priceKey));
+    if (vendor.specKey) targetKeys.add(String(vendor.specKey));
+    if (vendor.quantityKey) targetKeys.add(String(vendor.quantityKey));
+  });
+
+  const targetCompareKeys = targets.flatMap((vendor) => vendorSearchKeysForEdit(vendor.name)).filter(Boolean);
+  const columnsToAdd = (allColumns || []).filter((col) => {
+    const key = String(col.key || '');
+    if (currentKeys.has(key)) return false;
+    if (targetKeys.has(key)) return true;
+    const labelKey = compactForSearch(normalizeVendorLabelForEdit(col.label || key));
+    return targetCompareKeys.some((targetKey) => labelKey && (labelKey.includes(targetKey) || targetKey.includes(labelKey)));
+  });
+
+  if (!columnsToAdd.length) return null;
+
+  const tableType = table.tableType || table.table_type || '';
+  const nextColumns = sortColumnsForTable([...(currentColumns || []), ...columnsToAdd], tableType);
+  const sourceRows = Array.isArray(meta.allRows) && meta.allRows.length ? meta.allRows : [];
+  const baseRows = Array.isArray(table.rows) && table.rows.length ? table.rows : sourceRows;
+  const rowsWithRestoredValues = mergeRowsWithSourceValues(baseRows, sourceRows, columnsToAdd);
+  const nextRows = recomputeLowestForRows(rowsWithRestoredValues, nextColumns);
+  const nextVendors = inferVisibleVendorColumnsForEdit({ ...table, columns: nextColumns, rows: nextRows }, nextColumns);
+
+  return {
+    type: 'RESTORE_VENDOR_COLUMNS',
+    vendorNames: targets.map((vendor) => vendor.name),
+    columns: nextColumns,
+    rows: nextRows,
+    tableJson: {
+      ...(table.tableJson || {}),
+      meta: {
+        ...meta,
+        vendorCount: nextVendors.length,
+        vendors: nextVendors.map((vendor, index) => ({
+          name: vendor.name,
+          index,
+          unitPriceKey: vendor.unitPriceKey || vendor.priceKey || null,
+          amountKey: vendor.amountKey || null,
+        })),
+      },
+    },
+  };
+}
+
+
+function getAllVendorTableForEdit(table = {}) {
+  const meta = table?.tableJson?.meta && typeof table.tableJson.meta === 'object' ? table.tableJson.meta : {};
+  const allColumns = Array.isArray(meta.allColumns) && meta.allColumns.length ? meta.allColumns : (table.columns || []);
+  return {
+    ...table,
+    columns: allColumns,
+    tableJson: {
+      ...(table.tableJson || {}),
+      meta: {
+        ...meta,
+        vendors: Array.isArray(meta.allVendors) && meta.allVendors.length ? meta.allVendors : (Array.isArray(meta.vendors) ? meta.vendors : []),
+      },
+    },
+  };
+}
+
+function findRequestedVendorsForEdit(message = '', table = {}) {
+  const text = String(message || '');
+  const compactMessage = compactForSearch(text);
+  if (!compactMessage) return [];
+  const fullTable = getAllVendorTableForEdit(table);
+  const allColumns = fullTable.columns || [];
+  const vendors = inferVendorColumnsForEdit(fullTable, allColumns);
+  const matched = [];
+  const seen = new Set();
+  for (const vendor of vendors) {
+    const keys = vendorSearchKeysForEdit(vendor.name);
+    const hit = keys.some((key) => {
+      if (!key || key.length < 2) return false;
+      return compactMessage.includes(key);
+    });
+    if (hit && !seen.has(vendor.compareKey)) {
+      matched.push(vendor);
+      seen.add(vendor.compareKey);
+    }
+  }
+  return matched;
+}
+
+function extractVendorSelectEdit(message = '', table = {}, rowsOverride = null, columnsOverride = null) {
+  const text = String(message || '');
+  if (!/(비교|기준|만|으로|로|표|정리|보여|추려|필터|수량|개씩)/i.test(text)) return null;
+  const fullTable = getAllVendorTableForEdit(table);
+  const allColumns = fullTable.columns || [];
+  const targets = findRequestedVendorsForEdit(text, table);
+  if (!targets.length) return null;
+
+  const targetCompareKeys = new Set(targets.map((vendor) => vendor.compareKey).filter(Boolean));
+  const allVendors = inferVendorColumnsForEdit(fullTable, allColumns);
+  const vendorColumnKeys = new Set();
+  const selectedColumnKeys = new Set();
+
+  for (const vendor of allVendors) {
+    const keys = new Set([...(vendor.columnKeys || []), vendor.unitPriceKey, vendor.priceKey, vendor.amountKey, vendor.specKey, vendor.quantityKey].filter(Boolean).map(String));
+    keys.forEach((key) => vendorColumnKeys.add(key));
+    if (targetCompareKeys.has(vendor.compareKey)) keys.forEach((key) => selectedColumnKeys.add(key));
+  }
+
+  const summaryKeys = new Set(['lowest_vendor', 'lowest_unit_price', 'lowest_amount', 'remark', 'lowest_vs_standard']);
+  const nextColumns = (allColumns || []).filter((col) => {
+    const key = String(col.key || '');
+    if (summaryKeys.has(key)) return true;
+    if (vendorColumnKeys.has(key)) return selectedColumnKeys.has(key);
+    // 컬럼 라벨 기반으로도 한 번 더 방어한다.
+    const labelKey = compactForSearch(normalizeVendorLabelForEdit(col.label || key));
+    if (Array.from(targetCompareKeys).some((targetKey) => labelKey && (labelKey.includes(targetKey) || targetKey.includes(labelKey)))) return true;
+    const belongsToOtherVendor = allVendors.some((vendor) => vendor.compareKey && labelKey && (labelKey.includes(vendor.compareKey) || vendor.compareKey.includes(labelKey)));
+    return !belongsToOtherVendor;
+  });
+
+  const rowsSource = Array.isArray(rowsOverride) ? rowsOverride : (Array.isArray(table.rows) ? table.rows : []);
+  const meta = table?.tableJson?.meta && typeof table.tableJson.meta === 'object' ? table.tableJson.meta : {};
+  const sourceRows = Array.isArray(meta.allRows) && meta.allRows.length ? meta.allRows : [];
+  const rowsWithSelectedValues = mergeRowsWithSourceValues(rowsSource, sourceRows, nextColumns);
+  const nextRows = recomputeLowestForRows(rowsWithSelectedValues, nextColumns);
+  const nextVendors = inferVisibleVendorColumnsForEdit({ ...table, columns: nextColumns, rows: nextRows }, nextColumns);
+
+  return {
+    type: 'SELECT_VENDOR_COLUMNS',
+    vendorNames: targets.map((vendor) => vendor.name),
+    columns: sortColumnsForTable(nextColumns, table.tableType || table.table_type || ''),
+    rows: nextRows,
+    tableJson: {
+      ...(table.tableJson || {}),
+      meta: {
+        ...((table.tableJson && table.tableJson.meta) || {}),
+        vendorCount: nextVendors.length,
+        vendors: nextVendors.map((vendor, index) => ({
+          name: vendor.name,
+          index,
+          unitPriceKey: vendor.unitPriceKey || vendor.priceKey || null,
+          amountKey: vendor.amountKey || null,
+        })),
       },
     },
   };
@@ -655,31 +1104,48 @@ function extractRowFilterEdit(message, table) {
   if (!sourceRows.length) return null;
   const text = String(message || '').trim();
   const compact = compactForSearch(text);
-  if (!/(보여|바꿔|대신|말고|제외|만|필터|검색|나오게|추려|찾아|기준|추가|넣어|포함|같이|함께|붙여)/i.test(text)) return null;
+  if (!/(보여|바꿔|대신|말고|제외|빼|삭제|제거|숨|없애|만|필터|검색|나오게|추려|찾아|기준|추가|넣어|포함|같이|함께|붙여)/i.test(text)) return null;
 
   const itemNames = [...new Set(sourceRows.map((row) => String(row.item_name || '').trim()).filter(Boolean))]
     .sort((a, b) => b.length - a.length);
   const includeTerms = [];
   const excludeTerms = [];
+  let directMatchedRows = null;
   const 말고Index = compact.indexOf('말고');
 
+  const isRemoveCommand = /(빼|빼고|빼줘|제외|삭제|숨|없애|제거)/i.test(text);
   for (const name of itemNames) {
     const key = compactForSearch(name);
     if (!key || !compact.includes(key)) continue;
     const pos = compact.indexOf(key);
-    if (말고Index >= 0 && pos < 말고Index) excludeTerms.push(name);
+    if (isRemoveCommand) excludeTerms.push(name);
+    else if (말고Index >= 0 && pos < 말고Index) excludeTerms.push(name);
     else includeTerms.push(name);
   }
 
-  // 사용자가 '가설계단 이걸로', '강관비계만'처럼 부분 표현을 쓸 때만 보조 매칭한다.
+  // 사용자가 공백을 넣어 말해도 실제 item_name과 매칭한다.
+  // 제거 명령에서는 발견된 품목을 include가 아니라 exclude로 넣어야 한다.
+  if (isRemoveCommand) {
+    const normalizedNoSpace = compact.replace(/[()\[\]{}.,]/g, '');
+    for (const name of itemNames) {
+      const key = compactForSearch(name);
+      if (!key || excludeTerms.includes(name)) continue;
+      const looseKey = key.replace(/[()\[\]{}.,]/g, '');
+      if (looseKey && (normalizedNoSpace.includes(looseKey) || looseKey.includes(normalizedNoSpace))) {
+        excludeTerms.push(name);
+      }
+    }
+  }
+
+  // 사용자가 부분 표현을 쓸 때만 보조 매칭한다.
   // 단, 톤마대(만들기)처럼 괄호 포함 품목을 명시했는데 정확 매칭에 실패한 경우에는
   // '쌓기' 같은 부분어로 P.P마대(쌓기)를 잘못 끌고 오지 않도록 보조 매칭을 막는다.
-  if (!includeTerms.length && !hasExplicitParenthesizedItem(text)) {
+  if (!includeTerms.length && !excludeTerms.length && !hasExplicitParenthesizedItem(text)) {
     const tokens = text
       .replace(/[()\[\]{}.,]/g, ' ')
       .split(/\s+/)
       .map((v) => v.trim())
-      .filter((v) => v.length >= 2 && !/^(이걸로|이거|이것|보여줘|보여줄래|다시|현재|파일|표|단가|비교|말고|대신|만|좀|각각|추가|빼주고|빼줘|제외|업체|회사)$/.test(v));
+      .filter((v) => v.length >= 2 && !/^(이걸로|이거|이것|보여줘|보여줄래|다시|현재|파일|표|단가|비교|말고|대신|만|좀|각각|추가|빼주고|빼줘|제외|삭제|제거|업체|회사)$/.test(v));
     for (const token of tokens) {
       const t = compactForSearch(token);
       const matches = itemNames.filter((name) => {
@@ -687,20 +1153,33 @@ function extractRowFilterEdit(message, table) {
         return nameKey.includes(t) || t.includes(nameKey);
       });
       for (const matched of matches) {
-        if (matched && !includeTerms.includes(matched)) includeTerms.push(matched);
+        if (!matched) continue;
+        if (isRemoveCommand && !excludeTerms.includes(matched)) excludeTerms.push(matched);
+        else if (!isRemoveCommand && !includeTerms.includes(matched)) includeTerms.push(matched);
       }
+    }
+  }
+
+  if (!includeTerms.length && !excludeTerms.length) {
+    const fallbackTerms = extractRowSearchTerms(text);
+    const matchedByTerms = sourceRows.filter((row) => fallbackTerms.some((term) => rowMatchesSearchTerm(row, term)));
+    if (matchedByTerms.length) {
+      directMatchedRows = matchedByTerms;
+      includeTerms.push(...fallbackTerms);
     }
   }
 
   let nextRows = visibleRows;
   let appendedRowKeys = [];
-  if (includeTerms.length) {
+  if (excludeTerms.length && isRemoveCommand) {
+    nextRows = sourceRows.filter((row) => !excludeTerms.some((term) => getRowSearchText(row).includes(compactForSearch(term))));
+  } else if (includeTerms.length) {
     const exactKeys = new Set(itemNames.map((name) => compactForSearch(name)));
     const exactTerms = includeTerms.map((term) => compactForSearch(term)).filter((term) => exactKeys.has(term));
-    const matchedRows = sourceRows.filter((row) => {
+    const matchedRows = directMatchedRows || sourceRows.filter((row) => {
       const itemKey = compactForSearch(row.item_name || '');
       if (exactTerms.length) return exactTerms.includes(itemKey);
-      return includeTerms.some((term) => getRowSearchText(row).includes(compactForSearch(term)));
+      return includeTerms.some((term) => getRowSearchText(row).includes(compactForSearch(term)) || rowMatchesSearchTerm(row, term));
     });
     const shouldAppend = /(추가|이어|같이|함께|포함|더\s*넣|붙여)/i.test(text);
     if (shouldAppend) {
@@ -731,7 +1210,7 @@ function extractRowFilterEdit(message, table) {
       type: 'FILTER_ROWS_NO_MATCH',
       includeTerms,
       excludeTerms,
-      columns: sourceColumns || table.columns,
+      columns: table.columns || sourceColumns,
       rows: visibleRows
     };
   }
@@ -740,7 +1219,7 @@ function extractRowFilterEdit(message, table) {
     type: 'FILTER_ROWS_BY_TERM',
     includeTerms,
     excludeTerms,
-    columns: sourceColumns || table.columns,
+    columns: table.columns || sourceColumns,
     rows: nextRows,
     appendedRowKeys: typeof appendedRowKeys !== 'undefined' ? appendedRowKeys : []
   };
@@ -770,16 +1249,51 @@ function detectTableEditCommand(message, table) {
         ...nextEdit,
         vendorNames: vendorRemoval.vendorNames,
         columns: vendorRemoval.columns,
-        rows: nextEdit.rows,
+        rows: recomputeLowestForRows(nextEdit.rows, vendorRemoval.columns),
         tableJson: vendorRemoval.tableJson,
         type: `${nextEdit.type}_AND_REMOVE_VENDOR`,
       };
+    } else if (/(추가|넣|복구|살려|표시|보여|포함|같이|함께)/i.test(text)) {
+      const vendorRestore = extractVendorRestoreEdit(text, { ...table, columns: nextEdit.columns || table.columns, rows: nextEdit.rows || table.rows, tableJson: nextEdit.tableJson || table.tableJson }, nextEdit.columns || table.columns);
+      if (vendorRestore) {
+        nextEdit = {
+          ...nextEdit,
+          vendorNames: vendorRestore.vendorNames,
+          columns: vendorRestore.columns,
+          rows: recomputeLowestForRows(vendorRestore.rows || nextEdit.rows, vendorRestore.columns),
+          tableJson: vendorRestore.tableJson,
+          type: `${nextEdit.type}_AND_RESTORE_VENDOR`,
+        };
+      }
+    } else {
+      const vendorSelection = extractVendorSelectEdit(text, { ...table, tableJson: nextEdit.tableJson || table.tableJson }, nextEdit.rows || table.rows, nextEdit.columns || table.columns);
+      if (vendorSelection) {
+        nextEdit = {
+          ...nextEdit,
+          vendorNames: vendorSelection.vendorNames,
+          columns: vendorSelection.columns,
+          rows: recomputeLowestForRows(nextEdit.rows || vendorSelection.rows, vendorSelection.columns),
+          tableJson: vendorSelection.tableJson,
+          type: `${nextEdit.type}_AND_SELECT_VENDOR`,
+        };
+      }
     }
     return nextEdit;
   }
 
   const vendorRemovalOnly = extractVendorExcludeEdit(text, table, table.columns);
   if (vendorRemovalOnly) return vendorRemovalOnly;
+
+  if (!/(추가|넣|복구|살려|표시|보여|포함|같이|함께)/i.test(text)) {
+    const vendorSelectOnly = extractVendorSelectEdit(text, table, table.rows, table.columns);
+    if (vendorSelectOnly) return vendorSelectOnly;
+  }
+
+  const vendorRestoreOnly = extractVendorRestoreEdit(text, table, table.columns);
+  if (vendorRestoreOnly) return vendorRestoreOnly;
+
+  const vendorNoMatch = buildVendorNoMatchEdit(text, table);
+  if (vendorNoMatch) return vendorNoMatch;
 
   if (requestedQuantity.value && /(수량|기준|개|ea|㎡|m2|m²|㎥|m3|m³|톤|kg|대|명|식|시간|일|세트)/i.test(text)) {
     return {
@@ -874,7 +1388,17 @@ function describeTableEdit(edit) {
   if (edit.type === 'NOOP_COLUMNS_ALREADY_VISIBLE') return `${edit.keys.map(labelOf).join(', ')} 컬럼은 이미 표에 표시되어 있습니다.`;
   if (edit.type === 'SORT_ROWS') return edit.sort === 'UNIT_PRICE_DESC' ? '단가 높은 순으로 표를 정렬했습니다.' : '단가 낮은 순으로 표를 정렬했습니다.';
   if (edit.type === 'APPLY_REQUESTED_QUANTITY') return `요청 수량 ${edit.requestedQuantity?.value || ''}${edit.requestedQuantity?.unit || ''}을 표와 자사양식 산출 기준에 반영했습니다.`;
-  if (edit.type === 'REMOVE_VENDOR_COLUMNS') return `${(edit.vendorNames || []).join(', ')} 업체 컬럼을 제외하고 자사양식 기준 표를 다시 구성했습니다.`;
+  if (edit.type === 'REMOVE_VENDOR_COLUMNS') return `${(edit.vendorNames || []).join(', ')} 업체 컬럼을 제외하고 현재 표를 다시 구성했습니다.`;
+  if (edit.type === 'RESTORE_VENDOR_COLUMNS') return `${(edit.vendorNames || []).join(', ')} 업체 컬럼을 다시 추가하고 최저 업체/금액을 재계산했습니다.`;
+  if (edit.type === 'SELECT_VENDOR_COLUMNS') return `${(edit.vendorNames || []).join(', ')} 업체만 남기고 표를 다시 정리했습니다.`;
+  if (edit.type === 'VENDOR_EDIT_NO_MATCH') {
+    const names = (edit.availableVendors || []).slice(0, 8).join(', ');
+    return names ? `요청한 업체명을 현재 표/원본 컬럼에서 정확히 찾지 못했습니다. 인식된 업체 후보는 ${names}입니다.` : '요청한 업체명을 현재 표/원본 컬럼에서 정확히 찾지 못했습니다. 새 작업으로 다시 분석하면 원본 업체 컬럼을 복구할 수 있습니다.';
+  }
+  if (String(edit.type || '').includes('RESTORE_VENDOR') && edit.vendorNames?.length) {
+    const base = (edit.includeTerms || []).join(', ') || '요청한 항목';
+    return `${base} 기준으로 표를 정리하고 ${(edit.vendorNames || []).join(', ')} 업체 컬럼을 다시 추가했습니다.${edit.requestedQuantity?.value ? ` 요청 수량 ${edit.requestedQuantity.value}${edit.requestedQuantity.unit || ''}도 반영했습니다.` : ''}`;
+  }
   if (String(edit.type || '').includes('REMOVE_VENDOR') && edit.vendorNames?.length) {
     const base = (edit.includeTerms || []).join(', ') || '요청한 항목';
     return `${base} 기준으로 표 행을 ${Number.isFinite(edit.rows?.length) ? `${edit.rows.length}행 ` : ''}정리하고 ${(edit.vendorNames || []).join(', ')} 업체 컬럼을 제외했습니다.${edit.requestedQuantity?.value ? ` 요청 수량 ${edit.requestedQuantity.value}${edit.requestedQuantity.unit || ''}도 반영했습니다.` : ''}`;
@@ -883,7 +1407,10 @@ function describeTableEdit(edit) {
     const includes = (edit.includeTerms || []).join(', ');
     const excludes = (edit.excludeTerms || []).join(', ');
     const countText = Number.isFinite(edit.rows?.length) ? ` ${edit.rows.length}행` : '';
-    if (includes) return `${includes} 기준으로 표 행을${countText} 필터링했습니다.${edit.requestedQuantity?.value ? ` 요청 수량 ${edit.requestedQuantity.value}${edit.requestedQuantity.unit || ''}도 반영했습니다.` : ''}`;
+    if (includes) {
+      const appendText = Array.isArray(edit.appendedRowKeys) ? (edit.appendedRowKeys.length ? ` 새로 ${edit.appendedRowKeys.length}행을 추가했습니다.` : ' 이미 표시 중인 항목은 중복 추가하지 않았습니다.') : '';
+      return `${includes} 기준으로 표 행을${countText} 정리했습니다.${appendText}${edit.requestedQuantity?.value ? ` 요청 수량 ${edit.requestedQuantity.value}${edit.requestedQuantity.unit || ''}도 반영했습니다.` : ''}`;
+    }
     if (excludes) return `${excludes} 항목을 제외하고 표 행을${countText} 필터링했습니다.`;
     return `요청한 조건으로 표 행을${countText} 필터링했습니다.`;
   }
@@ -971,10 +1498,19 @@ async function persistAnalysisResult({ jobId, sessionId, aiResult, userRequest, 
       );
     }
 
+    const analysisJson = {
+      ...(aiResult.analysis || {}),
+      llmUsage: aiResult.llmUsage || null,
+      llmUsed: Boolean(aiResult.llmUsed),
+      llmIntentUsed: Boolean(aiResult.llmIntentUsed),
+      llmIntent: aiResult.llmIntent || null,
+      llmError: aiResult.llmError || ''
+    };
+
     await conn.query(
       `INSERT INTO document_analysis_results (job_id, document_type, recommended_table_type, document_purpose, summary, confidence, needs_review_yn, review_summary, analysis_json, llm_model, prompt_version)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [jobId, aiResult.analysis?.documentType || '업무 문서', table.tableType || 'NORMAL_TABLE', aiResult.analysis?.purpose || userRequest || '', aiResult.analysis?.summary || '', aiResult.analysis?.confidence || 0.8, validatedIssues.length ? 'Y' : 'N', validatedIssues.length ? '확인 필요 항목이 있습니다.' : '정상', JSON.stringify(aiResult.analysis || {}), aiResult.model || 'rule-parser', aiResult.promptVersion || 'lite-v1']
+      [jobId, aiResult.analysis?.documentType || '업무 문서', table.tableType || 'NORMAL_TABLE', aiResult.analysis?.purpose || userRequest || '', aiResult.analysis?.summary || '', aiResult.analysis?.confidence || 0.8, validatedIssues.length ? 'Y' : 'N', validatedIssues.length ? '확인 필요 항목이 있습니다.' : '정상', JSON.stringify(analysisJson), aiResult.model || 'rule-parser', aiResult.promptVersion || 'lite-v1']
     );
 
     let firstTableId = null;
@@ -1152,7 +1688,7 @@ function buildAnalysisAnswer(jobData, requestText) {
   const fileCount = (jobData?.files || []).length;
   const parseText = totalPages ? `첨부 파일 ${fileCount}개, 전체 ${totalPages.toLocaleString()}페이지를 텍스트 우선 파싱했습니다.` : `첨부 파일 ${fileCount}개를 텍스트 우선 파싱했습니다.`;
   const tableType = jobData?.tables?.[0]?.tableType || jobData?.tables?.[0]?.table_type || '';
-  if (tableType === 'MULTI_VENDOR_PRICE_COMPARISON') return `업체별 단가 비교 기준으로 분석했습니다. ${parseText} 요청한 공종/품목 기준으로 비교표 ${rowCount.toLocaleString()}행을 만들었습니다. 표 데이터 탭에서 업체별 단가와 표준시장단가를 확인하세요.`;
+  if (tableType === 'MULTI_VENDOR_PRICE_COMPARISON') return `업체별 단가 비교 기준으로 분석했습니다. ${parseText} 요청한 공종/품목 기준으로 비교표 ${rowCount.toLocaleString()}행을 만들었습니다. 표 데이터 탭에서 요청 업체별 단가와 계산 금액을 확인하세요.`;
   if (tableType === 'STANDARD_MARKET_PRICE_TABLE') return `표준시장단가 자료로 분석했습니다. ${parseText} 공종별 단가 ${rowCount.toLocaleString()}행을 표로 정리했고 확인 필요 항목은 ${issueCount}건입니다.`;
   if (['REFERENCE_GUIDELINE_TABLE', 'GUIDELINE_SUMMARY_TABLE'].includes(tableType)) return `기준서/지침서로 분석했습니다. ${parseText} 기준·단가·산정 문장 ${rowCount.toLocaleString()}행을 표로 정리했고 확인 필요 항목은 ${issueCount}건입니다.`;
   if (/(단가|비교|최저|가격)/i.test(requestText || '')) return `단가 비교 기준으로 분석했습니다. ${parseText} 표 후보 ${rowCount.toLocaleString()}행, 확인 필요 항목 ${issueCount}건입니다.`;
@@ -1189,7 +1725,15 @@ const updateTable = asyncHandler(async (req, res) => {
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
-    await conn.query(`UPDATE extracted_tables SET columns_json = ?, rows_json = ?, table_json = ?, row_count = ?, status = 'MODIFIED' WHERE id = ?`, [JSON.stringify(columns), JSON.stringify(rows), JSON.stringify({ columns, rows }), rows.length, table.id]);
+    const nextTableJson = {
+      ...(table.tableJson || {}),
+      columns,
+      rows,
+      meta: {
+        ...((table.tableJson || {}).meta || {}),
+      },
+    };
+    await conn.query(`UPDATE extracted_tables SET columns_json = ?, rows_json = ?, table_json = ?, row_count = ?, status = 'MODIFIED' WHERE id = ?`, [JSON.stringify(columns), JSON.stringify(rows), JSON.stringify(nextTableJson), rows.length, table.id]);
     await replaceIssues(conn, job.id, table.id, issues);
     await conn.query('UPDATE document_jobs SET status = ? WHERE id = ?', [issues.length ? 'NEED_REVIEW' : 'READY_TO_GENERATE', job.id]);
     await conn.commit();
@@ -1215,6 +1759,18 @@ const revalidateJob = asyncHandler(async (req, res) => {
   res.json({ job: await loadJob(job.id, req.user) });
 });
 
+function normalizeExcelOutputMode(value, fallback = 'FREE_FORM') {
+  const raw = String(value || fallback || 'FREE_FORM').trim().toUpperCase();
+  return raw === 'COMPANY_TEMPLATE' ? 'COMPANY_TEMPLATE' : 'FREE_FORM';
+}
+
+function normalizeTemplateId(value) {
+  if (value === undefined || value === null) return null;
+  const text = String(value).trim();
+  if (!text || text.toLowerCase() === 'null' || text.toLowerCase() === 'undefined') return null;
+  return text;
+}
+
 async function loadTemplateWithMappings(templateId) {
   if (!templateId) return { template: null, mappings: [] };
   const [[template]] = await pool.query(`SELECT * FROM excel_templates WHERE id = ? AND active_yn = 'Y'`, [templateId]);
@@ -1227,12 +1783,15 @@ async function loadTemplateWithMappings(templateId) {
   return { template, mappings: Array.isArray(mappingJson.mappings) ? mappingJson.mappings : [] };
 }
 
-async function generateExcelForJob({ job, tableId, fileName, templateId, sourceSessionId = null, sourceMessageId = null, authorName = '', templateLayoutMode = 'COMPACT_VENDOR_GROUPS' }) {
+async function generateExcelForJob({ job, tableId, fileName, outputMode = null, templateId = null, sourceSessionId = null, sourceMessageId = null, authorName = '', templateLayoutMode = 'COMPACT_VENDOR_GROUPS' }) {
   const table = tableId ? job.tables.find((item) => Number(item.id) === Number(tableId)) : job.tables[0];
   if (!table) throw new Error('엑셀로 만들 표 데이터가 없습니다.');
 
+  const effectiveOutputMode = normalizeExcelOutputMode(outputMode, job.outputMode || 'FREE_FORM');
+  const requestedTemplateId = normalizeTemplateId(templateId);
+  const effectiveTemplateId = effectiveOutputMode === 'COMPANY_TEMPLATE' ? (requestedTemplateId || job.templateId || null) : null;
+
   let excel;
-  const effectiveTemplateId = templateId || job.templateId || null;
   if (effectiveTemplateId) {
     const { template, mappings } = await loadTemplateWithMappings(effectiveTemplateId);
     if (!mappings.length) throw new Error('자사 양식 매핑이 저장되어 있지 않습니다. 매핑 페이지에서 먼저 저장하세요.');
@@ -1245,7 +1804,7 @@ async function generateExcelForJob({ job, tableId, fileName, templateId, sourceS
       rows: table.rows,
       job: { ...job, tables: [table] },
       authorName,
-      templateLayoutMode
+      templateLayoutMode: templateLayoutMode || 'COMPACT_VENDOR_GROUPS'
     });
   } else {
     excel = await createExcelFile({ jobId: job.id, fileName, columns: table.columns, rows: table.rows });
@@ -1257,13 +1816,23 @@ async function generateExcelForJob({ job, tableId, fileName, templateId, sourceS
     [job.id, effectiveTemplateId, sourceSessionId || null, sourceMessageId || null, excel.fileName, excel.filePath]
   );
   await pool.query('UPDATE document_jobs SET status = ? WHERE id = ?', ['GENERATED', job.id]);
-  return { id: result.insertId, fileName: excel.fileName, jobId: job.id, templateApplied: Boolean(effectiveTemplateId) };
+  return { id: result.insertId, fileName: excel.fileName, jobId: job.id, outputMode: effectiveOutputMode, templateApplied: Boolean(effectiveTemplateId) };
 }
 
 const generateExcel = asyncHandler(async (req, res) => {
   const job = await loadJob(req.params.id, req.user);
   if (!job) return res.status(404).json({ message: '작업을 찾을 수 없습니다.' });
-  const excel = await generateExcelForJob({ job, tableId: req.body.tableId || req.body.table_id, fileName: req.body.fileName, templateId: req.body.templateId || job.templateId, sourceSessionId: req.body.chatSessionId || null, authorName: req.user.userName || req.user.loginId || '', templateLayoutMode: req.body.templateLayoutMode || 'COMPACT_VENDOR_GROUPS' });
+  const outputMode = normalizeExcelOutputMode(req.body.outputMode || req.body.output_mode, job.outputMode || 'FREE_FORM');
+  const excel = await generateExcelForJob({
+    job,
+    tableId: req.body.tableId || req.body.table_id,
+    fileName: req.body.fileName,
+    outputMode,
+    templateId: outputMode === 'COMPANY_TEMPLATE' ? (req.body.templateId ?? req.body.template_id ?? null) : null,
+    sourceSessionId: req.body.chatSessionId || null,
+    authorName: req.user.userName || req.user.loginId || '',
+    templateLayoutMode: outputMode === 'COMPANY_TEMPLATE' ? (req.body.templateLayoutMode || 'COMPACT_VENDOR_GROUPS') : null
+  });
   res.status(201).json({ excel });
 });
 
@@ -1363,27 +1932,47 @@ const aiChat = asyncHandler(async (req, res) => {
   if (job && selectedTable) {
     const edit = detectTableEditCommand(message, selectedTable);
     if (edit) {
-      if (!['NOOP_COLUMNS_ALREADY_VISIBLE', 'FILTER_ROWS_NO_MATCH'].includes(edit.type)) {
+      if (!['NOOP_COLUMNS_ALREADY_VISIBLE', 'FILTER_ROWS_NO_MATCH', 'VENDOR_EDIT_NO_MATCH'].includes(edit.type)) {
         await updateExistingTable({ job, table: selectedTable, columns: edit.columns, rows: edit.rows, tableJson: edit.tableJson || null });
       }
       const updatedJob = await loadJob(job.id, req.user);
-      const answer = `${describeTableEdit(edit)} 현재 컬럼은 ${edit.columns.map((col) => col.label).join(', ')}입니다.`;
-      await appendChatMessage({ sessionId, jobId: job.id, role: 'ASSISTANT', text: answer, payload: { edit }, action: edit.type === 'NOOP_COLUMNS_ALREADY_VISIBLE' ? 'TABLE_INFO' : 'TABLE_UPDATED', llmModel: 'rule-table-editor' });
-      return res.json({ chat: { answer, intent: 'TABLE_EDIT', action: edit.type === 'NOOP_COLUMNS_ALREADY_VISIBLE' ? 'NO_CHANGE' : 'UPDATE_TABLE', recommendedTab: 'table', quickReplies: ['노무비율 추가해줘', '비고 빼줘', '단가 높은 순으로 정렬해줘'], llmUsed: false, model: 'rule-table-editor' }, job: updatedJob, session: await loadChatSession(sessionId, req.user) });
+      const baseAnswer = `${describeTableEdit(edit)} 현재 표는 ${edit.rows.length}행, ${edit.columns.length}개 컬럼입니다.`;
+      let answer = baseAnswer;
+      let llmEdit = null;
+      try {
+        if (edit.type !== 'VENDOR_EDIT_NO_MATCH') {
+          llmEdit = await chatWithDocuments({
+            message: `반드시 한국어로만 답변하세요. 중국어/일본어/영어 문장을 섞지 마세요. 다음 표 수정 결과를 사용자에게 2~4줄로 설명하고, 실제 반영된 행/업체/금액 기준으로 추가 확인할 점을 알려줘. 사용자 요청: ${String(message)} / 수정 결과: ${baseAnswer}`,
+            context: buildServerChatContext(updatedJob, selectedTable.id, { editSummary: baseAnswer, edit }),
+          });
+          const cleanLlmAnswer = sanitizeKoreanAssistantText(llmEdit?.answer || '', '표 수정은 반영되었습니다. 금액과 최저 업체는 현재 표시된 업체 컬럼 기준으로 다시 계산했습니다.');
+          if (llmEdit?.llmUsed && cleanLlmAnswer) answer = `${baseAnswer}
+
+AI 검토: ${cleanLlmAnswer}`;
+        }
+      } catch (error) {
+        llmEdit = null;
+      }
+      await appendChatMessage({ sessionId, jobId: job.id, role: 'ASSISTANT', text: answer, payload: { edit, llmEdit }, action: edit.type === 'NOOP_COLUMNS_ALREADY_VISIBLE' ? 'TABLE_INFO' : 'TABLE_UPDATED', llmModel: llmEdit?.model || 'rule-table-editor' });
+      return res.json({ chat: { answer, intent: 'TABLE_EDIT', action: edit.type === 'NOOP_COLUMNS_ALREADY_VISIBLE' ? 'NO_CHANGE' : 'UPDATE_TABLE', recommendedTab: 'table', quickReplies: ['표 확인', '단가 비교', '엑셀 만들어줘'], llmUsed: Boolean(llmEdit?.llmUsed), model: llmEdit?.model || 'rule-table-editor' }, job: updatedJob, session: await loadChatSession(sessionId, req.user) });
     }
   }
 
   if (job && /(엑셀|xlsx).*(만들|생성|다운로드)|다운로드.*(만들|생성|해줘)/i.test(String(message))) {
-    const excel = await generateExcelForJob({ job, tableId: selectedTable?.id, fileName: null, templateId: job.templateId, sourceSessionId: sessionId, sourceMessageId: userMessageId, authorName: req.user.userName || req.user.loginId || '', templateLayoutMode: context?.templateLayoutMode || 'COMPACT_VENDOR_GROUPS' });
+    const chatOutputMode = normalizeExcelOutputMode(context?.outputMode || job.outputMode || 'FREE_FORM', job.outputMode || 'FREE_FORM');
+    const chatTemplateId = chatOutputMode === 'COMPANY_TEMPLATE' ? (context?.templateId || context?.selectedTemplate?.id || job.templateId || null) : null;
+    const excel = await generateExcelForJob({ job, tableId: selectedTable?.id, fileName: null, outputMode: chatOutputMode, templateId: chatTemplateId, sourceSessionId: sessionId, sourceMessageId: userMessageId, authorName: req.user.userName || req.user.loginId || '', templateLayoutMode: chatOutputMode === 'COMPANY_TEMPLATE' ? (context?.templateLayoutMode || 'COMPACT_VENDOR_GROUPS') : null });
     const answer = `엑셀 파일을 생성했습니다. 다운로드 목록에도 함께 표시됩니다. 파일명: ${excel.fileName}`;
     await appendChatMessage({ sessionId, jobId: job.id, role: 'ASSISTANT', text: answer, payload: { generatedExcel: excel }, action: 'EXCEL_GENERATED', llmModel: 'rule-excel-generator' });
     return res.json({ chat: { answer, intent: 'EXCEL_CREATE', action: 'SHOW_EXCEL', recommendedTab: 'excel', quickReplies: ['다운로드 목록 보여줘', '표 데이터 보여줘'], generatedExcel: excel, llmUsed: false, model: 'rule-excel-generator' }, job: await loadJob(job.id, req.user), session: await loadChatSession(sessionId, req.user) });
   }
 
   const safeContext = buildServerChatContext(job, selectedTableId, context && typeof context === 'object' ? context : {});
-  const result = await chatWithDocuments({ message: String(message), context: safeContext });
-  await appendChatMessage({ sessionId, jobId: job?.id || null, role: 'ASSISTANT', text: result.answer || '답변을 생성하지 못했습니다.', payload: result, action: result.action || 'AI_CHAT', llmModel: result.model || null });
-  res.json({ chat: result, job: job ? await loadJob(job.id, req.user) : null, session: await loadChatSession(sessionId, req.user) });
+  const result = await chatWithDocuments({ message: `반드시 한국어로만 답변하세요. 중국어/일본어/영어 문장을 섞지 마세요. ${String(message)}`, context: safeContext });
+  const sanitizedAnswer = sanitizeKoreanAssistantText(result.answer || '', '요청을 확인했습니다. 현재 표 데이터 기준으로 답변을 생성했지만, LLM 응답 형식이 불안정하여 한국어 규칙 답변으로 대체했습니다. 표 데이터 탭에서 실제 반영 결과를 확인해 주세요.');
+  const safeResult = { ...result, answer: sanitizedAnswer };
+  await appendChatMessage({ sessionId, jobId: job?.id || null, role: 'ASSISTANT', text: safeResult.answer || '답변을 생성하지 못했습니다.', payload: safeResult, action: safeResult.action || 'AI_CHAT', llmModel: safeResult.model || null });
+  res.json({ chat: safeResult, job: job ? await loadJob(job.id, req.user) : null, session: await loadChatSession(sessionId, req.user) });
 });
 
 module.exports = {

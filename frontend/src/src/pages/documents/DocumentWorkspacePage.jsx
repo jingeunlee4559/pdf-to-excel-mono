@@ -11,7 +11,10 @@ const emptyAnalysis = {
   issueCount: 0,
   purpose: '문서 분석 대기',
   keyValues: [],
-  fileProfiles: []
+  fileProfiles: [],
+  llmUsage: null,
+  llmUsed: false,
+  llmIntentUsed: false
 };
 
 const defaultColumns = [
@@ -114,12 +117,20 @@ const statusLabel = (status) => {
 };
 
 
+function cleanTableColumnLabel(label = '') {
+  return String(label || '')
+    .replace(/^\s*[A-Z]\s*회사\s*[·ㆍ:：\-–—]*\s*/i, '')
+    .replace(/^\s*[A-Z]\s*회사(?=㈜|\(주\)|주식회사|[가-힣A-Za-z0-9])/i, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 export default function DocumentWorkspacePage() {
   const { user } = useAuth();
   const writerName = user?.userName || user?.loginId || '';
   const [templates, setTemplates] = useState([]);
   const [tab, setTab] = useState('analysis');
-  const [outputMode, setOutputMode] = useState('COMPANY_TEMPLATE');
+  const [outputMode, setOutputMode] = useState('FREE_FORM');
   const [templateLayoutMode, setTemplateLayoutMode] = useState('COMPACT_VENDOR_GROUPS');
   const [templateId, setTemplateId] = useState('');
   const [fileName, setFileName] = useState(`엑셀산출물_${new Date().toISOString().slice(0, 10).replaceAll('-', '')}.xlsx`);
@@ -375,7 +386,10 @@ export default function DocumentWorkspacePage() {
       issueCount: jobData?.issues?.length || 0,
       purpose: jobData?.analysis?.purpose || jobData?.analysis?.documentPurpose || '문서 데이터 엑셀화',
       keyValues: jobData?.analysis?.keyValues || [],
-      fileProfiles: jobData?.analysis?.fileProfiles || jobData?.analysis?.raw?.fileProfiles || []
+      fileProfiles: jobData?.analysis?.fileProfiles || jobData?.analysis?.raw?.fileProfiles || [],
+      llmUsage: jobData?.analysis?.llmUsage || jobData?.analysis?.raw?.llmUsage || null,
+      llmUsed: Boolean(jobData?.analysis?.llmUsed || jobData?.analysis?.raw?.llmUsed),
+      llmIntentUsed: Boolean(jobData?.analysis?.llmIntentUsed || jobData?.analysis?.raw?.llmIntentUsed)
     });
     const resultTables = Array.isArray(jobData?.tables) ? jobData.tables : [];
     setTables(resultTables);
@@ -698,7 +712,14 @@ export default function DocumentWorkspacePage() {
     try {
       setLoading(true);
       await saveTable();
-      const result = await generateExcelApi(job.id, { fileName, templateId: outputMode === 'COMPANY_TEMPLATE' ? templateId : null, tableId: table.id || null, chatSessionId: activeSessionId || null, templateLayoutMode });
+      const result = await generateExcelApi(job.id, {
+        fileName,
+        outputMode,
+        templateId: outputMode === 'COMPANY_TEMPLATE' ? templateId : null,
+        tableId: table.id || null,
+        chatSessionId: activeSessionId || null,
+        templateLayoutMode: outputMode === 'COMPANY_TEMPLATE' ? templateLayoutMode : null
+      });
       setGeneratedExcel(result.excel);
       await refreshDownloads();
       setMessage('엑셀 파일이 생성되었습니다. 다운로드 버튼을 누르세요. 다운로드 목록에도 표시됩니다.');
@@ -714,7 +735,7 @@ export default function DocumentWorkspacePage() {
   const currentJobRunning = isBackgroundRunning(job?.status);
 
   return (
-    <div className="space-y-4">
+    <div className="w-full max-w-none space-y-4">
       <section className="rounded-[28px] border border-slate-200 bg-white/95 px-5 py-4 shadow-card backdrop-blur">
         <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
           <div>
@@ -756,7 +777,7 @@ export default function DocumentWorkspacePage() {
         <div className="mt-3 flex flex-wrap items-center gap-2 2xl:pl-[60px]">
           <Badge tone={issues.length ? 'amber' : 'green'}>확인 필요 {issues.length}건</Badge>
           <Badge tone="green">양식 반영 {outputMode === 'COMPANY_TEMPLATE' ? '가능' : '미사용'}</Badge>
-          <Badge tone="slate">선택 양식: {selectedTemplate?.templateName || '없음'}</Badge>
+          <Badge tone="slate">{outputMode === 'COMPANY_TEMPLATE' ? `선택 양식: ${selectedTemplate?.templateName || '없음'}` : '선택 양식: 자유형'}</Badge>
           {outputMode === 'COMPANY_TEMPLATE' && <Badge tone="blue">배치: {templateLayoutMode === 'COMPACT_VENDOR_GROUPS' ? '빈 업체칸 숨김' : '원본 양식 유지'}</Badge>}
         </div>
       </section>
@@ -788,7 +809,7 @@ export default function DocumentWorkspacePage() {
         </div>
       </div>
 
-      <div className={`grid grid-cols-1 gap-5 2xl:h-[calc(100vh-250px)] 2xl:min-h-[680px] 2xl:items-stretch ${showResultPanel && showChatPanel ? '2xl:grid-cols-[minmax(0,1fr)_540px]' : '2xl:grid-cols-1'}`}>
+      <div className={`grid grid-cols-1 gap-4 2xl:h-[calc(100vh-250px)] 2xl:min-h-[680px] 2xl:items-stretch ${showResultPanel && showChatPanel ? '2xl:grid-cols-[minmax(0,1fr)_minmax(420px,540px)]' : '2xl:grid-cols-1'}`}>
         {showResultPanel && (
         <section className="flex min-h-[680px] min-w-0 flex-col overflow-hidden rounded-[32px] border border-slate-200 bg-white shadow-soft 2xl:h-full 2xl:min-h-0">
           <div className="flex flex-col justify-between gap-3 border-b border-slate-200 bg-white px-5 py-4 lg:flex-row lg:items-center">
@@ -828,6 +849,7 @@ export default function DocumentWorkspacePage() {
           userRequest={userRequest}
           setUserRequest={setUserRequest}
           selectedTemplate={selectedTemplate}
+          outputMode={outputMode}
           loading={loading}
           backgroundRunning={currentJobRunning}
           jobStatus={job?.status}
@@ -869,6 +891,7 @@ function ChatAssistantPanel({
   userRequest,
   setUserRequest,
   selectedTemplate,
+  outputMode = 'FREE_FORM',
   loading,
   backgroundRunning = false,
   jobStatus = '',
@@ -997,7 +1020,7 @@ function ChatAssistantPanel({
           <div className="max-w-[88%] rounded-[24px] rounded-tl-md border border-slate-200 bg-white px-4 py-3 shadow-card">
             <p className="text-sm font-bold leading-6 text-slate-700">파일을 첨부한 뒤 요청 내용을 입력하고 Enter를 누르면 파일과 요청이 함께 업로드됩니다. 분석 결과가 있으면 표/이슈 기준으로 답변합니다.</p>
             <div className="mt-3 rounded-2xl border border-brand-100 bg-brand-50 px-3 py-2 text-xs font-black text-brand-700">
-              현재 기준<br />{selectedTemplate?.templateName ? `자사 양식 엑셀 · ${selectedTemplate.templateName}` : '자사 양식 엑셀 · 템플릿 선택 필요'}
+              현재 기준<br />{outputMode === 'COMPANY_TEMPLATE' ? (selectedTemplate?.templateName ? `자사 양식 엑셀 · ${selectedTemplate.templateName}` : '자사 양식 엑셀 · 템플릿 선택 필요') : '자유형 엑셀 · 표 데이터 기준'}
             </div>
           </div>
         </div>
@@ -1278,10 +1301,177 @@ function TableSelector({ tables, selectedIndex, onSelect }) {
   );
 }
 
+
+const parseAmountValue = (value) => {
+  const num = Number(String(value ?? '').replace(/[^0-9.-]/g, ''));
+  return Number.isFinite(num) ? num : 0;
+};
+
+const formatWonValue = (value) => {
+  const num = parseAmountValue(value);
+  return num ? `${num.toLocaleString()}원` : '-';
+};
+
+const cleanVendorLabel = (value) => {
+  const raw = String(value ?? '').trim();
+  if (!raw) return '';
+  return raw
+    .replace(/^[A-Z]회사\s*/g, '')
+    .replace(/^[A-Z]\s*회사\s*/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+};
+
+const normalizeVendorName = (value) => cleanVendorLabel(value)
+  .replace(/[\s·,._()\[\]{}㈜주식회사]/g, '')
+  .toLowerCase();
+
+const getVendorNameFromColumn = (column) => {
+  const label = cleanVendorLabel(column?.label || column?.header || column?.name || column?.key || '');
+  if (!label) return '';
+  return label
+    .replace(/\s*(단가|금액|업체\s*단가|업체\s*금액)\s*$/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+};
+
+const getVendorColumnGroups = (table) => {
+  const columns = Array.isArray(table?.columns) ? table.columns : [];
+  const groups = new Map();
+
+  columns.forEach((column) => {
+    const label = String(column?.label || column?.header || column?.name || '').trim();
+    if (!label) return;
+    if (/최저|표준|기준|요청|수량|공종|규격|단위|비고|관리/.test(label)) return;
+    if (!/(단가|금액)/.test(label)) return;
+
+    const vendor = getVendorNameFromColumn(column);
+    const normalized = normalizeVendorName(vendor);
+    if (!normalized) return;
+    const existing = groups.get(normalized) || { vendor, unitPriceKey: null, amountKey: null, unitPriceLabel: '', amountLabel: '' };
+    if (/단가/.test(label) && !existing.unitPriceKey) {
+      existing.unitPriceKey = column.key;
+      existing.unitPriceLabel = label;
+    }
+    if (/금액/.test(label) && !existing.amountKey) {
+      existing.amountKey = column.key;
+      existing.amountLabel = label;
+    }
+    groups.set(normalized, existing);
+  });
+
+  return Array.from(groups.values());
+};
+
+const getCompareVendorCount = (table) => {
+  const groups = getVendorColumnGroups(table);
+  if (groups.length) return groups.length;
+  const meta = table?.tableJson?.meta || table?.meta || {};
+  if (Number(meta.vendorCount || 0)) return Number(meta.vendorCount);
+  return 0;
+};
+
+const getRequestedQuantityText = (rows) => {
+  const quantities = [...new Set(rows.map((row) => row.quantity || row.request_quantity).filter((v) => v !== undefined && v !== null && String(v).trim() !== ''))];
+  if (!quantities.length) return '-';
+  return quantities.slice(0, 5).join(', ');
+};
+
+const getItemNameSummary = (rows, limit = 6) => {
+  const names = [...new Set(rows.map((row) => row.item_name || row.itemName || row.name).filter(Boolean))];
+  if (!names.length) return '-';
+  const shown = names.slice(0, limit).join(', ');
+  return names.length > limit ? `${shown} 외 ${names.length - limit}건` : shown;
+};
+
+const buildVendorSummaryCards = (table) => {
+  const rows = Array.isArray(table?.rows) ? table.rows : [];
+  const groups = getVendorColumnGroups(table);
+  if (!rows.length || !groups.length) return [];
+  const lowestVendors = rows.map((row) => normalizeVendorName(row.lowest_vendor)).filter(Boolean);
+
+  return groups.map((group) => {
+    const totalAmount = rows.reduce((sum, row) => sum + parseAmountValue(row[group.amountKey]), 0);
+    const avgUnitPrice = rows.length
+      ? Math.round(rows.reduce((sum, row) => sum + parseAmountValue(row[group.unitPriceKey]), 0) / rows.length)
+      : 0;
+    const lowestCount = lowestVendors.filter((vendor) => vendor && vendor === normalizeVendorName(group.vendor)).length;
+    return {
+      vendor: group.vendor,
+      totalAmount,
+      avgUnitPrice,
+      lowestCount,
+      rows: rows.length,
+      desc: `최저 ${lowestCount}건 · 평균 단가 ${avgUnitPrice ? avgUnitPrice.toLocaleString() : '-'}원`,
+    };
+  }).sort((a, b) => {
+    if (b.lowestCount !== a.lowestCount) return b.lowestCount - a.lowestCount;
+    return a.totalAmount - b.totalAmount;
+  });
+};
+
+const buildAnalysisTextCards = (analysis) => {
+  const keyValues = Array.isArray(analysis?.keyValues) ? analysis.keyValues : [];
+  const getValue = (patterns) => {
+    const hit = keyValues.find((kv) => patterns.some((pattern) => pattern.test(String(kv.label || ''))));
+    return hit?.value;
+  };
+  return [
+    { label: '분석 요약', value: analysis?.summary },
+    { label: 'LLM 검토', value: getValue([/LLM\s*검토/, /검토/]) },
+    { label: '검색 키워드', value: getValue([/검색\s*키워드/, /키워드/]) },
+    { label: 'LLM 역할', value: getValue([/LLM\s*역할/, /역할/]) },
+  ].filter((item) => item.value && String(item.value).trim());
+};
+
+const buildCoreDataCards = (analysis, table, issues = []) => {
+  const rows = Array.isArray(table?.rows) ? table.rows : [];
+  const meta = table?.tableJson?.meta || table?.meta || {};
+  const tableType = table?.tableType || table?.table_type || '';
+  if (isMultiVendorCompareTableType(tableType)) {
+    const vendorSummaries = buildVendorSummaryCards(table);
+    const bestVendorText = vendorSummaries
+      .filter((item) => item.lowestCount > 0)
+      .slice(0, 3)
+      .map((item) => `${item.vendor} ${item.lowestCount}건`)
+      .join(', ') || '-';
+    const lowestTotal = rows.reduce((sum, row) => sum + parseAmountValue(row.lowest_amount), 0);
+    const selectedVendors = getVendorColumnGroups(table).map((item) => item.vendor).join(', ') || '-';
+    const tableColumnCount = Array.isArray(table?.columns) ? table.columns.length : 0;
+    return [
+      { label: '분석된 비교 행', value: `${rows.length.toLocaleString()}행` },
+      { label: '표 컬럼 수', value: `${tableColumnCount.toLocaleString()}개` },
+      { label: '비교 업체', value: selectedVendors },
+      { label: '비교 업체 수', value: `${getCompareVendorCount(table).toLocaleString()}개` },
+      { label: '요청/대상 품목', value: getItemNameSummary(rows, 6) },
+      { label: '요청 수량', value: getRequestedQuantityText(rows) },
+      { label: '최저 업체 요약', value: bestVendorText },
+      { label: '최저 금액 합계', value: lowestTotal ? `${lowestTotal.toLocaleString()}원` : '-' },
+      { label: '표준시장단가 표시', value: meta.standardPriceHidden ? '기본 숨김' : (meta.standardPriceShown ? '표시' : '기본 숨김') },
+      { label: '확인 필요', value: `${issues.length}건` },
+    ];
+  }
+
+  const firstRow = rows[0] || {};
+  const priorityKeys = ['item_name', 'spec', 'quantity', 'unit', 'unit_price', 'amount', 'lowest_amount', 'remark'];
+  const cards = priorityKeys
+    .filter((key) => firstRow[key] !== undefined && String(firstRow[key] ?? '').trim() !== '')
+    .map((key) => ({ label: key, value: String(firstRow[key]) }));
+  if (cards.length) return cards.slice(0, 8);
+  return [
+    { label: '문서 유형', value: analysis?.documentType || '-' },
+    { label: '표 행 수', value: `${rows.length.toLocaleString()}행` },
+    { label: '확인 필요', value: `${issues.length}건` },
+  ];
+};
+
 function AnalysisView({ analysis, issues, table, onMoveTable, onMoveExcel }) {
-  const firstRow = table.rows?.[0] || {};
+  const coreDataCards = buildCoreDataCards(analysis, table, issues);
+  const vendorSummaryCards = buildVendorSummaryCards(table);
+  const analysisTextCards = buildAnalysisTextCards(analysis);
+  const isCompareTable = isMultiVendorCompareTableType(table?.tableType || table?.table_type || '');
   return (
-    <div className="space-y-4">
+    <div className="w-full max-w-none space-y-4">
       <div className="overflow-hidden rounded-[30px] border border-slate-200 bg-white shadow-card">
         <div className="border-b border-slate-200 bg-gradient-to-br from-brand-50 via-white to-emerald-50 p-6">
           <div className="flex flex-col gap-5 2xl:flex-row 2xl:items-center 2xl:justify-between">
@@ -1330,30 +1520,96 @@ function AnalysisView({ analysis, issues, table, onMoveTable, onMoveExcel }) {
         )}
         <div className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-card">
           <h4 className="text-lg font-black text-slate-950">문서에서 읽은 핵심 데이터</h4>
-          <div className="mt-4 grid grid-cols-2 gap-2">
-            {Object.entries(firstRow).slice(0, 6).map(([key, value]) => (
-              <div key={key} className="rounded-2xl border border-slate-200 bg-slate-50 px-3 py-3">
-                <p className="text-xs font-black text-slate-400">{key}</p>
-                <p className="mt-1 truncate text-sm font-black text-slate-900">{String(value || '-')}</p>
+          <p className="mt-1 text-xs font-bold text-slate-500">첫 행 1개가 아니라 현재 표 전체 기준으로 요약합니다.</p>
+          <div className="mt-4 grid grid-cols-1 gap-2 sm:grid-cols-2">
+            {coreDataCards.map((item, index) => (
+              <div key={`${item.label}-${index}`} className="rounded-2xl border border-slate-200 bg-slate-50 px-3 py-3">
+                <p className="text-xs font-black text-slate-400">{item.label}</p>
+                <p className="mt-1 break-words text-sm font-black text-slate-900">{String(item.value || '-')}</p>
               </div>
             ))}
-            {!Object.keys(firstRow).length && <p className="col-span-2 text-sm font-bold text-slate-400">분석 후 핵심 데이터가 표시됩니다.</p>}
+            {!coreDataCards.length && <p className="col-span-2 text-sm font-bold text-slate-400">분석 후 핵심 데이터가 표시됩니다.</p>}
           </div>
         </div>
         <div className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-card">
           <h4 className="text-lg font-black text-slate-950">LLM 분석 적용 상태</h4>
+          {analysis.llmUsage && (
+            <div className="mt-4 grid grid-cols-1 gap-2 sm:grid-cols-2">
+              {[
+                ['의도분석', analysis.llmUsage.intentAnalysis],
+                ['표 추출', analysis.llmUsage.tableExtraction],
+                ['단가 계산', analysis.llmUsage.priceCalculation],
+                ['요약/검증', analysis.llmUsage.summaryAnalysis],
+                ['LLM 직접 표 생성', analysis.llmUsage.structureGeneration]
+              ].map(([label, item]) => (
+                <div key={label} className="rounded-2xl border border-brand-100 bg-brand-50 px-3 py-3">
+                  <p className="text-xs font-black text-brand-500">{label}</p>
+                  <p className="mt-1 break-words text-sm font-black text-slate-900">{item?.status || '-'}</p>
+                  <p className="mt-1 break-words text-[11px] font-bold text-slate-500">{item?.source || ''}</p>
+                </div>
+              ))}
+            </div>
+          )}
           <div className="mt-4 grid grid-cols-1 gap-2 sm:grid-cols-2">
             {(analysis.keyValues || []).filter((kv) => /LLM|의도|검색 키워드|모델/.test(String(kv.label || ''))).slice(0, 8).map((kv, index) => (
-              <div key={`${kv.label}-${index}`} className="rounded-2xl border border-brand-100 bg-brand-50 px-3 py-3">
-                <p className="text-xs font-black text-brand-500">{kv.label}</p>
+              <div key={`${kv.label}-${index}`} className="rounded-2xl border border-slate-200 bg-slate-50 px-3 py-3">
+                <p className="text-xs font-black text-slate-500">{kv.label}</p>
                 <p className="mt-1 break-words text-sm font-black text-slate-900">{String(kv.value ?? '-')}</p>
               </div>
             ))}
-            {!(analysis.keyValues || []).some((kv) => /LLM|의도|검색 키워드|모델/.test(String(kv.label || ''))) && (
+            {!analysis.llmUsage && !(analysis.keyValues || []).some((kv) => /LLM|의도|검색 키워드|모델/.test(String(kv.label || ''))) && (
               <p className="col-span-full text-sm font-bold text-slate-400">LLM 적용 상태가 아직 표시되지 않았습니다. 분석 서버 응답의 keyValues를 확인하세요.</p>
             )}
           </div>
         </div>
+        {isCompareTable && vendorSummaryCards.length > 0 && (
+          <div className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-card xl:col-span-2">
+            <div className="flex flex-col gap-2 lg:flex-row lg:items-end lg:justify-between">
+              <div>
+                <h4 className="text-lg font-black text-slate-950">업체별 비교 요약</h4>
+                <p className="mt-1 text-xs font-bold text-slate-500">현재 표에 실제 표시된 업체 컬럼만 기준으로 합계·평균·최저 횟수를 계산합니다.</p>
+              </div>
+              <Badge tone="blue">표 기준 자동 계산</Badge>
+            </div>
+            <div className="mt-4 grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
+              {vendorSummaryCards.map((item) => (
+                <div key={item.vendor} className="rounded-3xl border border-slate-200 bg-slate-50 p-4">
+                  <div className="flex items-start justify-between gap-2">
+                    <p className="break-words text-sm font-black text-slate-950">{item.vendor}</p>
+                    {item.lowestCount > 0 && <Badge tone="green">최저 {item.lowestCount}건</Badge>}
+                  </div>
+                  <div className="mt-3 grid grid-cols-2 gap-2">
+                    <div className="rounded-2xl bg-white px-3 py-2">
+                      <p className="text-[11px] font-black text-slate-400">합계 금액</p>
+                      <p className="mt-1 text-sm font-black text-slate-900">{item.totalAmount ? `${item.totalAmount.toLocaleString()}원` : '-'}</p>
+                    </div>
+                    <div className="rounded-2xl bg-white px-3 py-2">
+                      <p className="text-[11px] font-black text-slate-400">평균 단가</p>
+                      <p className="mt-1 text-sm font-black text-slate-900">{item.avgUnitPrice ? `${item.avgUnitPrice.toLocaleString()}원` : '-'}</p>
+                    </div>
+                  </div>
+                  <p className="mt-3 text-xs font-bold leading-5 text-slate-500">{item.desc}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {analysisTextCards.length > 0 && (
+          <div className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-card xl:col-span-2">
+            <h4 className="text-lg font-black text-slate-950">AI 분석 내용</h4>
+            <p className="mt-1 text-xs font-bold text-slate-500">LLM 요약·검토 의견은 설명용으로 표시하고, 표 추출과 금액 계산은 파서 결과를 기준으로 유지합니다.</p>
+            <div className="mt-4 grid grid-cols-1 gap-3 lg:grid-cols-2">
+              {analysisTextCards.map((item, index) => (
+                <div key={`${item.label}-${index}`} className="rounded-3xl border border-brand-100 bg-gradient-to-br from-brand-50 to-white p-4">
+                  <p className="text-xs font-black text-brand-600">{item.label}</p>
+                  <p className="mt-2 whitespace-pre-wrap text-sm font-bold leading-6 text-slate-700">{String(item.value)}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
         <div className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-card">
           <h4 className="text-lg font-black text-slate-950">엑셀화 방향</h4>
           <div className="mt-4 rounded-2xl border border-brand-100 bg-brand-50 p-4">
@@ -1402,7 +1658,7 @@ function formatMoney(value) {
   return num.toLocaleString();
 }
 
-function normalizeVendorName(name) {
+function normalizePreviewVendorLabel(name) {
   return String(name || '')
     .replace(/\s+/g, ' ')
     .replace(/\s*(단가|금액|견적가|견적단가)$/g, '')
@@ -1417,7 +1673,7 @@ function comparableCompanyName(name) {
 }
 
 function isIgnoredVendorLabel(label) {
-  const normalized = normalizeVendorName(label);
+  const normalized = normalizePreviewVendorLabel(label);
   return /^(기준|표준|일반|최저|최고|차이|대비|요청|계산|산출|공급|세액|금액|단가)$/i.test(normalized)
     || /(기준|표준|일반|최저|최고|차이|대비|요청|계산|산출)\s*(단가|금액)?$/i.test(label || '');
 }
@@ -1426,9 +1682,15 @@ function inferPreviewVendors(table) {
   const columns = table.columns || [];
   const rows = table.rows || [];
   const metaVendors = Array.isArray(table.tableJson?.meta?.vendors) ? table.tableJson.meta.vendors : [];
+  const metaVendorByIndex = new Map();
+  metaVendors.forEach((vendor, index) => {
+    const actualIndex = Number.isFinite(Number(vendor?.index)) ? Number(vendor.index) : index;
+    const name = vendor?.name || vendor?.vendorName || vendor?.label || vendor;
+    if (name) metaVendorByIndex.set(actualIndex, vendor);
+  });
   const map = new Map();
   const put = (name, patch = {}) => {
-    const clean = normalizeVendorName(name);
+    const clean = normalizePreviewVendorLabel(name);
     const key = comparableCompanyName(clean);
     if (!clean || !key || isIgnoredVendorLabel(clean)) return null;
     if (!map.has(key)) map.set(key, { name: clean, compareKey: key, ...patch });
@@ -1461,16 +1723,18 @@ function inferPreviewVendors(table) {
 
     const keyMatch = key.match(/^(?:vendor|company|target)[_\-]?(\d+)[_\-]?(name|spec|quantity|qty|unit_price|price|amount)$/i);
     if (keyMatch) {
-      const idx = Number(keyMatch[1]);
+      const rawIdx = Number(keyMatch[1]);
+      // vendor_1_unit_price는 1부터, meta.vendors index는 0부터 저장된다.
+      const zeroIndex = rawIdx > 0 ? rawIdx - 1 : rawIdx;
       const field = keyMatch[2].toLowerCase();
-      const rowName = rows.find((row) => row?.[`vendor_${idx}_name`] || row?.[`company_${idx}_name`])?.[`vendor_${idx}_name`]
-        || rows.find((row) => row?.[`company_${idx}_name`])?.[`company_${idx}_name`];
-      const labelName = normalizeVendorName(label);
-      // vendor_1_unit_price 같은 동적 키는 숫자만으로 업체를 만들지 않는다.
-      // 컬럼 라벨이 "㈜에프앤건설 단가"처럼 실제 회사명을 가진 경우 그 라벨을 사용하고,
-      // 실제 이름을 알 수 없으면 가짜 "업체2" 컬럼을 만들지 않는다.
+      const metaVendor = metaVendorByIndex.get(zeroIndex) || metaVendorByIndex.get(rawIdx);
+      const rowName = String(metaVendor?.name || metaVendor?.vendorName || metaVendor?.label || '').trim()
+        || rows.find((row) => row?.[`vendor_${rawIdx}_name`] || row?.[`company_${rawIdx}_name`])?.[`vendor_${rawIdx}_name`]
+        || rows.find((row) => row?.[`company_${rawIdx}_name`])?.[`company_${rawIdx}_name`];
+      const labelName = normalizePreviewVendorLabel(label);
       const fallbackName = !isIgnoredVendorLabel(labelName) && /(단가|금액|견적가|견적단가)$/i.test(label) ? labelName : '';
-      const vendor = put(rowName || fallbackName || (field === 'name' ? `업체${idx + 1}` : ''), { index: idx });
+      // 실제 회사명을 모르면 업체2/업체3 같은 가짜 업체명을 만들지 않는다.
+      const vendor = put(rowName || fallbackName, { index: zeroIndex });
       if (!vendor) return;
       if (field === 'name') vendor.nameKey = key;
       if (field === 'spec') vendor.specKey = key;
@@ -1561,7 +1825,160 @@ function TemplateCell({ children, className = '', colSpan, rowSpan, align = 'cen
   );
 }
 
+function getTemplateDisplayName(selectedTemplate) {
+  return String(
+    selectedTemplate?.templateName
+    || selectedTemplate?.template_name
+    || selectedTemplate?.name
+    || selectedTemplate?.title
+    || ''
+  );
+}
+
+function isProductPriceSurveyTemplate(selectedTemplate) {
+  const raw = getTemplateDisplayName(selectedTemplate);
+  const normalized = compactText(raw).replace(/[()_\-·ㆍ\[\]{}]/g, '');
+  if (!normalized) return false;
+  const hasVendor = /(업체별|업체|회사별|거래처별|vendor|company|supplier)/i.test(normalized);
+  const hasPriceSurvey = /(제품가격|제품단가|가격조사|조사현황|가격현황|단가조사|productprice|pricesurvey|survey)/i.test(normalized);
+  return hasVendor && hasPriceSurvey;
+}
+
+function buildProductPriceVendorSlots(vendors, templateLayoutMode) {
+  const cleanVendors = vendors.filter((vendor) => vendor?.name);
+  const slotCount = templateLayoutMode === 'COMPACT_VENDOR_GROUPS'
+    ? Math.max(cleanVendors.length, 1)
+    : Math.max(5, cleanVendors.length || 0);
+  const slots = [...cleanVendors];
+  while (slots.length < slotCount) slots.push({ name: `업체 ${slots.length + 1}`, empty: true });
+  return slots;
+}
+
+function pickRowValue(row, keys, fallback = '') {
+  for (const key of keys) {
+    const value = row?.[key];
+    if (value !== undefined && value !== null && String(value).trim() !== '') return value;
+  }
+  return fallback;
+}
+
+function getProductPriceAverage(row, vendors) {
+  const explicit = pickRowValue(row, ['average_price', 'avg_price', 'average_unit_price', '평균가격', '평균단가'], '');
+  if (explicit !== '') return explicit;
+  const prices = vendors
+    .filter((vendor) => !vendor.empty)
+    .map((vendor) => toPreviewNumber(getVendorPreviewValue(row, vendor, 'unit_price')))
+    .filter((value) => value > 0);
+  if (!prices.length) return '';
+  return Math.round(prices.reduce((sum, value) => sum + value, 0) / prices.length);
+}
+
+function getSelectedVendorValue(row) {
+  return cleanTableColumnLabel(pickRowValue(row, [
+    'selected_vendor',
+    'selected_company',
+    'chosen_vendor',
+    'lowest_vendor',
+    'best_vendor',
+    'vendor_selection',
+    '업체선정',
+    '최저업체'
+  ], ''));
+}
+
+function ProductPriceSurveyTemplatePreview({ table, issues, selectedTemplate, templateLayoutMode = 'PRESERVE_TEMPLATE' }) {
+  const vendors = inferPreviewVendors(table);
+  const visibleVendors = buildProductPriceVendorSlots(vendors, templateLayoutMode);
+  const rows = table.rows || [];
+  const rowAreaLength = 15;
+  const headerColSpan = 4 + visibleVendors.length + 3;
+  const hasIssues = issues.length > 0;
+  const hasDataVendorCount = vendors.length;
+
+  return (
+    <div className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-card">
+      <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+        <div>
+          <h4 className="text-xl font-black text-slate-950">자사 양식 미리보기</h4>
+          <p className="mt-1 text-sm text-slate-500">선택한 업체별 제품가격 조사현황표 양식 구조로 실제 입력 위치를 미리 확인합니다.</p>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <Badge tone={hasIssues ? 'amber' : 'green'}>{hasIssues ? '확인 필요 행 포함' : '정상'}</Badge>
+          <Badge tone="slate">{getTemplateDisplayName(selectedTemplate) || '업체별 제품가격 조사현황표'}</Badge>
+          <Badge tone="blue">업체 {hasDataVendorCount || 0}개 · {templateLayoutMode === 'COMPACT_VENDOR_GROUPS' ? '실제 업체만 표시' : '원본 5칸 유지'}</Badge>
+        </div>
+      </div>
+
+      <div className="scroll-thin mt-5 max-h-[calc(100vh-420px)] min-h-[420px] overflow-auto rounded-3xl border border-slate-200 bg-white p-3">
+        <table className="w-max min-w-full border-collapse table-fixed text-center text-[11px] font-bold text-slate-900">
+          <colgroup>
+            <col className="w-[58px]" />
+            <col className="w-[180px]" />
+            <col className="w-[100px]" />
+            <col className="w-[70px]" />
+            {visibleVendors.map((vendor, index) => <col key={`product-vendor-col-${index}`} className="w-[92px]" />)}
+            <col className="w-[100px]" />
+            <col className="w-[110px]" />
+            <col className="w-[120px]" />
+          </colgroup>
+          <tbody>
+            <tr><TemplateCell colSpan={headerColSpan} className="py-4 text-xl font-black">업체별 제품가격 조사현황표</TemplateCell></tr>
+            <tr><TemplateCell colSpan={headerColSpan} className="h-4 border-slate-300 bg-white"></TemplateCell></tr>
+            <tr>
+              <TemplateCell rowSpan={2} className="bg-emerald-100">번호</TemplateCell>
+              <TemplateCell rowSpan={2} className="bg-emerald-100">제품명</TemplateCell>
+              <TemplateCell rowSpan={2} className="bg-emerald-100">규격</TemplateCell>
+              <TemplateCell rowSpan={2} className="bg-emerald-100">단위</TemplateCell>
+              <TemplateCell colSpan={visibleVendors.length} className="bg-emerald-100">제품 단가 조사현황</TemplateCell>
+              <TemplateCell rowSpan={2} className="bg-emerald-100">평균가격</TemplateCell>
+              <TemplateCell rowSpan={2} className="bg-emerald-100">업체선정</TemplateCell>
+              <TemplateCell rowSpan={2} className="bg-emerald-100">비고</TemplateCell>
+            </tr>
+            <tr>
+              {visibleVendors.map((vendor, index) => (
+                <TemplateCell key={`product-vendor-head-${index}`} className={`${vendor.empty ? 'bg-emerald-50 text-slate-400' : 'bg-emerald-100'}`}>
+                  {vendor.empty ? `업체 ${index + 1}` : cleanTableColumnLabel(vendor.name)}
+                </TemplateCell>
+              ))}
+            </tr>
+            {rows.slice(0, rowAreaLength).map((row, rowIndex) => (
+              <tr key={`product-row-${rowIndex}`} className={issues.some((issue) => Number(issue.rowIndex) === rowIndex) ? 'bg-amber-50' : rowIndex % 2 ? 'bg-slate-50' : 'bg-white'}>
+                <TemplateCell>{row.row_no || row.no || rowIndex + 1}</TemplateCell>
+                <TemplateCell align="left" className="break-keep">{pickRowValue(row, ['product_name', 'item_name', 'work_item_name', '공종명칭', '제품명'])}</TemplateCell>
+                <TemplateCell>{pickRowValue(row, ['spec', 'standard', 'size', '규격'])}</TemplateCell>
+                <TemplateCell>{pickRowValue(row, ['unit', '단위'])}</TemplateCell>
+                {visibleVendors.map((vendor, vendorIndex) => (
+                  <TemplateCell key={`product-value-${rowIndex}-${vendorIndex}`}>{vendor.empty ? '' : formatMoney(getVendorPreviewValue(row, vendor, 'unit_price'))}</TemplateCell>
+                ))}
+                <TemplateCell>{formatMoney(getProductPriceAverage(row, visibleVendors))}</TemplateCell>
+                <TemplateCell>{getSelectedVendorValue(row)}</TemplateCell>
+                <TemplateCell align="left">{pickRowValue(row, ['remark', 'note', 'memo', '비고'])}</TemplateCell>
+              </tr>
+            ))}
+            {Array.from({ length: Math.max(0, rowAreaLength - rows.slice(0, rowAreaLength).length) }).map((_, idx) => (
+              <tr key={`product-empty-${idx}`} className={idx % 2 ? 'bg-slate-50' : 'bg-white'}>
+                <TemplateCell>{rows.length + idx + 1}</TemplateCell>
+                <TemplateCell></TemplateCell>
+                <TemplateCell></TemplateCell>
+                <TemplateCell></TemplateCell>
+                {visibleVendors.map((vendor, vendorIndex) => <TemplateCell key={`product-empty-${idx}-${vendorIndex}`}></TemplateCell>)}
+                <TemplateCell></TemplateCell>
+                <TemplateCell></TemplateCell>
+                <TemplateCell></TemplateCell>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
 function CompanyTemplatePreview({ table, issues, selectedTemplate, writerName, templateLayoutMode = 'PRESERVE_TEMPLATE' }) {
+  if (isProductPriceSurveyTemplate(selectedTemplate)) {
+    return <ProductPriceSurveyTemplatePreview table={table} issues={issues} selectedTemplate={selectedTemplate} templateLayoutMode={templateLayoutMode} />;
+  }
+
   const vendors = inferPreviewVendors(table);
   const visibleVendors = buildTemplateVendorSlots(vendors, templateLayoutMode);
   const rows = table.rows || [];
@@ -1674,7 +2091,7 @@ function ExcelPreview({ table, issues, outputMode, selectedTemplate, writerName,
       <div className="scroll-thin mt-5 max-h-[calc(100vh-420px)] min-h-[260px] overflow-auto rounded-3xl border border-slate-200">
         <table className="min-w-[760px] w-full border-collapse text-sm">
           <thead className="sticky top-0 z-10 bg-slate-100 text-slate-600 shadow-sm">
-            <tr>{visibleColumns.map((col) => <th key={col.key} className="border-b border-slate-200 px-4 py-3 text-left font-black">{col.label}</th>)}</tr>
+            <tr>{visibleColumns.map((col) => <th key={col.key} className="border-b border-slate-200 px-4 py-3 text-left font-black">{cleanTableColumnLabel(col.label)}</th>)}</tr>
           </thead>
           <tbody>
             {table.rows.map((row, rowIndex) => (
@@ -1707,7 +2124,7 @@ function TableEditor({ table, updateCell, addRow, removeRow, saveTable, disabled
       <div className="scroll-thin mt-5 max-h-[calc(100vh-420px)] min-h-[260px] overflow-auto rounded-3xl border border-slate-200">
         <table className="min-w-[900px] w-full border-collapse text-sm">
           <thead className="sticky top-0 z-10 bg-slate-100 text-slate-600 shadow-sm">
-            <tr>{visibleColumns.map((col) => <th key={col.key} className="border-b border-slate-200 px-3 py-3 text-left font-black">{col.label}</th>)}<th className="w-20 border-b border-slate-200 px-3 py-3">관리</th></tr>
+            <tr>{visibleColumns.map((col) => <th key={col.key} className="border-b border-slate-200 px-3 py-3 text-left font-black">{cleanTableColumnLabel(col.label)}</th>)}<th className="w-20 border-b border-slate-200 px-3 py-3">관리</th></tr>
           </thead>
           <tbody>
             {table.rows.map((row, rowIndex) => (

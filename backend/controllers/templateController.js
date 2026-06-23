@@ -13,6 +13,8 @@ function makeTemplateCode(templateName = 'TEMPLATE') {
   return `${compact || 'TEMPLATE'}_${Date.now()}`.slice(0, 96);
 }
 
+const SYSTEM_SEED_TEMPLATE_CODES = ['NORMAL_TABLE_V1', 'COMPARISON_MATRIX_V1', 'WORK_LOG_TABLE_V1'];
+
 function toTemplate(row) {
   const mappingJson = parseJson(row.mapping_json, null);
   const status = row.active_yn === 'Y' ? 'DRAFT' : 'INACTIVE';
@@ -41,7 +43,9 @@ const listTemplates = asyncHandler(async (req, res) => {
        FROM excel_templates t
        LEFT JOIN excel_template_mappings m ON m.template_id = t.id AND m.active_yn = 'Y'
       WHERE t.active_yn = 'Y'
-      ORDER BY t.created_at DESC`
+        AND t.template_code NOT IN (${SYSTEM_SEED_TEMPLATE_CODES.map(() => '?').join(',')})
+      ORDER BY t.created_at DESC`,
+    SYSTEM_SEED_TEMPLATE_CODES
   );
   res.json({ templates: rows.map(toTemplate) });
 });

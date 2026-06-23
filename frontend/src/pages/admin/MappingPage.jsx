@@ -101,6 +101,27 @@ const comparisonEstimateFields = [
   { fieldKey: 'comparison_note', fieldLabel: '비교메모', fieldGroup: 'COMPARISON_FIELD', defaultMappingType: 'COMPANY_GROUP_COLUMN', dataType: 'text', isRequired: false, guide: '업체별 비교 메모' },
   { fieldKey: 'total_amount', fieldLabel: '업체별 합계', fieldGroup: 'SUMMARY', defaultMappingType: 'COMPANY_GROUP_COLUMN', dataType: 'amount', isRequired: false, guide: 'F23/J23/N23' }
 ];
+
+const productPriceSurveyFields = comparisonEstimateFields.map((field) => ({
+  ...field,
+  // 사용자가 요청한 기준: 업체별 제품가격 조사현황표도 비교견적서와 같은 표준필드 세트를 사용한다.
+  // 실제 셀 위치/프리셋은 productPriceSurveyPreset에서 템플릿 구조에 맞게 따로 잡는다.
+  guide: field.guide || '비교견적서 기준 표준필드'
+}));
+const productPriceSurveyPreset = [
+  { fieldKey: 'document_title', fieldLabel: '문서명', mappingType: 'SINGLE_CELL', sheetName: '', cellAddress: 'A1', mergedRange: 'A1:L1', isRequired: false },
+  { fieldKey: 'row_no', fieldLabel: '번호', mappingType: 'REPEAT_ROW', sheetName: '', columnLetter: 'A', startRow: 5, endRow: 19, maxRows: 15, isRequired: false },
+  { fieldKey: 'item_name', fieldLabel: '제품명', mappingType: 'REPEAT_ROW', sheetName: '', columnLetter: 'B', startRow: 5, endRow: 19, maxRows: 15, isRequired: true },
+  { fieldKey: 'spec', fieldLabel: '규격', mappingType: 'REPEAT_ROW', sheetName: '', columnLetter: 'C', startRow: 5, endRow: 19, maxRows: 15, isRequired: false },
+  { fieldKey: 'unit', fieldLabel: '단위', mappingType: 'REPEAT_ROW', sheetName: '', columnLetter: 'D', startRow: 5, endRow: 19, maxRows: 15, isRequired: false },
+  { fieldKey: 'average_price', fieldLabel: '평균가격', mappingType: 'REPEAT_ROW', sheetName: '', columnLetter: 'J', startRow: 5, endRow: 19, maxRows: 15, isRequired: false },
+  { fieldKey: 'selected_vendor', fieldLabel: '업체선정', mappingType: 'REPEAT_ROW', sheetName: '', columnLetter: 'K', startRow: 5, endRow: 19, maxRows: 15, isRequired: false },
+  { fieldKey: 'remark', fieldLabel: '비고', mappingType: 'REPEAT_ROW', sheetName: '', columnLetter: 'L', startRow: 5, endRow: 19, maxRows: 15, isRequired: false },
+
+  { fieldKey: 'target_name', fieldLabel: '업체명', mappingType: 'COMPANY_GROUP_COLUMN', sheetName: '', columnLetters: ['E', 'F', 'G', 'H', 'I'], groupRanges: ['E4:E4', 'F4:F4', 'G4:G4', 'H4:H4', 'I4:I4'], startRow: 4, endRow: 4, groupWidth: 1, isRequired: true },
+  { fieldKey: 'unit_price', fieldLabel: '업체별 단가', mappingType: 'COMPANY_GROUP_COLUMN', sheetName: '', columnLetters: ['E', 'F', 'G', 'H', 'I'], startRow: 5, endRow: 19, maxRows: 15, groupWidth: 1, isRequired: true }
+];
+
 const comparisonPreset = [
   { fieldKey: 'document_title', fieldLabel: '문서명', mappingType: 'SINGLE_CELL', sheetName: '', cellAddress: 'A2', mergedRange: 'A2:N2', isRequired: false },
   { fieldKey: 'document_date', fieldLabel: '견적일자', mappingType: 'SINGLE_CELL', sheetName: '', cellAddress: 'I4', mergedRange: 'I4:J4', isRequired: true },
@@ -140,6 +161,25 @@ function isComparisonEstimateTemplate(template) {
   return text.includes('비교') || text.includes('견적') || text.includes('comparison') || text.includes('estimate') || text.includes('quote');
 }
 
+function isProductPriceSurveyTemplate(template) {
+  const text = [template?.templateName, template?.originalFileName, template?.templateCode, template?.templateType]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+  return (
+    text.includes('업체별') ||
+    text.includes('제품가격') ||
+    text.includes('제품각력') ||
+    text.includes('조사현황') ||
+    text.includes('표준현황') ||
+    text.includes('표준현황표') ||
+    text.includes('가격조사') ||
+    text.includes('price survey') ||
+    text.includes('vendor price') ||
+    text.includes('product price')
+  );
+}
+
 function colToNumber(letter = '') {
   return String(letter).toUpperCase().split('').reduce((sum, ch) => sum * 26 + ch.charCodeAt(0) - 64, 0);
 }
@@ -163,7 +203,7 @@ function withSheetName(mapping, sheetName) {
   return { ...mapping, sheetName: sheetName || mapping.sheetName || '' };
 }
 
-function makeManualMapping({ selectedField, mappingType, cell, sheetName, isComparisonTemplate }) {
+function makeManualMapping({ selectedField, mappingType, cell, sheetName, isComparisonTemplate, isProductPriceTemplate }) {
   const base = {
     fieldKey: selectedField.fieldKey,
     fieldLabel: selectedField.fieldLabel,
@@ -192,7 +232,8 @@ function makeManualMapping({ selectedField, mappingType, cell, sheetName, isComp
   }
 
   if (mappingType === 'COMPANY_GROUP_COLUMN') {
-    const preset = comparisonPreset.find((item) => item.fieldKey === selectedField.fieldKey);
+    const presetSource = isProductPriceTemplate ? productPriceSurveyPreset : comparisonPreset;
+    const preset = presetSource.find((item) => item.fieldKey === selectedField.fieldKey);
     if (preset?.columnLetters || preset?.groupRanges) {
       return withSheetName(preset, sheetName);
     }
@@ -245,8 +286,14 @@ export default function MappingPage() {
 
   const selectedTemplate = useMemo(() => templates.find((item) => String(item.id || item.templateId) === String(selectedTemplateId)), [templates, selectedTemplateId]);
   const isComparisonTemplate = useMemo(() => isComparisonEstimateTemplate(selectedTemplate), [selectedTemplate]);
-  const mappingModes = useMemo(() => (isComparisonTemplate ? COMPARISON_MAPPING_MODES : DEFAULT_MAPPING_MODES), [isComparisonTemplate]);
-  const effectiveFields = useMemo(() => (isComparisonTemplate ? comparisonEstimateFields : fields), [fields, isComparisonTemplate]);
+  const isProductPriceTemplate = useMemo(() => isProductPriceSurveyTemplate(selectedTemplate), [selectedTemplate]);
+  const isVendorRepeatTemplate = isComparisonTemplate || isProductPriceTemplate;
+  const mappingModes = useMemo(() => (isVendorRepeatTemplate ? COMPARISON_MAPPING_MODES : DEFAULT_MAPPING_MODES), [isVendorRepeatTemplate]);
+  const effectiveFields = useMemo(() => {
+    if (isProductPriceTemplate) return productPriceSurveyFields;
+    if (isComparisonTemplate) return comparisonEstimateFields;
+    return fields;
+  }, [fields, isComparisonTemplate, isProductPriceTemplate]);
   const selectedField = useMemo(() => effectiveFields.find((field) => field.fieldKey === selectedFieldKey), [effectiveFields, selectedFieldKey]);
   const mappingMap = useMemo(() => Object.fromEntries(mappings.map((item) => [item.fieldKey, item])), [mappings]);
   const mappingCounts = useMemo(() => mappings.reduce((acc, item) => { const key = item.mappingType || 'ETC'; acc[key] = (acc[key] || 0) + 1; return acc; }, {}), [mappings]);
@@ -369,21 +416,25 @@ export default function MappingPage() {
       mappingType,
       cell,
       sheetName: preview?.sheetName || sheetName,
-      isComparisonTemplate
+      isComparisonTemplate,
+      isProductPriceTemplate
     });
 
     setMappings((prev) => [...prev.filter((item) => item.fieldKey !== selectedField.fieldKey), next]);
     setMessage(`${selectedField.fieldLabel} 필드를 ${MAPPING_TYPE_LABEL[mappingType] || mappingType} 방식으로 ${getMappingDisplay(next)}에 연결했습니다.`);
   };
 
-  const applyComparisonPreset = () => {
+  const applyTemplatePreset = () => {
     const currentSheetName = preview?.sheetName || sheetName;
-    const presetMappings = comparisonPreset.map((item) => withSheetName(item, currentSheetName));
+    const presetSource = isProductPriceTemplate ? productPriceSurveyPreset : comparisonPreset;
+    const presetMappings = presetSource.map((item) => withSheetName(item, currentSheetName));
     const presetKeys = new Set(presetMappings.map((item) => item.fieldKey));
     setMappings((prev) => [...prev.filter((item) => !presetKeys.has(item.fieldKey)), ...presetMappings]);
     setMappingType('COMPANY_GROUP_COLUMN');
     setSelectedFieldKey('target_name');
-    setMessage('비교 견적서 기본 매핑을 적용했습니다. NO/품목은 반복 행, 업체별 규격·수량·단가·금액은 업체 반복 컬럼으로 저장됩니다.');
+    setMessage(isProductPriceTemplate
+      ? '업체별 제품가격 조사현황표 기본 매핑을 적용했습니다. 제품 행은 아래로 반복되고, 업체 1~5 단가 컬럼은 업체 반복 컬럼으로 저장됩니다.'
+      : '비교 견적서 기본 매핑을 적용했습니다. NO/품목은 반복 행, 업체별 규격·수량·단가·금액은 업체 반복 컬럼으로 저장됩니다.');
   };
 
   const removeMapping = (fieldKey) => {
@@ -407,7 +458,7 @@ export default function MappingPage() {
       setSaving(true);
       await saveTemplateMappingsApi(selectedTemplateId, {
         sheetName: preview?.sheetName || sheetName,
-        templateKind: isComparisonTemplate ? 'COMPARISON_ESTIMATE' : 'GENERAL',
+        templateKind: isProductPriceTemplate ? 'PRODUCT_PRICE_SURVEY' : (isComparisonTemplate ? 'COMPARISON_ESTIMATE' : 'GENERAL'),
         mappings
       });
       setMessage('매핑이 저장되었습니다.');
@@ -431,6 +482,7 @@ export default function MappingPage() {
                 <span className="rounded-full bg-slate-100 px-2.5 py-1 text-slate-500">{selectedTemplate.originalFileName || '파일명 없음'}</span>
                 <span className="rounded-full bg-emerald-50 px-2.5 py-1 text-emerald-700 ring-1 ring-emerald-100">ai-server 저장</span>
                 {isComparisonTemplate && <span className="rounded-full bg-sky-50 px-2.5 py-1 text-sky-700 ring-1 ring-sky-100">비교 견적서 구조</span>}
+                {isProductPriceTemplate && <span className="rounded-full bg-violet-50 px-2.5 py-1 text-violet-700 ring-1 ring-violet-100">업체 반복 가격조사 구조</span>}
               </div>
             )}
           </div>
@@ -442,7 +494,7 @@ export default function MappingPage() {
             </select>
             <div className="flex flex-wrap gap-2">
               <button onClick={() => loadPreview(selectedTemplateId, sheetName)} className="inline-flex h-11 items-center justify-center gap-2 rounded-2xl border border-slate-200 bg-white px-4 text-xs font-black text-slate-700 hover:bg-slate-50"><RefreshCw size={15} /> 새로고침</button>
-              {isComparisonTemplate && <button onClick={applyComparisonPreset} className="inline-flex h-11 items-center justify-center gap-2 rounded-2xl bg-sky-50 px-4 text-xs font-black text-sky-700 ring-1 ring-sky-100 hover:bg-sky-100"><Sparkles size={15} /> 비교견적서 프리셋</button>}
+              {isVendorRepeatTemplate && <button onClick={applyTemplatePreset} className="inline-flex h-11 items-center justify-center gap-2 rounded-2xl bg-sky-50 px-4 text-xs font-black text-sky-700 ring-1 ring-sky-100 hover:bg-sky-100"><Sparkles size={15} /> {isProductPriceTemplate ? '업체가격조사 프리셋' : '비교견적서 프리셋'}</button>}
               <button onClick={saveMappings} disabled={saving || !mappings.length} className="inline-flex h-11 items-center justify-center gap-2 rounded-2xl bg-gradient-to-r from-brand-500 to-brand-400 px-4 text-xs font-black text-white shadow-glow hover:from-brand-600 hover:to-brand-500 disabled:from-slate-300 disabled:to-slate-300"><Save size={15} /> {saving ? '저장 중...' : '매핑 저장'}</button>
             </div>
           </div>
@@ -493,9 +545,10 @@ export default function MappingPage() {
             <span className="rounded-full bg-brand-50 px-3 py-1 text-xs font-black text-brand-700 ring-1 ring-brand-100">{visibleFields.length}개</span>
           </div>
 
-          {isComparisonTemplate && (
+          {isVendorRepeatTemplate && (
             <div className="mt-4 rounded-2xl border border-sky-100 bg-sky-50 px-4 py-3 text-xs font-bold leading-5 text-sky-800">
               이 양식은 단순한 반복 컬럼이 아니라 <b>품목 행 반복</b>과 <b>업체별 가로 컬럼 반복</b>이 같이 있는 구조입니다.
+              {isProductPriceTemplate && <span className="mt-1 block">표준 필드는 비교견적서와 같은 세트를 사용하고, 업체 1~5 단가 영역만 이 양식 위치에 맞게 <b>업체 반복</b>으로 매핑하세요.</span>}
             </div>
           )}
 
