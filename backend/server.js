@@ -12,6 +12,7 @@ const documentJobRoutes = require('./routes/documentJobRoutes');
 const { resumeQueuedDocumentJobs } = require('./controllers/documentJobController');
 const referenceRoutes = require('./routes/referenceRoutes');
 const errorMiddleware = require('./middleware/errorMiddleware');
+const db = require('./config/db');
 
 const app = express();
 const PORT = Number(process.env.PORT || 8080);
@@ -78,12 +79,21 @@ app.use((req, res) => {
 
 app.use(errorMiddleware);
 
-app.listen(PORT, () => {
-  console.log(`[backend] running on http://localhost:${PORT}`);
-  console.log(`[backend] allowed origins: ${allowedOrigins.join(', ')}`);
-  console.log(`[backend] ai-server: ${process.env.AI_SERVER_URL || 'http://127.0.0.1:8000'}`);
-  console.log(`[backend] document job concurrency: ${process.env.DOCUMENT_JOB_CONCURRENCY || 2}`);
-  resumeQueuedDocumentJobs().catch((error) => {
-    console.error('[backend] queued document job resume failed:', error);
+async function startServer() {
+  await db.connectDb();
+  app.listen(PORT, () => {
+    console.log(`[backend] running on http://localhost:${PORT}`);
+    console.log(`[backend] allowed origins: ${allowedOrigins.join(', ')}`);
+    console.log(`[backend] ai-server: ${process.env.AI_SERVER_URL || 'http://127.0.0.1:8000'}`);
+    console.log(`[backend] mongodb: ${process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/prototypeversion3'}`);
+    console.log(`[backend] document job concurrency: ${process.env.DOCUMENT_JOB_CONCURRENCY || 2}`);
+    resumeQueuedDocumentJobs().catch((error) => {
+      console.error('[backend] queued document job resume failed:', error);
+    });
   });
+}
+
+startServer().catch((error) => {
+  console.error('[backend] startup failed:', error);
+  process.exit(1);
 });
