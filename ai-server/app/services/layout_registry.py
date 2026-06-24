@@ -61,13 +61,49 @@ def _family_of(layout_type: str = "") -> str:
     return "BASIC"
 
 
+
 def _infer_user_output_intent(text: str = "") -> str:
     raw = str(text or "")
-    if _includes_any(raw, ["표로", "표 형태", "표 형식", "엑셀", "그리드", "비교표", "테이블"]):
+    wants_report = _includes_any(raw, [
+        "보고서 형식", "보고서 형태", "보고서로", "업무보고서", "업무 보고서", "검토보고서", "검토 보고서",
+        "보고서", "보고 형식", "보고 형태", "서술형", "문장형", "본문형", "핵심 내용", "보고용",
+    ])
+    wants_table = _includes_any(raw, [
+        "표로", "표 형태", "표 형식", "표 양식", "표만", "비교표", "단가표", "조사표",
+        "테이블", "그리드", "엑셀 표", "표 정리", "표 만들어", "표 생성",
+    ])
+    if wants_table and not wants_report:
         return "TABLE"
-    if _includes_any(raw, ["보고서", "보고 형식", "업무보고서", "검토보고서", "서술형", "문장형", "핵심 내용"]):
+    if wants_table and re.search(r"표로|비교표|단가표|조사표|테이블|그리드|엑셀\s*표|표\s*(정리|생성|만들)", raw, re.I):
+        return "TABLE"
+    if wants_report:
         return "REPORT"
     return "AUTO"
+
+
+TABLE_ONLY_LAYOUTS = {"VENDOR_COMPARISON_TABLE", "PRICE_SURVEY_TABLE", "BASIC_TABLE"}
+REPORT_COMPATIBLE_LAYOUTS = {"REPORT_FORM", "REVIEW_OPINION_FORM", "INSPECTION_REPORT", "VENDOR_COMPARISON_REVIEW_FORM"}
+TABLE_COMPATIBLE_LAYOUTS = {"VENDOR_COMPARISON_TABLE", "PRICE_SURVEY_TABLE", "BASIC_TABLE"}
+
+
+def is_layout_allowed_for_intent(layout_type: str = "", intent: str = "AUTO", text: str = "") -> bool:
+    layout = str(layout_type or "").upper()
+    ctx = _analyze_context(text)
+    if intent == "REPORT":
+        if layout in TABLE_ONLY_LAYOUTS:
+            return False
+        if layout in REPORT_COMPATIBLE_LAYOUTS:
+            return True
+        if layout == "MEETING_MINUTES":
+            return bool(ctx["hasMeeting"])
+        if layout == "OFFICIAL_LETTER":
+            return bool(ctx["hasOfficial"])
+        if layout == "WORK_DAILY_REPORT":
+            return _includes_any(text, ["작업일보", "작업내용", "금일작업", "명일작업"])
+        return False
+    if intent == "TABLE":
+        return layout in TABLE_COMPATIBLE_LAYOUTS or layout == "ESTIMATE_REVIEW_FORM"
+    return True
 
 
 def _analyze_context(text: str = "") -> Dict[str, Any]:
@@ -80,21 +116,46 @@ def _analyze_context(text: str = "") -> Dict[str, Any]:
     has_report = _includes_any(raw, ["보고서", "검토보고서", "보고", "report", "서술형", "문장형", "텍스트 전용", "검토 의견"])
     has_real_table = _includes_any(raw, ["표 후보", "비교표", "표 구조", "row", "column", "행", "열", "컬럼"])
     has_inspection = _includes_any(raw, ["현장 점검", "점검보고서", "안전점검", "감리 점검", "하자 점검", "시정조치"])
-    return {"raw": raw, "upper": upper, "hasMeeting": has_meeting, "hasOfficial": has_official, "hasCompare": has_compare, "hasUnitPrice": has_unit_price, "hasReport": has_report, "hasRealTable": has_real_table, "hasInspection": has_inspection, "userIntent": _infer_user_output_intent(raw)}
+    return {
+        "raw": raw,
+        "upper": upper,
+        "hasMeeting": has_meeting,
+        "hasOfficial": has_official,
+        "hasCompare": has_compare,
+        "hasUnitPrice": has_unit_price,
+        "hasReport": has_report,
+        "hasRealTable": has_real_table,
+        "hasInspection": has_inspection,
+        "userIntent": _infer_user_output_intent(raw),
+    }
 
 
-def infer_main_layout_type(text: str = "") -> str:
+def infer_main_layout_type(text: str = "", explicit_intent: str = "AUTO", user_request: str = "") -> str:
     ctx = _analyze_context(text)
-    if ctx["hasMeeting"]:
+    request_text = str(user_request or "")
+    if ctx["hasMeeting"] and _includes_any(request_text or text, ["회의록", "회의록 형식"]):
         return "MEETING_MINUTES"
-    if ctx["hasOfficial"]:
+    if ctx["hasOfficial"] and _includes_any(request_text or text, ["공문", "공문 형식"]):
         return "OFFICIAL_LETTER"
-    if ctx["hasCompare"] and ctx["hasUnitPrice"]:
-        if ctx["userIntent"] == "TABLE":
+
+    if explicit_intent == "REPORT":
+        if ctx["hasInspection"] and _includes_any(request_text, ["점검 보고서", "현장 점검 보고서"]):
+            return "INSPECTION_REPORT"
+        if ctx["hasCompare"] and _includes_any(request_text, ["비교 검토보고서", "업체별 단가 비교 검토보고서"]):
+            return "VENDOR_COMPARISON_REVIEW_FORM"
+        return "REPORT_FORM"
+
+    if explicit_intent == "TABLE":
+        if ctx["hasCompare"]:
             return "VENDOR_COMPARISON_TABLE"
+        if ctx["hasUnitPrice"] or _includes_any(text, ["단가표", "표준시장단가표", "공종단가표", "노무비율"]):
+            return "PRICE_SURVEY_TABLE"
+        return "BASIC_TABLE"
+
+    if ctx["hasCompare"] and ctx["hasUnitPrice"]:
         return "VENDOR_COMPARISON_REVIEW_FORM" if ctx["hasReport"] or not ctx["hasRealTable"] else "VENDOR_COMPARISON_TABLE"
     if ctx["hasCompare"]:
-        return "VENDOR_COMPARISON_TABLE" if ctx["userIntent"] == "TABLE" or ctx["hasRealTable"] else "VENDOR_COMPARISON_REVIEW_FORM"
+        return "VENDOR_COMPARISON_TABLE" if ctx["hasRealTable"] else "VENDOR_COMPARISON_REVIEW_FORM"
     if _includes_any(text, ["단가표", "표준시장단가표", "공종단가표", "노무비율"]):
         return "PRICE_SURVEY_TABLE"
     if ctx["hasInspection"]:
@@ -108,69 +169,94 @@ def _matched_keyword_count(layout: Dict[str, Any], text: str = "") -> int:
     return sum(1 for keyword in layout.get("keywords", []) if _includes_any(text, [str(keyword)]))
 
 
-def _compare_scores(layout_type: str = "", ctx: Dict[str, Any] | None = None, main_type: str = "") -> Optional[int]:
+def _explicit_intent_score(layout_type: str = "", ctx: Dict[str, Any] | None = None, intent: str = "AUTO", main_type: str = "") -> Optional[int]:
     ctx = ctx or {}
-    table_wanted = ctx.get("userIntent") == "TABLE" or bool(ctx.get("hasRealTable"))
-    report_wanted = ctx.get("userIntent") == "REPORT" or bool(ctx.get("hasReport")) or not bool(ctx.get("hasRealTable"))
+    if intent == "REPORT":
+        scores = {
+            "REPORT_FORM": 88 if main_type == "REPORT_FORM" else 82,
+            "REVIEW_OPINION_FORM": 80,
+            "INSPECTION_REPORT": 86 if ctx.get("hasInspection") else 58,
+            "VENDOR_COMPARISON_REVIEW_FORM": 88 if main_type == "VENDOR_COMPARISON_REVIEW_FORM" else (74 if ctx.get("hasCompare") else 56),
+            "MEETING_MINUTES": 82 if ctx.get("hasMeeting") else 20,
+            "OFFICIAL_LETTER": 82 if ctx.get("hasOfficial") else 20,
+            "WORK_DAILY_REPORT": 54,
+        }
+        return scores.get(layout_type, 18)
+    if intent == "TABLE":
+        scores = {
+            "VENDOR_COMPARISON_TABLE": 88 if ctx.get("hasCompare") else 64,
+            "PRICE_SURVEY_TABLE": 82 if ctx.get("hasUnitPrice") else 62,
+            "BASIC_TABLE": 66,
+            "ESTIMATE_REVIEW_FORM": 60,
+        }
+        return scores.get(layout_type, 18)
+    return None
+
+
+def _compare_scores(layout_type: str = "", ctx: Dict[str, Any] | None = None, main_type: str = "", explicit_intent: str = "AUTO") -> Optional[int]:
+    ctx = ctx or {}
+    explicit_score = _explicit_intent_score(layout_type, ctx, explicit_intent, main_type)
+    if explicit_score is not None:
+        return explicit_score
     if main_type == "VENDOR_COMPARISON_TABLE":
         scores = {
-            "VENDOR_COMPARISON_TABLE": 96,
-            "VENDOR_COMPARISON_REVIEW_FORM": 91 if report_wanted else 88,
-            "ESTIMATE_REVIEW_FORM": 82,
-            "PRICE_SURVEY_TABLE": 78,
-            "REPORT_FORM": 74,
-            "REVIEW_OPINION_FORM": 68,
-            "BASIC_TABLE": 55,
+            "VENDOR_COMPARISON_TABLE": 88,
+            "VENDOR_COMPARISON_REVIEW_FORM": 76,
+            "ESTIMATE_REVIEW_FORM": 70,
+            "PRICE_SURVEY_TABLE": 68,
+            "REPORT_FORM": 58,
+            "REVIEW_OPINION_FORM": 54,
+            "BASIC_TABLE": 52,
         }
-        return scores.get(layout_type, 24)
+        return scores.get(layout_type, 22)
     if main_type == "VENDOR_COMPARISON_REVIEW_FORM":
         scores = {
-            "VENDOR_COMPARISON_REVIEW_FORM": 96,
-            "VENDOR_COMPARISON_TABLE": 94 if table_wanted else 91,
-            "REPORT_FORM": 84,
-            "REVIEW_OPINION_FORM": 80,
-            "ESTIMATE_REVIEW_FORM": 76,
-            "PRICE_SURVEY_TABLE": 72,
-            "BASIC_TABLE": 52,
+            "VENDOR_COMPARISON_REVIEW_FORM": 88,
+            "REPORT_FORM": 78,
+            "REVIEW_OPINION_FORM": 74,
+            "VENDOR_COMPARISON_TABLE": 64,
+            "ESTIMATE_REVIEW_FORM": 62,
+            "PRICE_SURVEY_TABLE": 58,
+            "BASIC_TABLE": 48,
         }
         return scores.get(layout_type, 22)
     return None
 
 
-def score_layout(layout: Dict[str, Any], text: str = "", main_type: str = "") -> int:
+def score_layout(layout: Dict[str, Any], text: str = "", main_type: str = "", explicit_intent: str = "AUTO") -> int:
     ctx = _analyze_context(text)
     layout_type = str(layout.get("layoutType") or "")
     matched = _matched_keyword_count(layout, text)
-    compare_score = _compare_scores(layout_type, ctx, main_type)
+    compare_score = _compare_scores(layout_type, ctx, main_type, explicit_intent)
     if compare_score is not None:
-        return max(18, min(98, compare_score + min(2, matched)))
+        return max(18, min(90, int(compare_score) + min(2, matched)))
 
-    base = 34
+    base = 32
     main_family = _family_of(main_type)
     cand_family = _family_of(layout_type)
     if main_type == layout_type:
-        base = 94
+        base = 86
     elif main_family == cand_family and main_family != "BASIC":
-        base = 78
+        base = 72
     elif matched >= 2:
-        base = 58
+        base = 56
     elif matched == 1:
-        base = 46
+        base = 44
 
     if ctx["hasInspection"] and layout_type == "INSPECTION_REPORT":
-        base = max(base, 92)
+        base = max(base, 84)
     if not ctx["hasInspection"] and layout_type == "INSPECTION_REPORT":
-        base = min(base, 35)
+        base = min(base, 34)
     if not ctx["hasMeeting"] and layout_type == "MEETING_MINUTES":
         base = min(base, 24)
     if not ctx["hasOfficial"] and layout_type == "OFFICIAL_LETTER":
         base = min(base, 24)
+    return max(18, min(90, round(base + min(4, matched))))
 
-    return max(18, min(98, round(base + min(6, matched * 2))))
-
-
-def _build_reason(layout: Dict[str, Any], score: int, text: str = "", main_type: str = "") -> str:
-    if layout.get("layoutType") == "VENDOR_COMPARISON_TABLE" and main_type in {"VENDOR_COMPARISON_REVIEW_FORM", "VENDOR_COMPARISON_TABLE"}:
+def _build_reason(layout: Dict[str, Any], score: int, text: str = "", main_type: str = "", explicit_intent: str = "AUTO") -> str:
+    if explicit_intent == "REPORT" and str(layout.get("layoutType") or "") in TABLE_ONLY_LAYOUTS:
+        return f"{layout.get('reason') or ''} 보고서 요청에서는 표 전용 후보로 제외됩니다."
+    if layout.get("layoutType") == "VENDOR_COMPARISON_TABLE" and main_type == "VENDOR_COMPARISON_TABLE":
         suffix = "" if _analyze_context(text)["hasRealTable"] else " 원문이 표가 아닌 문장형이면 문장 기반으로 업체명·금액·차이율을 추출합니다."
         return f"{layout.get('reason') or ''}{suffix}"
     if score < 45:
@@ -181,9 +267,7 @@ def _build_reason(layout: Dict[str, Any], score: int, text: str = "", main_type:
 def build_layout_candidates(analysis: Dict[str, Any] | None = None, table: Dict[str, Any] | None = None, user_request: str = "") -> List[Dict[str, Any]]:
     analysis = analysis or {}
     table = table or {}
-    columns = table.get("columns") or []
-    column_text = " ".join(f"{c.get('label') or ''} {c.get('key') or ''}" for c in columns if isinstance(c, dict))
-    text = " ".join(str(x) for x in [
+    parts: List[str] = [
         analysis.get("documentType"),
         analysis.get("document_type"),
         analysis.get("purpose"),
@@ -194,16 +278,23 @@ def build_layout_candidates(analysis: Dict[str, Any] | None = None, table: Dict[
         table.get("table_name"),
         table.get("tableType"),
         table.get("table_type"),
-        column_text,
-        user_request,
-    ] if x)
+    ]
+    for col in table.get("columns") or []:
+        if isinstance(col, dict):
+            parts.append(f"{col.get('label') or ''} {col.get('key') or ''}")
+    parts.append(user_request)
+    text = " ".join(str(item) for item in parts if item)
     if not _has_meaningful_context(text):
         return []
-    main_type = infer_main_layout_type(text)
+
+    explicit_intent = _infer_user_output_intent(user_request)
+    main_type = infer_main_layout_type(text, explicit_intent, user_request)
     scored: List[Dict[str, Any]] = []
     for layout in LAYOUT_REGISTRY:
-        score = score_layout(layout, text, main_type)
-        item = {
+        if not is_layout_allowed_for_intent(str(layout.get("layoutType") or ""), explicit_intent, text):
+            continue
+        score = score_layout(layout, text, main_type, explicit_intent)
+        scored.append({
             "designId": layout["designId"],
             "name": layout["name"],
             "documentKind": layout["documentKind"],
@@ -211,11 +302,13 @@ def build_layout_candidates(analysis: Dict[str, Any] | None = None, table: Dict[
             "layout": normalize_layout_for_renderer(layout["layoutType"]),
             "title": layout["title"],
             "score": score,
-            "reason": _build_reason(layout, score, text, main_type),
+            "reason": _build_reason(layout, score, text, main_type, explicit_intent),
             "sections": layout["sections"],
             "sourceType": "LAYOUT_REGISTRY",
             "mainType": main_type,
-        }
-        if item["layoutType"] == main_type or score >= 65:
-            scored.append(item)
-    return sorted(scored, key=lambda item: item.get("score", 0), reverse=True)[:5]
+            "requestIntent": explicit_intent,
+        })
+    threshold = 55 if explicit_intent == "AUTO" else 50
+    filtered = [item for item in scored if item["layoutType"] == main_type or int(item.get("score") or 0) >= threshold]
+    filtered.sort(key=lambda x: int(x.get("score") or 0), reverse=True)
+    return filtered[:5]

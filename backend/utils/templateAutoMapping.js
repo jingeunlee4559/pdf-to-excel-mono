@@ -34,6 +34,7 @@ function detectTemplateKind(mappingJson = {}, template = {}) {
     template.description,
   ].filter(Boolean).join(' '));
 
+  if (raw.includes('CUSTOM_DOCUMENT_FORM') || raw.includes('DOCUMENT_FORM') || /문서양식|회사양식|결재양식/.test(ko)) return 'CUSTOM_DOCUMENT_FORM';
   if (raw.includes('MEETING') || /회의록|회의|안건|결정사항|조치사항/.test(ko)) return 'MEETING_MINUTES';
   if (raw.includes('OFFICIAL') || /공문|수신|참조|발신|시행/.test(ko)) return 'OFFICIAL_LETTER';
   if (raw.includes('REPORT') || raw.includes('SECTION') || raw.includes('APPROVAL') || /보고서|보고|검토|현황|리포트/.test(ko)) return 'REPORT';
@@ -67,6 +68,27 @@ const COMMON_HEADER_MAPPINGS = [
 ];
 
 const PRESETS = {
+
+  CUSTOM_DOCUMENT_FORM: {
+    template_type: 'CUSTOM_DOCUMENT_FORM',
+    layout: 'CUSTOM_DOCUMENT_FORM',
+    sheetName: 'AI문서양식',
+    title: 'AI 생성 문서 양식',
+    sections: [
+      { key: 'purpose', title: '1. 작성 목적', bindingKey: 'purpose', height: 3 },
+      { key: 'summary', title: '2. 주요 내용', bindingKey: 'summary', height: 4 },
+      { key: 'review', title: '3. 검토 의견', bindingKey: 'review_opinion', height: 4 },
+      { key: 'action', title: '4. 후속 조치', bindingKey: 'action_plan', height: 3 },
+    ],
+    headerPairs: [
+      { label: '작성일', bindingKey: 'document_date' },
+      { label: '작성자', bindingKey: 'requester_name' },
+      { label: '공사명', bindingKey: 'project_name' },
+      { label: '현장명', bindingKey: 'site_name' },
+    ],
+    approvalLines: ['담당', '검토', '승인'],
+    mappings: COMMON_HEADER_MAPPINGS,
+  },
   REPORT: {
     template_type: 'REPORT',
     layout: 'SECTION_REPORT',
@@ -214,6 +236,8 @@ function ensureTemplateMappingJson(mappingJson = {}, template = {}) {
     autoValueFallback: true,
   };
   out.sections = Array.isArray(base.sections) && base.sections.length ? base.sections : (preset.sections || []);
+  out.headerPairs = Array.isArray(base.headerPairs) && base.headerPairs.length ? base.headerPairs : (preset.headerPairs || []);
+  out.approvalLines = Array.isArray(base.approvalLines) && base.approvalLines.length ? base.approvalLines : (preset.approvalLines || []);
   out.baseColumns = Array.isArray(base.baseColumns) && base.baseColumns.length ? base.baseColumns : (preset.baseColumns || []);
   out.repeatGroups = Array.isArray(base.repeatGroups) && base.repeatGroups.length ? base.repeatGroups : (preset.repeatGroups || []);
   out.summaryColumns = Array.isArray(base.summaryColumns) && base.summaryColumns.length ? base.summaryColumns : (preset.summaryColumns || []);

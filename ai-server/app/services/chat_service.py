@@ -5,7 +5,7 @@ import os
 import re
 from typing import Any, Dict, List, Optional
 
-from app.services.llm_client import call_local_llm_json, get_llm_config
+from app.services.llm_client import call_llm_json, get_llm_config
 
 
 def _chat_llm_enabled() -> bool:
@@ -280,7 +280,7 @@ async def answer_chat(message: str, context: Optional[Dict[str, Any]] = None) ->
 
     try:
         prompt = _build_chat_prompt(msg, context)
-        result = await call_local_llm_json(prompt, cfg)
+        result = await call_llm_json(prompt, cfg)
         answer = str(result.get("answer") or "").strip()
         if not answer:
             raise RuntimeError("LLM 응답 JSON에 answer가 없습니다.")
@@ -293,7 +293,7 @@ async def answer_chat(message: str, context: Optional[Dict[str, Any]] = None) ->
             "quickReplies": result.get("quickReplies") if isinstance(result.get("quickReplies"), list) else ["이 문서 뭐야?", "단가만 비교해줘"],
             "llmUsed": True,
             "llmFallback": False,
-            "model": f"ollama:{cfg.model}",
+            "model": f"gemini:{cfg.model}",
             "llmMeta": result.get("_llm", {}),
         }
         return _guard_bad_repeated_answer(chat_result, msg, context)

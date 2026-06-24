@@ -10,7 +10,6 @@ const {
 const { designTemplateWithAiServer, createTemplateSkeletonWithAiServer } = require('./aiServerService');
 const { inferVendors } = require('./excelService');
 const { ensureTemplateMappingJson } = require('../utils/templateAutoMapping');
-const { buildLayoutCandidates, normalizeLayoutForRenderer } = require('./layoutRegistry');
 
 const SYSTEM_SEED_TEMPLATE_CODES = ['NORMAL_TABLE_V1', 'COMPARISON_MATRIX_V1', 'WORK_LOG_TABLE_V1', 'ESTIMATE_FORM_V1', 'UNIT_PRICE_TABLE_V1', 'BUSINESS_REPORT_V1', 'MEETING_MINUTES_V1', 'OFFICIAL_LETTER_V1'];
 const AI_TEMPLATE_DIR = path.join(__dirname, '..', 'storage', 'templates', 'ai_generated');
@@ -36,6 +35,18 @@ function normalizeText(value = '') {
 
 function compactFieldKey(value = '') {
   return String(value || '').trim();
+}
+
+function requestWantsTableOutput(text = '') {
+  return /(표로|표\s*형태|표\s*형식|비교표|단가표|조사표|테이블|그리드|엑셀\s*표|표\s*(정리|생성|만들))/i.test(String(text || ''));
+}
+
+function requestWantsReportOutput(text = '') {
+  return inferUserOutputIntent(String(text || '')) === 'REPORT';
+}
+
+function looksLikeVendorCompareTemplateText(text = '') {
+  return /(업체별|회사별|비교견적|견적비교|단가비교|가격비교|최저가|최고가|vendor|comparison|supplier)/i.test(String(text || ''));
 }
 
 function toCamelTemplate(row, mappingJson = null) {
@@ -104,14 +115,25 @@ function getTableFieldKeys(job = {}) {
 
 function inferWantedTemplateType(job = {}) {
   const tableType = String(job.tables?.[0]?.tableType || job.tables?.[0]?.table_type || job.analysis?.recommendedTableType || job.analysis?.documentType || '').toUpperCase();
-  const request = String(`${job.userRequest || job.user_request || ''} ${job.analysis?.purpose || ''} ${job.analysis?.summary || ''}`);
+  const request = String(`${job.userRequest || job.user_request || ''}`);
+  const analysisText = String(`${job.analysis?.purpose || ''} ${job.analysis?.summary || ''}`);
+  const requestIntent = inferUserOutputIntent(request);
+
+  // 사용자가 "보고서 형식"을 명시하면 표 후보가 존재해도 보고서 양식을 우선한다.
+  if (requestIntent === 'REPORT' && !requestWantsTableOutput(request)) return 'REPORT';
+  if (requestIntent === 'TABLE') {
+    if (/(업체별|회사별|비교견적|견적비교|단가비교|가격비교|최저가|비교표)/i.test(`${request} ${analysisText}`)) return 'MULTI_VENDOR_PRICE_COMPARISON';
+    if (/(단가표|표준시장단가|표준단가|공종단가|가격표)/i.test(`${request} ${analysisText}`)) return 'UNIT_PRICE_TABLE';
+    return 'NORMAL_TABLE';
+  }
+
   if (tableType === 'TEXT_VENDOR_COMPARISON_REPORT') return 'REPORT';
-  if (tableType === 'MULTI_VENDOR_PRICE_COMPARISON' || /(업체별|회사별|비교견적|견적비교|견적서|단가비교|가격비교|최저가|비교표)/i.test(request)) return 'MULTI_VENDOR_PRICE_COMPARISON';
-  if (tableType === 'STANDARD_MARKET_PRICE_TABLE' || /(단가표|표준시장단가|표준단가|공종단가|가격표)/i.test(request)) return 'UNIT_PRICE_TABLE';
-  if (/(회의록|회의|안건|참석자|결정사항|조치사항)/i.test(request) || tableType.includes('MEETING')) return 'MEETING_MINUTES';
-  if (/(공문|수신|참조|시행|발신|공문서)/i.test(request) || tableType.includes('OFFICIAL')) return 'OFFICIAL_LETTER';
-  if (/(보고서|보고|검토|현황|요약|분석)/i.test(request) || tableType.includes('REPORT')) return 'REPORT';
-  if (tableType === 'WORK_LOG_TABLE' || /(작업일보|작업내용|투입인원|장비)/i.test(request)) return 'WORK_LOG_TABLE';
+  if (tableType === 'MULTI_VENDOR_PRICE_COMPARISON') return 'MULTI_VENDOR_PRICE_COMPARISON';
+  if (tableType === 'STANDARD_MARKET_PRICE_TABLE' || /(단가표|표준시장단가|표준단가|공종단가|가격표)/i.test(`${request} ${analysisText}`)) return 'UNIT_PRICE_TABLE';
+  if (/(회의록|회의|안건|참석자|결정사항|조치사항)/i.test(`${request} ${analysisText}`) || tableType.includes('MEETING')) return 'MEETING_MINUTES';
+  if (/(공문|수신|참조|시행|발신|공문서)/i.test(`${request} ${analysisText}`) || tableType.includes('OFFICIAL')) return 'OFFICIAL_LETTER';
+  if (/(보고서|보고|검토|현황|요약|분석)/i.test(`${request} ${analysisText}`) || tableType.includes('REPORT')) return 'REPORT';
+  if (tableType === 'WORK_LOG_TABLE' || /(작업일보|작업내용|투입인원|장비)/i.test(`${request} ${analysisText}`)) return 'WORK_LOG_TABLE';
   return tableType || 'NORMAL_TABLE';
 }
 
@@ -131,7 +153,9 @@ function templateTypeAffinity(wantedType, templateType = '', text = '') {
     if (/(단가표|단가|표준시장|가격표|unitprice|price)/i.test(hay)) return 30;
   }
   if (wanted === 'REPORT') {
-    if (/(보고서|보고|현황|검토|요약|report)/i.test(hay)) return 30;
+    if (/업무보고서|업무\s*보고서|businessreport|reportform/i.test(hay)) return 35;
+    if (looksLikeVendorCompareTemplateText(hay)) return 12;
+    if (/(보고서|보고|현황|검토|요약|report)/i.test(hay)) return 26;
   }
   if (wanted === 'MEETING_MINUTES') {
     if (/(회의록|회의|안건|참석|minutes|meeting)/i.test(hay)) return 30;
@@ -182,47 +206,9 @@ async function listTemplatesWithMappings() {
 }
 
 async function getTemplateRecommendationsForJob(job = {}) {
-  if (!job?.id) return [];
-  const tableFields = getTableFieldKeys(job);
-  const tableFieldSet = new Set(tableFields);
-  const wantedType = inferWantedTemplateType(job);
-  const requestText = `${job.userRequest || ''} ${job.analysis?.summary || ''} ${job.analysis?.purpose || ''}`;
-  const templates = await listTemplatesWithMappings();
-
-  const recommendations = templates.map(({ template, mappingJson }) => {
-    const templateText = `${template.template_name || ''} ${template.template_code || ''} ${template.template_type || ''} ${template.description || ''} ${template.original_file_name || ''}`;
-    const mappedKeys = getMappingFieldKeys(mappingJson);
-    const matchedFields = mappedKeys.filter((key) => tableFieldSet.has(key));
-    const missingFields = tableFields.filter((key) => !mappedKeys.includes(key));
-    const typeScore = templateTypeAffinity(wantedType, template.template_type, templateText);
-    const fieldScore = tableFields.length ? Math.min(25, Math.round((matchedFields.length / tableFields.length) * 25)) : 0;
-    const dynamicScore = wantedType === 'MULTI_VENDOR_PRICE_COMPARISON' && hasDynamicVendorSupport(mappingJson, template) ? 20 : 0;
-    const keywordScore = /(비교|견적|업체|단가|가격|현황|작업|일보|표준)/i.test(`${requestText} ${templateText}`) ? 10 : 0;
-    const mappingScore = mappedKeys.length ? 10 : 0;
-    const score = Math.min(100, typeScore + fieldScore + dynamicScore + keywordScore + mappingScore);
-    const reasons = buildReasonSummary({ score, typeScore, fieldScore, dynamicScore, keywordScore, mappedCount: matchedFields.length, tableFieldCount: tableFields.length, wantedType });
-
-    return {
-      id: template.id,
-      templateId: template.id,
-      templateName: template.template_name,
-      templateCode: template.template_code,
-      templateType: template.template_type,
-      score,
-      rank: 0,
-      reasons,
-      matchedFields,
-      missingFields: missingFields.slice(0, 12),
-      dynamicVendorSupport: hasDynamicVendorSupport(mappingJson, template),
-      recommendationType: 'EXISTING_TEMPLATE',
-      template: toCamelTemplate(template, mappingJson),
-    };
-  }).filter((item) => item.score > 0)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, 5)
-    .map((item, index) => ({ ...item, rank: index + 1 }));
-
-  return recommendations;
+  // 기존 등록/기본 후보 점수 추천은 사용하지 않는다.
+  // Gemini가 사용자 요청을 기준으로 신규 회사 문서형 엑셀 양식을 직접 생성한다.
+  return [];
 }
 
 async function saveRecommendationHistory(jobId, recommendations = []) {
@@ -270,11 +256,12 @@ function pickExistingColumnsFromTable(table = {}, standardFields = [], preferred
 
 function fallbackTemplateDesign({ job = {}, table = {}, standardFields = [] }) {
   const wantedType = inferWantedTemplateType(job);
-  const registryCandidate = buildLayoutCandidates({ analysis: job.analysis || {}, table, userRequest: job.userRequest || job.user_request || '' })[0] || null;
-  const isCompare = wantedType === 'MULTI_VENDOR_PRICE_COMPARISON' || registryCandidate?.layoutType === 'VENDOR_COMPARISON_TABLE';
-  const isMarket = wantedType === 'STANDARD_MARKET_PRICE_TABLE' || wantedType === 'UNIT_PRICE_TABLE' || registryCandidate?.layoutType === 'PRICE_SURVEY_TABLE';
-  const isDocumentForm = ['REPORT', 'MEETING_MINUTES', 'OFFICIAL_LETTER'].includes(wantedType) || ['REPORT_FORM', 'INSPECTION_REPORT', 'REVIEW_OPINION_FORM', 'MEETING_MINUTES', 'OFFICIAL_LETTER', 'WORK_DAILY_REPORT'].includes(registryCandidate?.layoutType);
-  const title = isCompare ? '업체별 단가 비교표' : (isMarket ? '표준시장단가 정리표' : (registryCandidate?.title || (isDocumentForm ? '업무 보고서' : 'AI 생성 문서 정리표')));
+  const requestText = String(job.userRequest || job.user_request || '');
+  const intent = inferUserOutputIntent(requestText);
+  const isCompare = intent !== 'REPORT' && (wantedType === 'MULTI_VENDOR_PRICE_COMPARISON' || /(업체별|회사별|단가비교|비교견적|견적비교|가격비교|비교표)/i.test(requestText));
+  const isMarket = intent !== 'REPORT' && (wantedType === 'STANDARD_MARKET_PRICE_TABLE' || wantedType === 'UNIT_PRICE_TABLE' || /표준시장단가|단가표|가격표/i.test(requestText));
+  const isDocumentForm = intent !== 'TABLE' || ['REPORT', 'MEETING_MINUTES', 'OFFICIAL_LETTER', 'REPORT_FORM', 'INSPECTION_REPORT', 'REVIEW_OPINION_FORM', 'WORK_DAILY_REPORT'].includes(wantedType);
+  const title = isCompare ? '업체별 단가 비교표' : (isMarket ? '표준시장단가 정리표' : (isDocumentForm ? 'AI 생성 업무 문서' : 'AI 생성 문서 정리표'));
   const basePreferred = isCompare
     ? ['row_no', 'item_name', 'spec', 'quantity', 'unit', 'standard_unit_price']
     : (isMarket ? ['row_no', 'construction_code', 'item_name', 'spec', 'unit', 'standard_unit_price', 'labor_ratio', 'remark'] : ['row_no', 'item_name', 'spec', 'quantity', 'unit', 'unit_price', 'amount', 'remark']);
@@ -285,11 +272,23 @@ function fallbackTemplateDesign({ job = {}, table = {}, standardFields = [] }) {
 
   return {
     templateName: `AI_${title}`,
-    templateType: registryCandidate?.layoutType || wantedType,
+    templateType: isDocumentForm ? 'CUSTOM_DOCUMENT_FORM' : wantedType,
     sheetName: title.slice(0, 31),
     title,
-    layout: isCompare ? 'AI_GENERATED_DYNAMIC_VENDOR_TABLE' : (isMarket ? 'PRICE_TABLE' : normalizeLayoutForRenderer(registryCandidate?.layoutType || wantedType)),
+    layout: isCompare ? 'AI_GENERATED_DYNAMIC_VENDOR_TABLE' : (isMarket ? 'PRICE_TABLE' : (isDocumentForm ? 'CUSTOM_DOCUMENT_FORM' : normalizeLayoutForRenderer(wantedType))),
     headerFields: [pickStandardField(standardFields, 'document_title'), pickStandardField(standardFields, 'document_date'), pickStandardField(standardFields, 'requester_name')].filter((item) => item.fieldKey),
+    headerPairs: [
+      { label: '작성일', bindingKey: 'document_date' },
+      { label: '작성자', bindingKey: 'requester_name' },
+      { label: '공사명', bindingKey: 'project_name' },
+      { label: '현장명', bindingKey: 'site_name' },
+    ],
+    sections: isCompare || isMarket || wantedType === 'NORMAL_TABLE' ? [] : [
+      { key: 'purpose', title: '1. 작성 목적', bindingKey: 'purpose', height: 3 },
+      { key: 'summary', title: '2. 주요 내용', bindingKey: 'summary', height: 4 },
+      { key: 'review', title: '3. 검토 의견', bindingKey: 'review_opinion', height: 4 },
+      { key: 'action', title: '4. 후속 조치', bindingKey: 'action_plan', height: 3 },
+    ],
     baseColumns,
     repeatGroups: isCompare ? [{
       groupKey: 'vendors',
@@ -302,9 +301,41 @@ function fallbackTemplateDesign({ job = {}, table = {}, standardFields = [] }) {
       { fieldKey: 'calculated_unit_price', label: '최저 단가' },
       { fieldKey: 'remark', label: '비고' },
     ] : summaryColumns,
+    approvalLines: ['담당', '검토', '승인'],
     reason: isCompare ? '업체별 단가 비교 문서로 분석되어 업체 수에 따라 반복 컬럼이 늘어나는 양식을 제안했습니다.' : (isDocumentForm ? `${title} 레이아웃으로 문서 핵심 내용을 서술형 섹션에 배치합니다.` : '분석된 표 컬럼과 DB 표준필드를 기준으로 일반 행 반복 양식을 제안했습니다.'),
     confidence: 0.82,
   };
+}
+
+function normalizeDocumentSections(items = [], fallbackItems = []) {
+  const source = Array.isArray(items) ? items : [];
+  const fallback = Array.isArray(fallbackItems) ? fallbackItems : [];
+  const out = [];
+  [...source, ...fallback].forEach((item) => {
+    if (!item || typeof item !== 'object') return;
+    const title = String(item.title || item.label || '').trim();
+    const bindingKey = String(item.bindingKey || item.fieldKey || item.key || '').trim();
+    const key = String(item.key || bindingKey || title).trim().slice(0, 60);
+    if (!title || !bindingKey) return;
+    if (/[\[\]{}]/.test(bindingKey) || bindingKey.length > 80) return;
+    if (out.some((existing) => existing.title === title && existing.bindingKey === bindingKey)) return;
+    const height = Math.max(1, Math.min(8, Number(item.height || 3) || 3));
+    out.push({ key, title: title.slice(0, 80), bindingKey: bindingKey.slice(0, 80), height });
+  });
+  return out.slice(0, 12);
+}
+
+function normalizeHeaderPairs(items = [], fallbackItems = []) {
+  const out = [];
+  [...(Array.isArray(items) ? items : []), ...(Array.isArray(fallbackItems) ? fallbackItems : [])].forEach((item) => {
+    if (!item || typeof item !== 'object') return;
+    const label = String(item.label || '').trim();
+    const bindingKey = String(item.bindingKey || item.fieldKey || '').trim();
+    if (!label || !bindingKey) return;
+    if (out.some((existing) => existing.label === label && existing.bindingKey === bindingKey)) return;
+    out.push({ label: label.slice(0, 40), bindingKey: bindingKey.slice(0, 80) });
+  });
+  return out.slice(0, 8);
 }
 
 function sanitizeDesign(rawDesign = {}, { standardFields = [], job = {}, table = {} } = {}) {
@@ -335,9 +366,19 @@ function sanitizeDesign(rawDesign = {}, { standardFields = [], job = {}, table =
 
   const requestedLayout = String(source.layout || source.layoutType || fallback.layout || '').trim();
   const normalizedRequestedLayout = normalizeLayoutForRenderer(requestedLayout);
-  const finalLayout = safeRepeatGroups.length && /VENDOR|DYNAMIC|COMPARISON/i.test(normalizedRequestedLayout)
-    ? 'AI_GENERATED_DYNAMIC_VENDOR_TABLE'
-    : (normalizedRequestedLayout || fallback.layout || 'AI_GENERATED_TABLE');
+  const rawBaseColumns = normalizeFieldList(source.baseColumns, []).slice(0, 20);
+  const sections = normalizeDocumentSections(source.sections, fallback.sections);
+  let finalLayout = normalizedRequestedLayout || fallback.layout || 'AI_GENERATED_TABLE';
+  let baseColumns = rawBaseColumns;
+  if (safeRepeatGroups.length && /VENDOR|DYNAMIC|COMPARISON/i.test(normalizedRequestedLayout)) {
+    finalLayout = 'AI_GENERATED_DYNAMIC_VENDOR_TABLE';
+    baseColumns = rawBaseColumns.length ? rawBaseColumns : normalizeFieldList(source.baseColumns, fallback.baseColumns).slice(0, 20);
+  } else if (sections.length && !safeRepeatGroups.length && (/CUSTOM_DOCUMENT_FORM|DOCUMENT_FORM/i.test(normalizedRequestedLayout) || !rawBaseColumns.length)) {
+    finalLayout = 'CUSTOM_DOCUMENT_FORM';
+    baseColumns = rawBaseColumns;
+  } else if (!baseColumns.length) {
+    baseColumns = normalizeFieldList(source.baseColumns, fallback.baseColumns).slice(0, 20);
+  }
 
   return {
     templateName: String(source.templateName || fallback.templateName || 'AI_추천양식').slice(0, 80),
@@ -346,12 +387,15 @@ function sanitizeDesign(rawDesign = {}, { standardFields = [], job = {}, table =
     title: String(source.title || fallback.title || 'AI 추천양식').slice(0, 120),
     layout: finalLayout,
     headerFields: normalizeFieldList(source.headerFields, fallback.headerFields),
-    baseColumns: normalizeFieldList(source.baseColumns, fallback.baseColumns).slice(0, 20),
+    headerPairs: normalizeHeaderPairs(source.headerPairs, fallback.headerPairs),
+    sections,
+    baseColumns,
     repeatGroups: safeRepeatGroups,
     summaryColumns: normalizeFieldList(source.summaryColumns, fallback.summaryColumns).slice(0, 8),
+    approvalLines: (Array.isArray(source.approvalLines) ? source.approvalLines : fallback.approvalLines || ['담당', '검토', '승인']).map((x) => String(x).trim()).filter(Boolean).slice(0, 5),
     reason: String(source.reason || fallback.reason || '').slice(0, 500),
     confidence: Math.max(0, Math.min(1, Number(source.confidence || fallback.confidence || 0.75))),
-    generatedBy: source.generatedBy || (source?._llm ? 'qwen2.5:7b' : 'rule-fallback'),
+    generatedBy: source.generatedBy || (source?._llm ? 'gemini-2.5-flash' : 'rule-fallback'),
   };
 }
 
@@ -365,9 +409,8 @@ async function makeTemplateDesignWithLlm({ job = {}, table = {}, standardFields 
       columns: (table.columns || []).slice(0, 80),
       rows: (table.rows || []).slice(0, 20),
       standardFields: standardFields.map((field) => ({ fieldKey: field.field_key, label: field.field_label, group: field.field_group, dataType: field.data_type })),
-      layoutRegistry: buildLayoutCandidates({ analysis: job.analysis || {}, table, userRequest: job.userRequest || job.user_request || '' }).map((item) => ({ layoutType: item.layoutType, layout: item.layout, name: item.name, reason: item.reason, sections: item.sections })),
     });
-    if (result && typeof result === 'object') return { ...result, generatedBy: result?._llm?.model || 'qwen2.5:7b' };
+    if (result && typeof result === 'object') return { ...result, generatedBy: result?._llm?.model || 'gemini-2.5-flash' };
   } catch (error) {
     console.warn('[AI_TEMPLATE_DESIGN_FALLBACK]', error?.response?.data || error.message);
   }
@@ -417,14 +460,20 @@ async function createAiGeneratedTemplateForJob({ job = {}, tableId = null, user 
   const templateId = await nextSeq('excel_templates');
   const mappingId = await nextSeq('excel_template_mappings');
   const mappingJson = ensureTemplateMappingJson({
+    designId: `GEMINI_${Date.now()}`,
+    name: design.templateName,
+    templateName: design.templateName,
     layout: design.layout,
     template_type: design.templateType,
     sheetName: design.sheetName,
     title: design.title,
     headerFields: design.headerFields,
+    headerPairs: design.headerPairs,
+    sections: design.sections,
     baseColumns: design.baseColumns,
     repeatGroups: design.repeatGroups,
     summaryColumns: design.summaryColumns,
+    approvalLines: design.approvalLines,
     rowStart: 5,
     aiGenerated: true,
     generatedBy: design.generatedBy,
@@ -593,62 +642,9 @@ function makeFieldItem(key, label = null) {
 }
 
 function getTemplateDesignCandidatesForJob(job = {}) {
-  const wantedType = inferWantedTemplateType(job);
-  const table = (job.tables || [])[0] || {};
-  const tableColumns = Array.isArray(table.columns) ? table.columns : [];
-  const baseFromTable = tableColumns.slice(0, 14).map((col) => makeFieldItem(col.key, col.label || col.key));
-  const fallbackBase = baseFromTable.length ? baseFromTable : [makeFieldItem('row_no', 'NO'), makeFieldItem('item_name', '품명'), makeFieldItem('spec', '규격'), makeFieldItem('quantity', '수량'), makeFieldItem('unit', '단위'), makeFieldItem('unit_price', '단가'), makeFieldItem('amount', '금액'), makeFieldItem('remark', '비고')];
-  const registryCandidates = buildLayoutCandidates({ analysis: job.analysis || {}, table, userRequest: job.userRequest || job.user_request || '' });
-
-  const toDesign = (candidate) => {
-    const layout = normalizeLayoutForRenderer(candidate.layoutType || candidate.layout);
-    const isVendor = layout === 'AI_GENERATED_DYNAMIC_VENDOR_TABLE';
-    const isTableLike = /TABLE|PRICE|ESTIMATE|VENDOR/i.test(layout);
-    return {
-      designId: candidate.designId,
-      name: candidate.name,
-      documentKind: candidate.documentKind,
-      layoutType: candidate.layoutType,
-      score: candidate.score,
-      layout,
-      reason: candidate.reason,
-      sections: candidate.sections || [],
-      templateName: `AI_${candidate.name}`,
-      templateType: candidate.layoutType || wantedType,
-      sheetName: String(candidate.name || 'AI추천양식').slice(0, 31),
-      title: candidate.title || candidate.name,
-      confidence: Math.max(0.5, Math.min(0.98, Number(candidate.score || 80) / 100)),
-      baseColumns: isVendor
-        ? [makeFieldItem('row_no', 'NO'), makeFieldItem('item_name', '품명'), makeFieldItem('spec', '규격'), makeFieldItem('quantity', '수량'), makeFieldItem('unit', '단위')]
-        : (isTableLike ? fallbackBase : []),
-      repeatGroups: isVendor ? [{ groupKey: 'vendors', repeatBy: 'vendor', columns: [makeFieldItem('unit_price', '단가'), makeFieldItem('amount', '금액')] }] : [],
-      summaryColumns: isVendor ? [makeFieldItem('lowest_target', '최저 업체'), makeFieldItem('calculated_unit_price', '최저 단가'), makeFieldItem('remark', '비고')] : [],
-      sourceType: 'LAYOUT_REGISTRY',
-    };
-  };
-
-  const designs = registryCandidates.map(toDesign);
-  if (!designs.some((item) => item.layout === 'TABLE_ONLY' || item.layout === 'BASIC_TABLE')) {
-    designs.push({
-      designId: 'BASIC_TABLE_V1',
-      name: '기본 표 양식',
-      documentKind: '일반표',
-      score: 70,
-      layout: 'BASIC_TABLE',
-      layoutType: 'BASIC_TABLE',
-      reason: '문서 유형이 불명확하거나 서술형 전환이 맞지 않을 때 원본 표 데이터를 안전하게 편집합니다.',
-      templateName: 'AI_기본 표 양식',
-      templateType: wantedType,
-      sheetName: '기본 표 양식',
-      title: '데이터 정리표',
-      confidence: 0.7,
-      baseColumns: fallbackBase,
-      repeatGroups: [],
-      summaryColumns: [],
-      sourceType: 'LAYOUT_REGISTRY',
-    });
-  }
-  return designs.slice(0, 5);
+  // layoutRegistry 기반 상단 후보 목록은 제거한다.
+  // 화면에서는 'Gemini로 새 양식 생성' 버튼만 노출하고, 생성 후 결과 양식만 미리보기한다.
+  return [];
 }
 
 module.exports = {

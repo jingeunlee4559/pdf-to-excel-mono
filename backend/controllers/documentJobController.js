@@ -7,7 +7,7 @@ const asyncHandler = require('../utils/asyncHandler');
 const { parseJson } = require('../utils/mapper');
 const { analyzeDocuments, validateTable, defaultColumns, columnsForTableType, pruneEmptyColumns, chatWithDocuments } = require('../services/analysisService');
 const { createExcelFile, createMappedTemplateExcel } = require('../services/excelService');
-const { getTemplateRecommendationsForJob, saveRecommendationHistory, getTemplateDesignCandidatesForJob, createAiGeneratedTemplateForJob } = require('../services/templateRecommendationService');
+const { saveRecommendationHistory, createAiGeneratedTemplateForJob } = require('../services/templateRecommendationService');
 const { Counter, CandidateField, StandardField, TableEditLog } = require('../models');
 const { verifyToken } = require('../utils/jwt');
 
@@ -248,18 +248,10 @@ async function loadJob(jobId, user) {
     }))
   };
 
-  try {
-    jobDetail.aiTemplateRecommendations = await getTemplateRecommendationsForJob(jobDetail);
-  } catch (error) {
-    console.warn('[AI_TEMPLATE_RECOMMENDATION_FAILED]', error.message);
-    jobDetail.aiTemplateRecommendations = [];
-  }
-  try {
-    jobDetail.aiTemplateDesignCandidates = getTemplateDesignCandidatesForJob(jobDetail);
-  } catch (error) {
-    console.warn('[AI_TEMPLATE_DESIGN_CANDIDATES_FAILED]', error.message);
-    jobDetail.aiTemplateDesignCandidates = [];
-  }
+  // 기존 점수형 후보 추천과 layoutRegistry 기반 디자인 후보는 노출하지 않는다.
+  // Gemini 새 양식 생성 버튼을 통해 사용자 요청별 양식을 직접 생성한다.
+  jobDetail.aiTemplateRecommendations = [];
+  jobDetail.aiTemplateDesignCandidates = [];
   try {
     const candidates = await CandidateField.find({ job_id: Number(jobDetail.id), active_yn: 'Y' }).sort({ id: 1 }).lean();
     jobDetail.candidateFields = candidates.map((item) => ({
@@ -624,7 +616,7 @@ function sanitizeKoreanAssistantText(value = '', fallback = '') {
   if (!text) return fallback;
   const cjkCount = (text.match(/[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]/g) || []).length;
   const hangulCount = (text.match(/[가-힣]/g) || []).length;
-  // qwen이 중국어/일본어로 섞어 답하면 사용자 화면에는 규칙 기반 한국어 답변만 보여준다.
+  // LLM이 중국어/일본어로 섞어 답하면 사용자 화면에는 규칙 기반 한국어 답변만 보여준다.
   if (cjkCount >= 2 || (cjkCount >= 1 && hangulCount < 20)) return fallback || text.replace(/[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]+/g, '').trim();
   return text;
 }
@@ -1946,7 +1938,7 @@ const createAiTemplate = asyncHandler(async (req, res) => {
     job,
     tableId: req.body.tableId || req.body.table_id || null,
     user: req.user,
-    designOverride: req.body.design || req.body.designJson || null,
+    designOverride: req.body.forceGeminiDesign ? null : (req.body.design || req.body.designJson || null),
   });
   const refreshedJob = await loadJob(job.id, req.user);
   res.status(201).json({

@@ -166,11 +166,59 @@ function familyOf(layoutType = '') {
   return (LAYOUT_REGISTRY.find((item) => item.layoutType === layoutType) || {}).family || 'BASIC';
 }
 
+
 function inferUserOutputIntent(text = '') {
   const raw = String(text || '');
-  if (includesAny(raw, ['표로', '표 형태', '표 형식', '엑셀', '그리드', '비교표', '테이블'])) return 'TABLE';
-  if (includesAny(raw, ['보고서', '보고 형식', '업무보고서', '검토보고서', '서술형', '문장형', '핵심 내용'])) return 'REPORT';
+  const wantsReport = includesAny(raw, [
+    '보고서 형식', '보고서 형태', '보고서로', '업무보고서', '업무 보고서', '검토보고서', '검토 보고서',
+    '보고서', '보고 형식', '보고 형태', '서술형', '문장형', '본문형', '핵심 내용', '보고용'
+  ]);
+  const wantsTable = includesAny(raw, [
+    '표로', '표 형태', '표 형식', '표 양식', '표만', '비교표', '단가표', '조사표',
+    '테이블', '그리드', '엑셀 표', '표 정리', '표 만들어', '표 생성'
+  ]);
+
+  // 사용자가 보고서와 표를 같이 언급했더라도, "표로/비교표/단가표"처럼 표 산출을 직접 지시한 경우만 TABLE로 본다.
+  // 단순히 원문/분석 결과에 "표"라는 단어가 들어간 것 때문에 보고서 요청이 표 후보로 밀리지 않게 한다.
+  if (wantsTable && !wantsReport) return 'TABLE';
+  if (wantsTable && /표로|비교표|단가표|조사표|테이블|그리드|엑셀\s*표|표\s*(정리|생성|만들)/i.test(raw)) return 'TABLE';
+  if (wantsReport) return 'REPORT';
   return 'AUTO';
+}
+
+const TABLE_ONLY_LAYOUTS = new Set(['VENDOR_COMPARISON_TABLE', 'PRICE_SURVEY_TABLE', 'BASIC_TABLE']);
+const REPORT_COMPATIBLE_LAYOUTS = new Set([
+  'REPORT_FORM',
+  'REVIEW_OPINION_FORM',
+  'INSPECTION_REPORT',
+  'VENDOR_COMPARISON_REVIEW_FORM',
+]);
+const TABLE_COMPATIBLE_LAYOUTS = new Set([
+  'VENDOR_COMPARISON_TABLE',
+  'PRICE_SURVEY_TABLE',
+  'BASIC_TABLE',
+]);
+
+function isLayoutAllowedForIntent(layoutType = '', intent = 'AUTO', text = '') {
+  const layout = String(layoutType || '').toUpperCase();
+  const ctx = analyzeContext(text);
+
+  if (intent === 'REPORT') {
+    // 보고서 요청에서는 표 전용 후보를 후보군에서 제외한다.
+    if (TABLE_ONLY_LAYOUTS.has(layout)) return false;
+    if (REPORT_COMPATIBLE_LAYOUTS.has(layout)) return true;
+    if (layout === 'MEETING_MINUTES') return ctx.hasMeeting;
+    if (layout === 'OFFICIAL_LETTER') return ctx.hasOfficial;
+    if (layout === 'WORK_DAILY_REPORT') return includesAny(text, ['작업일보', '작업내용', '금일작업', '명일작업']);
+    return false;
+  }
+
+  if (intent === 'TABLE') {
+    // 표 요청에서는 보고서/공문/회의록 후보를 섞지 않는다.
+    return TABLE_COMPATIBLE_LAYOUTS.has(layout) || layout === 'ESTIMATE_REVIEW_FORM';
+  }
+
+  return true;
 }
 
 function analyzeContext(text = '') {
@@ -187,15 +235,29 @@ function analyzeContext(text = '') {
   return { raw, upper, hasMeeting, hasOfficial, hasCompare, hasUnitPrice, hasReport, hasRealTable, hasInspection, userIntent };
 }
 
-function inferMainLayoutType(text = '') {
+function inferMainLayoutType(text = '', explicitIntent = 'AUTO', userRequest = '') {
   const ctx = analyzeContext(text);
-  if (ctx.hasMeeting) return 'MEETING_MINUTES';
-  if (ctx.hasOfficial) return 'OFFICIAL_LETTER';
+  const requestText = String(userRequest || '');
+
+  if (ctx.hasMeeting && includesAny(requestText || text, ['회의록', '회의록 형식'])) return 'MEETING_MINUTES';
+  if (ctx.hasOfficial && includesAny(requestText || text, ['공문', '공문 형식'])) return 'OFFICIAL_LETTER';
+
+  if (explicitIntent === 'REPORT') {
+    if (ctx.hasInspection && includesAny(requestText, ['점검 보고서', '현장 점검 보고서'])) return 'INSPECTION_REPORT';
+    if (ctx.hasCompare && includesAny(requestText, ['비교 검토보고서', '업체별 단가 비교 검토보고서'])) return 'VENDOR_COMPARISON_REVIEW_FORM';
+    return 'REPORT_FORM';
+  }
+
+  if (explicitIntent === 'TABLE') {
+    if (ctx.hasCompare) return 'VENDOR_COMPARISON_TABLE';
+    if (ctx.hasUnitPrice || includesAny(text, ['단가표', '표준시장단가표', '공종단가표', '노무비율'])) return 'PRICE_SURVEY_TABLE';
+    return 'BASIC_TABLE';
+  }
+
   if (ctx.hasCompare && ctx.hasUnitPrice) {
-    if (ctx.userIntent === 'TABLE') return 'VENDOR_COMPARISON_TABLE';
     return ctx.hasReport || !ctx.hasRealTable ? 'VENDOR_COMPARISON_REVIEW_FORM' : 'VENDOR_COMPARISON_TABLE';
   }
-  if (ctx.hasCompare) return ctx.userIntent === 'TABLE' || ctx.hasRealTable ? 'VENDOR_COMPARISON_TABLE' : 'VENDOR_COMPARISON_REVIEW_FORM';
+  if (ctx.hasCompare) return ctx.hasRealTable ? 'VENDOR_COMPARISON_TABLE' : 'VENDOR_COMPARISON_REVIEW_FORM';
   if (includesAny(text, ['단가표', '표준시장단가표', '공종단가표', '노무비율'])) return 'PRICE_SURVEY_TABLE';
   if (ctx.hasInspection) return 'INSPECTION_REPORT';
   if (ctx.hasReport) return 'REPORT_FORM';
@@ -206,62 +268,91 @@ function matchedKeywordCount(layout, text = '') {
   return (layout.keywords || []).filter((keyword) => includesAny(text, [keyword])).length;
 }
 
-function compareScores(layoutType = '', ctx = {}, mainType = '') {
-  const tableWanted = ctx.userIntent === 'TABLE' || ctx.hasRealTable;
-  const reportWanted = ctx.userIntent === 'REPORT' || ctx.hasReport || !ctx.hasRealTable;
+function explicitIntentScore(layoutType = '', ctx = {}, intent = 'AUTO', mainType = '') {
+  if (intent === 'REPORT') {
+    const map = {
+      REPORT_FORM: mainType === 'REPORT_FORM' ? 88 : 82,
+      REVIEW_OPINION_FORM: 80,
+      INSPECTION_REPORT: ctx.hasInspection ? 86 : 58,
+      VENDOR_COMPARISON_REVIEW_FORM: mainType === 'VENDOR_COMPARISON_REVIEW_FORM' ? 88 : (ctx.hasCompare ? 74 : 56),
+      MEETING_MINUTES: ctx.hasMeeting ? 82 : 20,
+      OFFICIAL_LETTER: ctx.hasOfficial ? 82 : 20,
+      WORK_DAILY_REPORT: 54,
+    };
+    return map[layoutType] ?? 18;
+  }
+
+  if (intent === 'TABLE') {
+    const map = {
+      VENDOR_COMPARISON_TABLE: ctx.hasCompare ? 88 : 64,
+      PRICE_SURVEY_TABLE: ctx.hasUnitPrice ? 82 : 62,
+      BASIC_TABLE: 66,
+      ESTIMATE_REVIEW_FORM: 60,
+    };
+    return map[layoutType] ?? 18;
+  }
+
+  return null;
+}
+
+function compareScores(layoutType = '', ctx = {}, mainType = '', explicitIntent = 'AUTO') {
+  const explicitScore = explicitIntentScore(layoutType, ctx, explicitIntent, mainType);
+  if (explicitScore !== null) return explicitScore;
+
   if (mainType === 'VENDOR_COMPARISON_TABLE') {
     const map = {
-      VENDOR_COMPARISON_TABLE: 96,
-      VENDOR_COMPARISON_REVIEW_FORM: reportWanted ? 91 : 88,
-      ESTIMATE_REVIEW_FORM: 82,
-      PRICE_SURVEY_TABLE: 78,
-      REPORT_FORM: 74,
-      REVIEW_OPINION_FORM: 68,
-      BASIC_TABLE: 55,
+      VENDOR_COMPARISON_TABLE: 88,
+      VENDOR_COMPARISON_REVIEW_FORM: 76,
+      ESTIMATE_REVIEW_FORM: 70,
+      PRICE_SURVEY_TABLE: 68,
+      REPORT_FORM: 58,
+      REVIEW_OPINION_FORM: 54,
+      BASIC_TABLE: 52,
     };
-    return map[layoutType] ?? 24;
+    return map[layoutType] ?? 22;
   }
   if (mainType === 'VENDOR_COMPARISON_REVIEW_FORM') {
     const map = {
-      VENDOR_COMPARISON_REVIEW_FORM: 96,
-      VENDOR_COMPARISON_TABLE: tableWanted ? 94 : 91,
-      REPORT_FORM: 84,
-      REVIEW_OPINION_FORM: 80,
-      ESTIMATE_REVIEW_FORM: 76,
-      PRICE_SURVEY_TABLE: 72,
-      BASIC_TABLE: 52,
+      VENDOR_COMPARISON_REVIEW_FORM: 88,
+      REPORT_FORM: 78,
+      REVIEW_OPINION_FORM: 74,
+      VENDOR_COMPARISON_TABLE: 64,
+      ESTIMATE_REVIEW_FORM: 62,
+      PRICE_SURVEY_TABLE: 58,
+      BASIC_TABLE: 48,
     };
     return map[layoutType] ?? 22;
   }
   return null;
 }
 
-function scoreLayoutAgainstText(layout, text = '', mainType = '') {
+function scoreLayoutAgainstText(layout, text = '', mainType = '', explicitIntent = 'AUTO') {
   const ctx = analyzeContext(text);
   const layoutType = layout.layoutType;
   const matched = matchedKeywordCount(layout, text);
-  const compareScore = compareScores(layoutType, ctx, mainType);
-  if (compareScore !== null) return Math.max(18, Math.min(98, compareScore + Math.min(2, matched)));
+  const compareScore = compareScores(layoutType, ctx, mainType, explicitIntent);
+  if (compareScore !== null) return Math.max(18, Math.min(90, compareScore + Math.min(2, matched)));
 
-  let base = 34;
+  let base = 32;
   const mainFamily = familyOf(mainType);
   const candFamily = familyOf(layoutType);
-  if (mainType === layoutType) base = 94;
-  else if (mainFamily === candFamily && mainFamily !== 'BASIC') base = 78;
-  else if (matched >= 2) base = 58;
-  else if (matched === 1) base = 46;
+  if (mainType === layoutType) base = 86;
+  else if (mainFamily === candFamily && mainFamily !== 'BASIC') base = 72;
+  else if (matched >= 2) base = 56;
+  else if (matched === 1) base = 44;
 
-  if (ctx.hasInspection && layoutType === 'INSPECTION_REPORT') base = Math.max(base, 92);
-  if (!ctx.hasInspection && layoutType === 'INSPECTION_REPORT') base = Math.min(base, 35);
+  if (ctx.hasInspection && layoutType === 'INSPECTION_REPORT') base = Math.max(base, 84);
+  if (!ctx.hasInspection && layoutType === 'INSPECTION_REPORT') base = Math.min(base, 34);
   if (!ctx.hasMeeting && layoutType === 'MEETING_MINUTES') base = Math.min(base, 24);
   if (!ctx.hasOfficial && layoutType === 'OFFICIAL_LETTER') base = Math.min(base, 24);
 
-  const score = Math.round(base + Math.min(6, matched * 2));
-  return Math.max(18, Math.min(98, score));
+  const score = Math.round(base + Math.min(4, matched));
+  return Math.max(18, Math.min(90, score));
 }
 
-function buildReason(layout, score, text = '', mainType = '') {
-  if (layout.layoutType === 'VENDOR_COMPARISON_TABLE' && ['VENDOR_COMPARISON_REVIEW_FORM', 'VENDOR_COMPARISON_TABLE'].includes(mainType)) {
+function buildReason(layout, score, text = '', mainType = '', explicitIntent = 'AUTO') {
+  if (explicitIntent === 'REPORT' && TABLE_ONLY_LAYOUTS.has(layout.layoutType)) return `${layout.reason} 보고서 요청에서는 표 전용 후보로 제외됩니다.`;
+  if (layout.layoutType === 'VENDOR_COMPARISON_TABLE' && mainType === 'VENDOR_COMPARISON_TABLE') {
     const suffix = analyzeContext(text).hasRealTable ? '' : ' 원문이 표가 아닌 문장형이면 문장 기반으로 업체명·금액·차이율을 추출합니다.';
     return `${layout.reason}${suffix}`;
   }
@@ -285,28 +376,35 @@ function buildLayoutCandidates({ analysis = {}, table = {}, userRequest = '' } =
     userRequest,
   ].filter(Boolean).join(' ');
   if (!hasMeaningfulContext(text)) return [];
-  const mainType = inferMainLayoutType(text);
-  const scored = LAYOUT_REGISTRY.map((layout) => {
-    const score = scoreLayoutAgainstText(layout, text, mainType);
-    return {
-      designId: layout.designId,
-      name: layout.name,
-      documentKind: layout.documentKind,
-      layoutType: layout.layoutType,
-      layout: normalizeLayoutForRenderer(layout.layoutType),
-      title: layout.title,
-      score,
-      reason: buildReason(layout, score, text, mainType),
-      sections: layout.sections,
-      sourceType: 'LAYOUT_REGISTRY',
-      mainType,
-    };
-  });
+
+  const explicitIntent = inferUserOutputIntent(userRequest);
+  const mainType = inferMainLayoutType(text, explicitIntent, userRequest);
+  const scored = LAYOUT_REGISTRY
+    .filter((layout) => isLayoutAllowedForIntent(layout.layoutType, explicitIntent, text))
+    .map((layout) => {
+      const score = scoreLayoutAgainstText(layout, text, mainType, explicitIntent);
+      return {
+        designId: layout.designId,
+        name: layout.name,
+        documentKind: layout.documentKind,
+        layoutType: layout.layoutType,
+        layout: normalizeLayoutForRenderer(layout.layoutType),
+        title: layout.title,
+        score,
+        reason: buildReason(layout, score, text, mainType, explicitIntent),
+        sections: layout.sections,
+        sourceType: 'LAYOUT_REGISTRY',
+        mainType,
+        requestIntent: explicitIntent,
+      };
+    });
+
+  const threshold = explicitIntent === 'AUTO' ? 55 : 50;
   const filtered = scored
-    .filter((item) => item.layoutType === mainType || Number(item.score || 0) >= 65)
+    .filter((item) => item.layoutType === mainType || Number(item.score || 0) >= threshold)
     .sort((a, b) => Number(b.score || 0) - Number(a.score || 0));
   return filtered.slice(0, 5);
 }
 
 
-module.exports = { LAYOUT_REGISTRY, normalizeLayoutForRenderer, buildLayoutCandidates, scoreLayoutAgainstText };
+module.exports = { LAYOUT_REGISTRY, normalizeLayoutForRenderer, buildLayoutCandidates, scoreLayoutAgainstText, inferUserOutputIntent, isLayoutAllowedForIntent };

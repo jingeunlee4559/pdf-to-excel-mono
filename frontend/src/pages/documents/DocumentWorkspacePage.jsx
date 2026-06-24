@@ -1,8 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { createAiTemplateApi, createChatSessionApi, createDocumentJobApi, deleteChatSessionApi, excelDownloadUrl, generateExcelApi, getChatSessionApi, getDocumentJobApi, listChatSessionsApi, listDownloadsApi, revalidateJobApi, sendAiChatApi, updateCandidateFieldApi, updateTableApi } from '../../api/documentApi.js';
-import { listTemplatesApi } from '../../api/templateApi.js';
+import { getTemplatePreviewApi, listTemplatesApi } from '../../api/templateApi.js';
 import { useAuth } from '../../context/AuthContext.jsx';
-import { buildLayoutCandidates, scoreLayoutAgainstText, LAYOUT_REGISTRY, normalizeLayoutForPreview } from '../../utils/layoutRegistry.js';
 
 const emptyAnalysis = {
   summary: '아직 분석된 문서가 없습니다. 오른쪽 영역에서 파일과 요청 내용을 입력한 뒤 분석을 실행하세요.',
@@ -167,8 +166,9 @@ function detectDocumentDesignType({ analysis = {}, table = {}, userRequest = '' 
   return 'BASIC_TABLE';
 }
 
-function buildDefaultDesignCandidates({ analysis = {}, table = {}, userRequest = '' } = {}) {
-  return buildLayoutCandidates({ analysis, table, userRequest });
+function buildDefaultDesignCandidates() {
+  // 기존 layoutRegistry 기반 후보 목록은 사용하지 않는다.
+  return [];
 }
 
 function templateToAiDesignCandidate(template) {
@@ -207,53 +207,57 @@ function getRecommendationContextText(context = {}) {
   ].filter(Boolean).join(' ');
 }
 
-function recomputeDesignScore(item = {}, context = {}, defaults = []) {
-  const contextText = getRecommendationContextText(context);
-  const layoutType = String(item.layoutType || item.layout_type || item.templateType || item.template_type || item.layout || '').toUpperCase();
-  const matchedDefault = defaults.find((candidate) => String(candidate.layoutType || candidate.layout || '').toUpperCase() === layoutType || String(candidate.designId || '').toUpperCase() === String(item.designId || item.design_id || '').toUpperCase());
-  if (matchedDefault) return Number(matchedDefault.score || item.score || 0);
-  const registryItem = LAYOUT_REGISTRY.find((candidate) => candidate.layoutType === layoutType);
-  const mainType = defaults[0]?.mainType || '';
-  if (registryItem && contextText) return scoreLayoutAgainstText(registryItem, contextText, mainType);
-  return Number(item.score || 0);
+function normalizeDesignLayoutType(value = '') {
+  const layout = String(value || '').toUpperCase();
+  if (!layout) return 'BASIC_TABLE';
+  if (layout === 'VENDOR_COMPARISON_REVIEW_FORM' || layout.includes('VENDOR_COMPARE_REVIEW')) return 'VENDOR_COMPARISON_REVIEW_FORM';
+  if (layout === 'REVIEW_OPINION_FORM' || layout.includes('REVIEW_OPINION')) return 'REVIEW_OPINION_FORM';
+  if (layout === 'INSPECTION_REPORT' || layout.includes('INSPECTION')) return 'INSPECTION_REPORT';
+  if (layout === 'WORK_DAILY_REPORT' || layout.includes('WORK_DAILY')) return 'WORK_DAILY_REPORT';
+  if (layout.includes('DYNAMIC_VENDOR') || layout.includes('VENDOR_COMPARE')) return 'VENDOR_COMPARISON_TABLE';
+  if (layout === 'PRICE_TABLE' || layout.includes('PRICE_SURVEY') || layout.includes('UNIT_PRICE')) return 'PRICE_SURVEY_TABLE';
+  if (layout === 'ESTIMATE_FORM' || layout.includes('ESTIMATE')) return 'ESTIMATE_REVIEW_FORM';
+  if (['SECTION_REPORT', 'APPROVAL_FORM', 'HEADER_SUMMARY_TABLE', 'REPORT', 'REPORT_FORM'].includes(layout)) return 'REPORT_FORM';
+  if (layout.includes('MEETING')) return 'MEETING_MINUTES';
+  if (layout.includes('OFFICIAL')) return 'OFFICIAL_LETTER';
+  return layout;
 }
 
-function mergeAiDesignOptions(designCandidates = [], templates = [], context = {}) {
-  const defaults = buildDefaultDesignCandidates(context);
-  // AI 추천양식은 현재 문서 분석 결과 + layout registry 상위 후보만 사용한다.
-  // AI 서버가 과거 점수로 보낸 후보도 프론트에서 현재 문서 기준으로 다시 점수화한다.
-  const list = [...(designCandidates || []), ...defaults];
+function recomputeDesignScore(item = {}) {
+  return Math.max(0, Math.min(100, Number(item.score || item.confidence * 100 || 80) || 80));
+}
+
+function mergeAiDesignOptions(designCandidates = [], templates = []) {
+  const list = [
+    ...(Array.isArray(designCandidates) ? designCandidates : []),
+    ...(Array.isArray(templates) ? templates.map(templateToAiDesignCandidate).filter(Boolean) : []),
+  ];
   const seenIds = new Set();
-  const seenSemantic = new Set();
   return list
-    .filter((item) => item && (item.designId || item.name || item.layout))
+    .filter((item) => item && (item.designId || item.name || item.layout || item.templateName))
     .map((item, index) => {
-      const layoutType = String(item.layoutType || item.layout_type || item.templateType || item.template_type || item.layout || 'BASIC_TABLE').toUpperCase();
-      const layout = normalizeLayoutForPreview(layoutType);
+      const rawLayoutType = item.layoutType || item.layout_type || item.templateType || item.template_type || item.layout || 'CUSTOM_DOCUMENT_FORM';
+      const layoutType = normalizeDesignLayoutType(rawLayoutType);
       return {
         ...item,
-        designId: String(item.designId || item.design_id || layoutType || item.name || `AI_DESIGN_${index}`),
-        name: item.name || item.templateName || item.title || `AI 양식 ${index + 1}`,
+        designId: String(item.designId || item.design_id || item.templateCode || item.template_code || layoutType || item.name || `AI_DESIGN_${index}`),
+        name: item.name || item.templateName || item.title || `AI 생성 양식 ${index + 1}`,
         layoutType,
-        layout,
-        score: recomputeDesignScore({ ...item, layoutType }, context, defaults),
+        layout: item.layout || layoutType,
+        score: recomputeDesignScore(item),
       };
     })
-    .filter((item) => Number(item.score || 0) >= 65 || indexSafeLayout(item.layoutType || item.layout))
     .filter((item) => {
       const idKey = String(item.designId || '').toUpperCase();
-      const semanticKey = `${String(item.name || '').trim().toUpperCase()}|${String(item.layoutType || item.layout || '').trim().toUpperCase()}`;
-      if (seenIds.has(idKey) || seenSemantic.has(semanticKey)) return false;
+      if (seenIds.has(idKey)) return false;
       seenIds.add(idKey);
-      seenSemantic.add(semanticKey);
       return true;
     })
-    .sort((a, b) => Number(b.score || 0) - Number(a.score || 0))
     .slice(0, 5);
 }
 
 function indexSafeLayout(layout = '') {
-  return ['REPORT_FORM', 'BASIC_TABLE'].includes(String(layout || '').toUpperCase());
+  return ['REPORT_FORM', 'REVIEW_OPINION_FORM', 'VENDOR_COMPARISON_REVIEW_FORM', 'INSPECTION_REPORT', 'BASIC_TABLE'].includes(String(layout || '').toUpperCase());
 }
 
 
@@ -372,6 +376,9 @@ export default function DocumentWorkspacePage() {
   const [outputMode, setOutputMode] = useState('FREE_FORM');
   const [templateLayoutMode, setTemplateLayoutMode] = useState('COMPACT_VENDOR_GROUPS');
   const [templateId, setTemplateId] = useState('');
+  const [templatePreview, setTemplatePreview] = useState(null);
+  const [templatePreviewLoading, setTemplatePreviewLoading] = useState(false);
+  const [templatePreviewError, setTemplatePreviewError] = useState('');
   const [fileName, setFileName] = useState(`엑셀산출물_${new Date().toISOString().slice(0, 10).replaceAll('-', '')}.xlsx`);
   const [pendingFiles, setPendingFiles] = useState([]);
   const [analyzedFiles, setAnalyzedFiles] = useState([]);
@@ -431,6 +438,33 @@ export default function DocumentWorkspacePage() {
     if (!selectedDesignId) return null;
     return aiDesignOptions.find((item) => String(item.designId || '') === String(selectedDesignId || '')) || null;
   }, [aiDesignOptions, selectedDesignId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const loadTemplatePreview = async () => {
+      if (outputMode !== 'COMPANY_TEMPLATE' || !selectedTemplate?.id) {
+        setTemplatePreview(null);
+        setTemplatePreviewError('');
+        setTemplatePreviewLoading(false);
+        return;
+      }
+      setTemplatePreviewLoading(true);
+      setTemplatePreviewError('');
+      try {
+        const data = await getTemplatePreviewApi(selectedTemplate.id, { maxRows: 80, maxCols: 30 });
+        if (cancelled) return;
+        setTemplatePreview(data.preview || null);
+      } catch (err) {
+        if (cancelled) return;
+        setTemplatePreview(null);
+        setTemplatePreviewError(err.response?.data?.message || '등록 양식 원본 미리보기를 불러오지 못했습니다.');
+      } finally {
+        if (!cancelled) setTemplatePreviewLoading(false);
+      }
+    };
+    loadTemplatePreview();
+    return () => { cancelled = true; };
+  }, [outputMode, selectedTemplate?.id]);
 
   useEffect(() => {
     if (outputMode !== 'FREE_FORM') return;
@@ -662,7 +696,7 @@ export default function DocumentWorkspacePage() {
     setJob(jobData);
     const nextRecommendations = Array.isArray(jobData?.aiTemplateRecommendations) ? jobData.aiTemplateRecommendations : [];
     const serverDesigns = Array.isArray(jobData?.aiTemplateDesignCandidates) ? jobData.aiTemplateDesignCandidates : [];
-    const nextDesigns = serverDesigns.length ? serverDesigns : buildDefaultDesignCandidates({ analysis: jobData?.analysis || {}, table: jobData?.tables?.[0] || {}, userRequest: jobData?.userRequest || jobData?.user_request || '' });
+    const nextDesigns = serverDesigns;
     setAiTemplateRecommendations(nextRecommendations);
     setAiTemplateDesignCandidates(nextDesigns);
     setCandidateFields(Array.isArray(jobData?.candidateFields) ? jobData.candidateFields : []);
@@ -1091,14 +1125,11 @@ export default function DocumentWorkspacePage() {
       setAiTemplateCreating(true);
       setLoading(true);
       await saveTable();
-      const selectedDesign = aiTemplateDesignCandidates.find((item) => item.designId === selectedDesignId) || aiDesignOptions.find((item) => item.designId === selectedDesignId) || null;
-      if (!selectedDesign) {
-        setMessage('저장할 AI 디자인을 먼저 선택하세요.');
-        return;
-      }
-      const result = await createAiTemplateApi(job.id, { tableId: table.id || null, design: selectedDesign });
+      // 여기서는 선택한 후보를 그대로 저장하지 않고, Gemini 2.5 Flash가 현재 요청/분석결과/표 구조를 기준으로
+      // 실제 회사 문서형 엑셀 양식 구조를 새로 설계하도록 맡긴다.
+      const result = await createAiTemplateApi(job.id, { tableId: table.id || null, forceGeminiDesign: true });
       const newTemplate = result.template;
-      const nextDesign = result.design || selectedDesign || null;
+      const nextDesign = result.design || null;
       if (newTemplate?.id) {
         setTemplates((prev) => {
           const exists = prev.some((item) => String(item.id) === String(newTemplate.id));
@@ -1115,7 +1146,7 @@ export default function DocumentWorkspacePage() {
       setOutputMode('FREE_FORM');
       if (result.job) bindJobResult(result.job);
       setTab('excel');
-      setMessage(result.message || 'DB 표준필드 기반 AI 생성 양식을 자유 편집 양식으로 준비했습니다. 자사 등록 양식 목록에는 섞지 않습니다.');
+      setMessage(result.message || 'Gemini가 사용자 요청에 맞춘 AI 생성 엑셀 양식을 준비했습니다. 자사 등록 양식 목록에는 섞지 않습니다.');
     } catch (err) {
       setMessage(err.response?.data?.message || 'AI 새 양식 생성 중 오류가 발생했습니다.');
     } finally {
@@ -1205,7 +1236,6 @@ export default function DocumentWorkspacePage() {
             <p className="mt-2 truncate text-sm font-black text-slate-900">
               선택 양식: {outputMode === 'COMPANY_TEMPLATE' ? (selectedTemplate?.templateName || '등록한 회사 양식 선택 필요') : (selectedDesign?.name || 'AI 추천양식 선택 필요')}
             </p>
-            <p className="mt-1 text-xs font-bold text-slate-500">후보 목록은 접어두고, 미리보기에는 선택된 하나의 양식만 반영됩니다.</p>
           </div>
           <button
             type="button"
@@ -1285,7 +1315,7 @@ export default function DocumentWorkspacePage() {
           <div className="scroll-thin min-h-0 flex-1 overflow-y-auto p-5">
             <TableSelector tables={tables} selectedIndex={selectedTableIndex} onSelect={selectTableByIndex} />
             {tab === 'analysis' && <AnalysisView analysis={analysis} issues={issues} table={table} onMoveTable={() => setTab('excel')} onMoveExcel={() => setTab('excel')} />}
-            {tab === 'excel' && <ExcelPreview table={table} issues={issues} outputMode={outputMode} selectedTemplate={selectedTemplate} selectedDesign={selectedDesign} writerName={writerName} templateLayoutMode={templateLayoutMode} updateCell={updateCell} addRow={addRow} removeRow={removeRow} addColumn={addColumn} removeColumn={removeColumn} updateColumnLabel={updateColumnLabel} saveTable={saveTable} disabled={loading} candidateFields={candidateFields} onCandidateAction={handleCandidateFieldAction} />}
+            {tab === 'excel' && <ExcelPreview table={table} issues={issues} outputMode={outputMode} selectedTemplate={selectedTemplate} selectedDesign={selectedDesign} writerName={writerName} templateLayoutMode={templateLayoutMode} templatePreview={templatePreview} templatePreviewLoading={templatePreviewLoading} templatePreviewError={templatePreviewError} updateCell={updateCell} addRow={addRow} removeRow={removeRow} addColumn={addColumn} removeColumn={removeColumn} updateColumnLabel={updateColumnLabel} saveTable={saveTable} disabled={loading} candidateFields={candidateFields} onCandidateAction={handleCandidateFieldAction} />}
             {tab === 'source' && <SourceView files={analyzedFiles} sourceText={sourceText} />}
           </div>
         </section>
@@ -1338,7 +1368,9 @@ export default function DocumentWorkspacePage() {
 
 function classifyDesign(layout = '') {
   const text = String(layout || '').toUpperCase();
-  if (text.includes('DYNAMIC_VENDOR') || text.includes('VENDOR')) return '업체 반복';
+  if (text.includes('VENDOR_COMPARISON_REVIEW') || text.includes('VENDOR_COMPARE_REVIEW')) return '비교 검토보고서';
+  if (text.includes('REVIEW_OPINION')) return '검토 의견서';
+  if (text.includes('DYNAMIC_VENDOR') || (text.includes('VENDOR') && !text.includes('REVIEW'))) return '업체 반복';
   if (text.includes('ESTIMATE')) return '견적서';
   if (text.includes('PRICE') || text.includes('UNIT')) return '단가표';
   if (text.includes('MEETING')) return '회의록';
@@ -1375,10 +1407,10 @@ function AiTemplateRecommendationBox({ job, recommendations = [], designCandidat
   const visibleAiDesigns = showAllAiCandidates ? designs : designs.slice(0, 3);
   const currentTitle = isCompanyMode
     ? (selectedTemplate?.templateName || activeRecommendation?.templateName || '등록한 회사 양식을 선택하세요')
-    : (activeDesign?.name || 'AI 추천양식을 선택하세요');
+    : (activeDesign?.name || 'Gemini로 새 양식을 생성하세요');
   const currentDescription = isCompanyMode
     ? ((activeRecommendation?.reasons || [])[0] || selectedTemplate?.description || '등록한 엑셀 양식에 분석 데이터를 매핑합니다.')
-    : (activeDesign?.reason || '문서 분석 결과와 layout registry 기준으로 생성된 추천 양식입니다.');
+    : (activeDesign?.reason || 'Gemini가 사용자 요청과 문서 분석 결과를 기준으로 새 회사 문서 양식을 생성합니다.');
   const visibleCandidateFields = (candidateFields || []).slice(0, 6);
   const needNewTemplate = job?.id && !companyChoices.length && designs.length > 0;
 
@@ -1393,24 +1425,23 @@ function AiTemplateRecommendationBox({ job, recommendations = [], designCandidat
             {job?.id ? <Badge tone="green">현재 문서 분석 기준</Badge> : <Badge tone="slate">파일 분석 후 자동 추천</Badge>}
             {needNewTemplate && <Badge tone="amber">회사 양식 없음</Badge>}
           </div>
-          <h4 className="mt-2 text-lg font-black text-slate-950">현재 문서에 맞는 양식만 골라서 보여줍니다.</h4>
-          <p className="mt-1 text-sm font-bold leading-6 text-slate-500">AI 추천양식은 상위 후보만 표시하고, 등록한 회사 양식은 실제 등록 양식만 표시합니다.</p>
+          <h4 className="mt-2 text-lg font-black text-slate-950">Gemini가 사용자 요청에 맞는 회사 문서형 엑셀 양식을 새로 만듭니다.</h4>
         </div>
         {!isCompanyMode && (
           <button
             type="button"
             onClick={onCreateAiTemplate}
-            disabled={!job?.id || loading || creating || !activeDesign}
+            disabled={!job?.id || loading || creating}
             className="shrink-0 rounded-2xl bg-gradient-to-r from-slate-900 to-brand-700 px-4 py-2.5 text-xs font-black text-white shadow-glow disabled:bg-slate-200 disabled:from-slate-200 disabled:to-slate-200 disabled:text-slate-400"
-            title="현재 선택된 AI 추천양식을 저장합니다. 등록 회사 양식 목록에는 섞이지 않습니다."
+            title="Gemini 2.5 Flash가 사용자 요청과 문서 분석 결과를 기준으로 새 엑셀 양식을 설계합니다."
           >
-            {creating ? 'AI 양식 저장 중' : '현재 AI 양식 저장'}
+            {creating ? 'Gemini 양식 생성 중' : 'Gemini로 회사 양식 생성'}
           </button>
         )}
       </div>
 
       <div className="mt-4 flex flex-wrap gap-2">
-        <button type="button" onClick={() => onChangeOutputMode?.('FREE_FORM')} className={tabButtonClass(!isCompanyMode)}>AI 추천양식</button>
+        <button type="button" onClick={() => onChangeOutputMode?.('FREE_FORM')} className={tabButtonClass(!isCompanyMode)}>AI 생성양식</button>
         <button type="button" onClick={() => onChangeOutputMode?.('COMPANY_TEMPLATE')} className={tabButtonClass(isCompanyMode)}>등록한 회사 양식</button>
       </div>
 
@@ -1422,7 +1453,7 @@ function AiTemplateRecommendationBox({ job, recommendations = [], designCandidat
             <p className="mt-2 line-clamp-2 text-xs font-bold leading-5 text-slate-600">{currentDescription}</p>
           </div>
           <div className="flex shrink-0 flex-wrap gap-2 md:justify-end">
-            <Badge tone={isCompanyMode ? 'blue' : 'green'}>{isCompanyMode ? '등록한 회사 양식' : 'AI 추천양식'}</Badge>
+            <Badge tone={isCompanyMode ? 'blue' : 'green'}>{isCompanyMode ? '등록한 회사 양식' : 'AI 생성양식'}</Badge>
             {!isCompanyMode && activeDesign?.layout && <Badge tone="slate">{classifyDesign(activeDesign.layout)}</Badge>}
             {!isCompanyMode && activeDesign?.score ? <Badge tone={Number(activeDesign.score) >= 85 ? 'green' : Number(activeDesign.score) >= 70 ? 'amber' : 'slate'}>{Math.round(Number(activeDesign.score))}점</Badge> : null}
             {isCompanyMode && activeRecommendation?.score ? <Badge tone={Number(activeRecommendation.score) >= 80 ? 'green' : Number(activeRecommendation.score) >= 60 ? 'amber' : 'slate'}>{Math.round(Number(activeRecommendation.score))}점</Badge> : null}
@@ -1431,49 +1462,23 @@ function AiTemplateRecommendationBox({ job, recommendations = [], designCandidat
       </div>
 
       {!isCompanyMode ? (
-        <div className="mt-3 rounded-3xl border border-emerald-100 bg-white/90 p-3 shadow-card">
-          <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+        <div className="mt-3 rounded-3xl border border-emerald-100 bg-white/90 p-4 shadow-card">
+          <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
             <div>
-              <p className="text-xs font-black text-slate-800">AI 추천양식</p>
-              <p className="mt-1 text-[11px] font-bold text-slate-400">처음에는 상위 3개만 표시합니다. 전체 registry 목록을 그대로 노출하지 않습니다.</p>
+              <p className="text-xs font-black text-slate-800">Gemini AI 생성양식</p>
+              <p className="mt-1 text-xs font-bold leading-5 text-slate-500">
+                기존 후보 점수표를 고르지 않고, 사용자 요청과 분석된 문서 내용을 기준으로 Gemini가 새 엑셀 양식 JSON을 설계합니다.
+              </p>
             </div>
-            {designs.length > 3 && (
-              <button type="button" onClick={() => setShowAllAiCandidates((prev) => !prev)} className="rounded-2xl bg-emerald-50 px-3 py-2 text-[11px] font-black text-emerald-700 hover:bg-emerald-100">
-                {showAllAiCandidates ? '상위 3개만 보기' : `후보 ${designs.length}개 보기`}
-              </button>
-            )}
+            <Badge tone={activeDesign ? 'green' : 'slate'}>{activeDesign ? '생성됨' : '생성 전'}</Badge>
           </div>
-          {visibleAiDesigns.length > 0 ? (
-            <div className="grid gap-2 md:grid-cols-2 2xl:grid-cols-3">
-              {visibleAiDesigns.map((design) => {
-                const active = String(selectedDesignId || '') === String(design.designId || '');
-                return (
-                  <button
-                    key={design.designId || design.name}
-                    type="button"
-                    onClick={() => onSelectDesign?.(design.designId)}
-                    disabled={loading}
-                    className={`rounded-2xl border p-3 text-left transition disabled:opacity-50 ${active ? 'border-emerald-300 bg-emerald-50 ring-2 ring-emerald-100' : 'border-slate-200 bg-white hover:border-emerald-200 hover:bg-emerald-50/60'}`}
-                  >
-                    <div className="flex items-start justify-between gap-2">
-                      <div className="min-w-0">
-                        <p className="truncate text-sm font-black text-slate-900">{design.name || design.title}</p>
-                        <p className="mt-1 text-[11px] font-bold text-slate-500">{classifyDesign(design.layout)} · {design.layoutType || design.layout || 'BASIC_TABLE'}</p>
-                      </div>
-                      <span className="shrink-0 rounded-full bg-emerald-50 px-2 py-1 text-[11px] font-black text-emerald-700">{Math.round(Number(design.score || 0))}점</span>
-                    </div>
-                    <p className="mt-2 line-clamp-2 text-xs font-bold leading-5 text-slate-600">{design.reason || 'AI가 문서 구조를 기준으로 추천한 양식입니다.'}</p>
-                    {Array.isArray(design.sections) && design.sections.length > 0 && (
-                      <p className="mt-2 line-clamp-1 text-[11px] font-bold text-slate-400">구성: {design.sections.slice(0, 4).join(' · ')}{design.sections.length > 4 ? ' · …' : ''}</p>
-                    )}
-                    {active && <p className="mt-2 text-[11px] font-black text-emerald-700">현재 선택됨</p>}
-                  </button>
-                );
-              })}
+          {activeDesign ? (
+            <div className="mt-3 rounded-2xl border border-emerald-100 bg-emerald-50 p-3 text-xs font-bold leading-5 text-emerald-800">
+              현재 생성 양식: {activeDesign.name || activeDesign.title || 'AI 생성 양식'} · {classifyDesign(activeDesign.layout || activeDesign.layoutType)}
             </div>
           ) : (
-            <div className="rounded-2xl border border-dashed border-slate-200 bg-slate-50 p-4 text-xs font-bold leading-5 text-slate-500">
-              분석 결과가 들어오면 AI가 문서 유형에 맞는 양식 후보를 생성합니다.
+            <div className="mt-3 rounded-2xl border border-dashed border-slate-200 bg-slate-50 p-4 text-xs font-bold leading-5 text-slate-500">
+              문서 분석이 완료되면 오른쪽 위의 <span className="font-black text-slate-700">Gemini로 회사 양식 생성</span> 버튼을 눌러 새 양식을 만드세요. 상단 후보 목록과 점수 추천은 사용하지 않습니다.
             </div>
           )}
         </div>
@@ -1514,7 +1519,7 @@ function AiTemplateRecommendationBox({ job, recommendations = [], designCandidat
             </div>
           ) : (
             <div className="rounded-2xl border border-dashed border-slate-200 bg-slate-50 p-4 text-xs font-bold leading-5 text-slate-500">
-              등록된 회사 양식이 없습니다. AI 추천양식을 사용하거나 관리자 화면에서 회사 양식을 등록하세요.
+              등록된 회사 양식이 없습니다. Gemini로 새 회사 문서 양식을 생성하세요.
             </div>
           )}
         </div>
@@ -2523,21 +2528,21 @@ function EditableTemplateCell({ value = '', onChange, className = '', colSpan, r
   );
 }
 
-function PreviewEditToolbar({ table, addRow, addColumn, removeColumn, updateColumnLabel, saveTable, disabled, candidateFields = [], onCandidateAction }) {
+function PreviewEditToolbar({ table, addRow, addColumn, removeColumn, updateColumnLabel, saveTable, disabled, candidateFields = [], onCandidateAction, showColumnTools = true }) {
   return (
     <div className="mb-4 rounded-3xl border border-brand-100 bg-gradient-to-br from-brand-50 to-white p-3">
       <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
         <div>
           <p className="text-sm font-black text-slate-900">엑셀 미리보기 직접 편집</p>
-          <p className="mt-1 text-xs font-bold text-slate-500">아래 엑셀 미리보기 안에서 직접 수정합니다. 행삭제는 각 행의 ×, 컬럼삭제는 아래 컬럼 관리에서 처리합니다.</p>
+          <p className="mt-1 text-xs font-bold text-slate-500">{showColumnTools ? '아래 데이터 표를 기준으로 셀·행·컬럼을 직접 수정합니다. 등록 회사 양식도 수정용 데이터 표에서 컬럼을 추가할 수 있습니다.' : '아래 엑셀 미리보기 안에서 직접 수정합니다. 행삭제는 각 행의 ×, 컬럼삭제는 아래 컬럼 관리에서 처리합니다.'}</p>
         </div>
         <div className="flex flex-wrap gap-2">
           <button type="button" onClick={addRow} disabled={disabled} className="rounded-2xl bg-white px-4 py-2 text-xs font-black text-slate-700 ring-1 ring-slate-200 hover:bg-slate-50 disabled:opacity-50">행 추가</button>
-          <button type="button" onClick={addColumn} disabled={disabled} className="rounded-2xl bg-white px-4 py-2 text-xs font-black text-slate-700 ring-1 ring-slate-200 hover:bg-slate-50 disabled:opacity-50">컬럼 추가</button>
+          {showColumnTools && <button type="button" onClick={addColumn} disabled={disabled} className="rounded-2xl bg-white px-4 py-2 text-xs font-black text-slate-700 ring-1 ring-slate-200 hover:bg-slate-50 disabled:opacity-50">컬럼 추가</button>}
           <button type="button" onClick={saveTable} disabled={disabled} className="rounded-2xl bg-gradient-to-r from-brand-500 to-brand-400 px-4 py-2 text-xs font-black text-white shadow-glow disabled:from-slate-300 disabled:to-slate-300">수정 저장</button>
         </div>
       </div>
-      {(table?.columns || []).length > 0 && (
+      {showColumnTools && (table?.columns || []).length > 0 && (
         <div className="mt-3 rounded-2xl border border-slate-200 bg-white/80 px-3 py-3">
           <p className="mb-2 text-xs font-black text-slate-800">컬럼 관리 · 이름 수정 / 컬럼 삭제</p>
           <div className="flex flex-wrap gap-2">
@@ -2609,9 +2614,8 @@ function getTemplateDisplayName(selectedTemplate) {
 
 function isAiGeneratedTemplate(selectedTemplate) {
   const mapping = selectedTemplate?.mapping || selectedTemplate?.mappingJson || {};
-  const layout = String(mapping?.layout || '').toUpperCase();
   const code = String(selectedTemplate?.templateCode || selectedTemplate?.template_code || '').toUpperCase();
-  return Boolean(mapping?.aiGenerated) || layout.startsWith('AI_GENERATED') || code.startsWith('AI_');
+  return Boolean(mapping?.aiGenerated) || code.startsWith('AI_');
 }
 
 function normalizeAiPreviewFieldKey(fieldKey = '') {
@@ -2752,6 +2756,28 @@ function isProductPriceSurveyTemplate(selectedTemplate) {
   return hasVendor && hasPriceSurvey;
 }
 
+
+function isComparisonEstimateTemplate(selectedTemplate) {
+  if (!selectedTemplate) return false;
+  if (isProductPriceSurveyTemplate(selectedTemplate)) return false;
+  const mapping = selectedTemplate.mapping || selectedTemplate.mappingJson || selectedTemplate.mapping_json || {};
+  const raw = [
+    getTemplateDisplayName(selectedTemplate),
+    selectedTemplate?.originalFileName,
+    selectedTemplate?.original_file_name,
+    selectedTemplate?.templateCode,
+    selectedTemplate?.template_code,
+    selectedTemplate?.templateType,
+    selectedTemplate?.template_type,
+    mapping?.layout,
+    mapping?.layoutType,
+    mapping?.templateType,
+  ].filter(Boolean).join(' ');
+  const normalized = compactText(raw).replace(/[()_\-·ㆍ\[\]{}]/g, '');
+  if (!normalized) return false;
+  return /(비교견적|견적비교|비교서|비교표|비교|견적서|견적|comparison|estimate|quote)/i.test(normalized);
+}
+
 function buildProductPriceVendorSlots(vendors, templateLayoutMode) {
   const cleanVendors = vendors.filter((vendor) => vendor?.name);
   const slotCount = templateLayoutMode === 'COMPACT_VENDOR_GROUPS'
@@ -2882,12 +2908,180 @@ function ProductPriceSurveyTemplatePreview({ table, issues, selectedTemplate, te
   );
 }
 
-function CompanyTemplatePreview({ table, issues, selectedTemplate, writerName, templateLayoutMode = 'PRESERVE_TEMPLATE', updateCell, removeRow, disabled }) {
+
+function ExcelTemplateOriginalGrid({ preview }) {
+  const columns = Array.isArray(preview?.columns) ? preview.columns : [];
+  const rows = Array.isArray(preview?.rows) ? preview.rows : [];
+  if (!columns.length || !rows.length) {
+    return <div className="rounded-2xl border border-dashed border-slate-300 bg-slate-50 px-4 py-12 text-center text-sm font-black text-slate-400">원본 엑셀 미리보기 데이터가 없습니다.</div>;
+  }
+  return (
+    <div className="rounded-[24px] border border-slate-200 bg-slate-100 p-3">
+      <div className="scroll-thin max-h-[54vh] overflow-auto rounded-2xl bg-white shadow-inner">
+        <div className="inline-block min-w-full p-2">
+          <table className="border-collapse bg-white text-xs">
+            <colgroup>
+              <col style={{ width: 46 }} />
+              {columns.map((col) => (
+                <col
+                  key={col.letter}
+                  style={{
+                    width: col.widthPx || 80,
+                    display: col.hidden ? 'none' : undefined
+                  }}
+                />
+              ))}
+            </colgroup>
+            <thead>
+              <tr>
+                <th className="sticky left-0 top-0 z-20 border border-slate-300 bg-slate-200 text-slate-500" style={{ height: 28 }} />
+                {columns.map((col) => (
+                  <th key={col.letter} className="sticky top-0 z-10 border border-slate-300 bg-slate-200 text-center font-black text-slate-600" style={{ height: 28, display: col.hidden ? 'none' : undefined }}>
+                    {col.letter}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row) => {
+                if (row.hidden) return null;
+                return (
+                  <tr key={row.rowNumber} style={{ height: row.heightPx || 28 }}>
+                    <th className="sticky left-0 z-10 border border-slate-300 bg-slate-200 px-2 text-center font-black text-slate-500">{row.rowNumber}</th>
+                    {(row.cells || []).map((cell) => {
+                      if (cell.isMergedHidden) return null;
+                      const style = cell.style || {};
+                      return (
+                        <td
+                          key={cell.address}
+                          rowSpan={cell.rowSpan && cell.rowSpan > 1 ? cell.rowSpan : undefined}
+                          colSpan={cell.colSpan && cell.colSpan > 1 ? cell.colSpan : undefined}
+                          title={`${cell.address}${cell.mergedRange ? ` (${cell.mergedRange})` : ''} ${cell.text || ''}`}
+                          className="overflow-hidden px-2 py-1 align-middle"
+                          style={{
+                            backgroundColor: style.backgroundColor || '#ffffff',
+                            color: style.color || '#0f172a',
+                            fontWeight: style.fontWeight || 500,
+                            fontStyle: style.italic ? 'italic' : 'normal',
+                            textDecoration: style.underline ? 'underline' : 'none',
+                            fontFamily: style.fontFamily || undefined,
+                            fontSize: `${Math.max(9, style.fontSize || 11)}px`,
+                            textAlign: style.textAlign || 'center',
+                            verticalAlign: style.verticalAlign || 'middle',
+                            borderTop: style.borderTop || '1px solid #e2e8f0',
+                            borderRight: style.borderRight || '1px solid #e2e8f0',
+                            borderBottom: style.borderBottom || '1px solid #e2e8f0',
+                            borderLeft: style.borderLeft || '1px solid #e2e8f0',
+                            whiteSpace: style.whiteSpace || 'nowrap',
+                            minWidth: 50,
+                            maxWidth: cell.colSpan && cell.colSpan > 1 ? 520 : 260
+                          }}
+                        >
+                          <span className={style.whiteSpace === 'normal' ? 'block break-words leading-snug' : 'block truncate'}>{cell.text}</span>
+                        </td>
+                      );
+                    })}
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+      {Array.isArray(preview.mergedCells) && preview.mergedCells.length > 0 && (
+        <div className="mt-3 flex flex-wrap items-center gap-2 text-[11px] font-bold text-slate-500">
+          <span className="rounded-full bg-white px-2.5 py-1 ring-1 ring-slate-200">병합 셀 {preview.mergedCells.length}개 반영</span>
+          <span className="rounded-full bg-white px-2.5 py-1 ring-1 ring-slate-200">원본 행/열 높이·너비 반영</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function RegisteredTemplateDataGrid({ table, issues = [], updateCell, removeRow, disabled }) {
+  const visibleColumns = getVisibleColumns(table.columns, table.rows);
+  return (
+    <div className="scroll-thin overflow-auto rounded-3xl border border-slate-200">
+      <table className="min-w-[920px] w-full border-collapse text-sm">
+        <thead className="sticky top-0 z-10 bg-slate-100 text-slate-600 shadow-sm">
+          <tr>
+            {visibleColumns.map((col) => (
+              <th key={col.key} className="border-b border-slate-200 px-3 py-3 text-left font-black align-top">
+                <span className="block min-w-[120px] truncate">{cleanTableColumnLabel(col.label || col.key)}</span>
+                <span className="mt-1 block truncate text-[10px] font-bold text-slate-400">{col.key}</span>
+              </th>
+            ))}
+            <th className="w-20 border-b border-slate-200 px-3 py-3">관리</th>
+          </tr>
+        </thead>
+        <tbody>
+          {(table.rows || []).map((row, rowIndex) => (
+            <tr key={rowIndex} className={issues.some((issue) => Number(issue.rowIndex) === rowIndex) ? 'bg-amber-50' : 'bg-white'}>
+              {visibleColumns.map((col) => (
+                <td key={col.key} className="border-b border-slate-100 p-1">
+                  <input value={row[col.key] ?? ''} onChange={(event) => updateCell?.(rowIndex, col.key, event.target.value)} disabled={disabled} className="w-full rounded-xl px-3 py-2 text-sm font-bold outline-none focus:bg-brand-50 focus:ring-2 focus:ring-brand-500 disabled:cursor-default disabled:text-slate-900" />
+                </td>
+              ))}
+              <td className="border-b border-slate-100 p-1"><button type="button" onClick={() => removeRow?.(rowIndex)} disabled={disabled} className="rounded-xl bg-rose-50 px-3 py-2 text-xs font-black text-rose-600 disabled:opacity-40">삭제</button></td>
+            </tr>
+          ))}
+          {(!table.rows || table.rows.length === 0) && <tr><td colSpan={visibleColumns.length + 1} className="px-4 py-12 text-center font-bold text-slate-400">행 추가 또는 파일 분석 후 수정할 수 있습니다.</td></tr>}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function GenericRegisteredTemplatePreview({ table, issues, selectedTemplate, templatePreview, templatePreviewLoading, templatePreviewError, updateCell, removeRow, disabled }) {
+  const hasIssues = issues.length > 0;
+  return (
+    <div className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-card">
+      <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+        <div>
+          <h4 className="text-xl font-black text-slate-950">등록 양식 미리보기</h4>
+          <p className="mt-1 text-sm text-slate-500">선택한 엑셀 원본 구조를 그대로 확인합니다. 비교견적서가 아닌 양식은 고정 비교표로 표시하지 않습니다.</p>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <Badge tone={hasIssues ? 'amber' : 'green'}>{hasIssues ? '확인 필요 행 포함' : '정상'}</Badge>
+          <Badge tone="slate">{getTemplateDisplayName(selectedTemplate) || '등록 양식'}</Badge>
+          <Badge tone="blue">일반 등록 양식</Badge>
+        </div>
+      </div>
+
+      <div className="mt-5">
+        {templatePreviewLoading && <div className="flex min-h-[360px] items-center justify-center rounded-[24px] border border-dashed border-slate-200 bg-slate-50 text-sm font-black text-slate-400">원본 엑셀 양식 미리보기를 불러오는 중입니다.</div>}
+        {!templatePreviewLoading && templatePreview && <ExcelTemplateOriginalGrid preview={templatePreview} />}
+        {!templatePreviewLoading && !templatePreview && (
+          <div className="rounded-[24px] border border-dashed border-slate-300 bg-slate-50 px-4 py-12 text-center">
+            <p className="text-sm font-black text-slate-600">원본 엑셀 미리보기를 표시할 수 없습니다.</p>
+            <p className="mt-1 text-xs font-bold text-slate-400">{templatePreviewError || '템플릿 파일 경로 또는 ai-server 미리보기 API를 확인하세요.'}</p>
+          </div>
+        )}
+      </div>
+
+      <div className="mt-5 rounded-3xl border border-slate-200 bg-slate-50 p-4">
+        <div className="mb-3 flex flex-col gap-1 lg:flex-row lg:items-end lg:justify-between">
+          <div>
+            <p className="text-sm font-black text-slate-900">추출 데이터 편집</p>
+            <p className="mt-1 text-xs font-bold text-slate-500">컬럼 구조는 원본 템플릿 매핑을 따릅니다. 여기서는 값과 행만 수정합니다.</p>
+          </div>
+          <Badge tone="slate">컬럼 변경 잠금</Badge>
+        </div>
+        <RegisteredTemplateDataGrid table={table} issues={issues} updateCell={updateCell} removeRow={removeRow} disabled={disabled} />
+      </div>
+    </div>
+  );
+}
+
+function CompanyTemplatePreview({ table, issues, selectedTemplate, writerName, templateLayoutMode = 'PRESERVE_TEMPLATE', templatePreview = null, templatePreviewLoading = false, templatePreviewError = '', updateCell, removeRow, disabled }) {
   if (isAiGeneratedTemplate(selectedTemplate)) {
     return <AiGeneratedTemplatePreview table={table} issues={issues} selectedTemplate={selectedTemplate} writerName={writerName} updateCell={updateCell} removeRow={removeRow} disabled={disabled} />;
   }
   if (isProductPriceSurveyTemplate(selectedTemplate)) {
     return <ProductPriceSurveyTemplatePreview table={table} issues={issues} selectedTemplate={selectedTemplate} templateLayoutMode={templateLayoutMode} updateCell={updateCell} removeRow={removeRow} disabled={disabled} />;
+  }
+  if (!isComparisonEstimateTemplate(selectedTemplate)) {
+    return <GenericRegisteredTemplatePreview table={table} issues={issues} selectedTemplate={selectedTemplate} templatePreview={templatePreview} templatePreviewLoading={templatePreviewLoading} templatePreviewError={templatePreviewError} updateCell={updateCell} removeRow={removeRow} disabled={disabled} />;
   }
 
   const vendors = inferPreviewVendors(table);
@@ -2998,8 +3192,15 @@ function designBaseColumns(design = {}, table = {}) {
 
 function DesignCandidatePreview({ table, issues, design, writerName, updateCell, removeRow, disabled, updateColumnLabel, removeColumn }) {
   const layout = String(design?.layout || '').toUpperCase();
+  const layoutType = String(design?.layoutType || design?.layout_type || '').toUpperCase();
   const designId = String(design?.designId || '').toUpperCase();
-  if (layout.includes('DYNAMIC_VENDOR') || layout.includes('VENDOR_COMPARE') || designId.includes('VENDOR_COMPARE')) {
+  if (layoutType === 'VENDOR_COMPARISON_REVIEW_FORM' || layout.includes('VENDOR_COMPARISON_REVIEW') || designId.includes('VENDOR_COMPARE_REVIEW')) {
+    return <DesignVendorComparisonReviewPreview table={table} issues={issues} design={design} writerName={writerName} updateCell={updateCell} removeRow={removeRow} disabled={disabled} />;
+  }
+  if (layoutType === 'REVIEW_OPINION_FORM' || layout.includes('REVIEW_OPINION') || designId.includes('REVIEW_OPINION')) {
+    return <DesignReviewOpinionPreview table={table} issues={issues} design={design} writerName={writerName} updateCell={updateCell} removeRow={removeRow} disabled={disabled} />;
+  }
+  if (layout.includes('DYNAMIC_VENDOR') || layoutType === 'VENDOR_COMPARISON_TABLE' || (layout.includes('VENDOR_COMPARE') && !layout.includes('REVIEW')) || (designId.includes('VENDOR_COMPARE') && !designId.includes('REVIEW'))) {
     return <DesignVendorComparePreview table={table} issues={issues} design={design} writerName={writerName} updateCell={updateCell} removeRow={removeRow} disabled={disabled} />;
   }
   if (layout.includes('ESTIMATE') || designId.includes('ESTIMATE')) {
@@ -3014,7 +3215,7 @@ function DesignCandidatePreview({ table, issues, design, writerName, updateCell,
   if (layout.includes('OFFICIAL')) {
     return <DesignOfficialLetterPreview table={table} issues={issues} design={design} writerName={writerName} updateCell={updateCell} removeRow={removeRow} disabled={disabled} />;
   }
-  if (layout.includes('REPORT') || layout.includes('SECTION') || layout.includes('SUMMARY') || layout.includes('APPROVAL') || layout.includes('HEADER_TABLE')) {
+  if (layout.includes('REPORT') || layoutType.includes('REPORT') || layout.includes('SECTION') || layout.includes('SUMMARY') || layout.includes('APPROVAL') || layout.includes('HEADER_TABLE')) {
     return <DesignReportPreview table={table} issues={issues} design={design} writerName={writerName} updateCell={updateCell} removeRow={removeRow} disabled={disabled} updateColumnLabel={updateColumnLabel} removeColumn={removeColumn} />;
   }
   return (
@@ -3245,6 +3446,93 @@ function DesignReportPreview({ table, issues, design, writerName, updateCell, re
   );
 }
 
+
+function DesignReviewOpinionPreview({ table, issues, design, writerName, updateCell, removeRow, disabled }) {
+  const rows = table.rows || [];
+  const first = rows[0] || {};
+  return (
+    <div className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-card">
+      <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+        <div>
+          <h4 className="text-xl font-black text-slate-950">검토 의견서 양식 미리보기</h4>
+          <p className="mt-1 text-sm text-slate-500">보고서와 다른 검토 의견서 전용 구조입니다. 확인사항, 이슈, 검토의견, 보완요청을 분리합니다.</p>
+        </div>
+        <Badge tone={issues.length ? 'amber' : 'blue'}>{issues.length ? '확인 필요 포함' : '검토 의견서'}</Badge>
+      </div>
+
+      <div className="mt-5 rounded-[28px] border border-slate-300 bg-white p-6 shadow-sm">
+        <input
+          value={first.report_title || first.document_title || design?.title || '검토 의견서'}
+          onChange={(event) => updateCell?.(0, 'report_title', event.target.value)}
+          disabled={disabled}
+          className="w-full rounded-xl border-0 border-b-2 border-slate-300 px-3 py-3 text-center text-3xl font-black tracking-[0.18em] outline-none focus:border-brand-400"
+        />
+        <div className="mt-5 grid grid-cols-1 overflow-hidden rounded-2xl border border-slate-300 text-sm font-bold md:grid-cols-4">
+          <div className="bg-slate-100 px-3 py-2 text-center font-black">작성일</div>
+          <div className="border-b border-slate-300 px-3 py-2 md:border-b-0 md:border-r">{formatPreviewDate()}</div>
+          <div className="bg-slate-100 px-3 py-2 text-center font-black">작성자</div>
+          <div className="px-3 py-2">{writerName || '-'}</div>
+          <div className="bg-slate-100 px-3 py-2 text-center font-black">문서구분</div>
+          <input value={first.document_type || first.documentType || '내부 검토'} onChange={(e) => updateCell?.(0, 'document_type', e.target.value)} disabled={disabled} className="border-b border-slate-300 px-3 py-2 outline-none focus:bg-brand-50 md:border-b-0 md:border-r" />
+          <div className="bg-slate-100 px-3 py-2 text-center font-black">검토상태</div>
+          <input value={first.status || '확인 필요'} onChange={(e) => updateCell?.(0, 'status', e.target.value)} disabled={disabled} className="px-3 py-2 outline-none focus:bg-brand-50" />
+        </div>
+
+        <div className="mt-5 grid grid-cols-1 gap-3">
+          <ReportSection number="1" title="검토 대상" value={first.document_title || first.report_title || ''} onChange={(v) => updateCell?.(0, 'document_title', v)} disabled={disabled} placeholder="원문 문서명 또는 검토 대상을 입력하세요." />
+          <ReportSection number="2" title="주요 확인사항" value={first.summary || first.content || ''} onChange={(v) => updateCell?.(0, 'summary', v)} disabled={disabled} placeholder="원문에서 확인된 주요 내용을 입력하세요." />
+          <ReportSection number="3" title="주요 이슈" value={first.issue_summary || first.review_result || ''} onChange={(v) => updateCell?.(0, 'issue_summary', v)} disabled={disabled} placeholder="보완 또는 확인이 필요한 이슈를 입력하세요." />
+          <ReportSection number="4" title="검토 의견" value={first.review_opinion || first.review_result || first.issue_summary || ''} onChange={(v) => updateCell?.(0, 'review_opinion', v)} disabled={disabled} placeholder="검토 의견을 입력하세요." />
+          <ReportSection number="5" title="보완/조치 요청" value={first.action_plan || ''} onChange={(v) => updateCell?.(0, 'action_plan', v)} disabled={disabled} placeholder="원문에 명시된 보완 또는 조치사항을 입력하세요." />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function DesignVendorComparisonReviewPreview({ table, issues, design, writerName, updateCell, removeRow, disabled }) {
+  const rows = table.rows || [];
+  const first = rows[0] || {};
+  return (
+    <div className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-card">
+      <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+        <div>
+          <h4 className="text-xl font-black text-slate-950">업체별 단가 비교 검토보고서 미리보기</h4>
+          <p className="mt-1 text-sm text-slate-500">업체 비교표가 아니라 비교 검토보고서 전용 문서형 구조입니다. 비교 기준, 요약, 검토의견, 확인사항을 나눕니다.</p>
+        </div>
+        <Badge tone={issues.length ? 'amber' : 'blue'}>{issues.length ? '확인 필요 포함' : '비교 검토보고서'}</Badge>
+      </div>
+
+      <div className="mt-5 rounded-[28px] border border-slate-300 bg-white p-6 shadow-sm">
+        <div className="grid grid-cols-1 gap-4 lg:grid-cols-[1fr_260px]">
+          <div>
+            <p className="text-xs font-black text-slate-500">검토보고서 제목</p>
+            <input
+              value={first.report_title || first.document_title || design?.title || '업체별 단가 비교 검토보고서'}
+              onChange={(event) => updateCell?.(0, 'report_title', event.target.value)}
+              disabled={disabled}
+              className="mt-2 w-full rounded-xl border border-slate-200 px-4 py-3 text-2xl font-black text-slate-950 outline-none focus:ring-2 focus:ring-brand-400"
+            />
+          </div>
+          <div className="overflow-hidden rounded-2xl border border-slate-300 text-center text-xs font-black">
+            <div className="grid grid-cols-2 border-b border-slate-300"><div className="bg-slate-100 py-2">작성일</div><div className="py-2">{formatPreviewDate()}</div></div>
+            <div className="grid grid-cols-2 border-b border-slate-300"><div className="bg-slate-100 py-2">작성자</div><div className="py-2">{writerName || '-'}</div></div>
+            <div className="grid grid-cols-2"><div className="bg-slate-100 py-2">확인행</div><div className="py-2">{rows.length}건</div></div>
+          </div>
+        </div>
+
+        <div className="mt-5 grid grid-cols-1 gap-3">
+          <ReportSection number="1" title="검토 목적" value={firstNonEmpty(sanitizeBusinessPurpose(first.report_purpose), sanitizeBusinessPurpose(first.purpose), inferBusinessPurposeFromRow(first))} onChange={(v) => updateCell?.(0, 'report_purpose', v)} disabled={disabled} placeholder="원문에 명시된 검토 목적을 입력하세요." />
+          <ReportSection number="2" title="비교/검토 기준" value={first.comparison_basis || first.criteria || first.summary || ''} onChange={(v) => updateCell?.(0, 'comparison_basis', v)} disabled={disabled} placeholder="단가, 금액, 업체, 검토 기준을 입력하세요." />
+          <ReportSection number="3" title="주요 비교 내용" value={first.summary || first.content || ''} onChange={(v) => updateCell?.(0, 'summary', v)} disabled={disabled} placeholder="원문 기준 비교 내용을 입력하세요." />
+          <ReportSection number="4" title="검토 결과/의견" value={first.issue_summary || first.review_result || first.review_opinion || ''} onChange={(v) => updateCell?.(0, 'issue_summary', v)} disabled={disabled} placeholder="비교 검토 결과를 입력하세요." />
+          <ReportSection number="5" title="확인 및 조치사항" value={first.action_plan || ''} onChange={(v) => updateCell?.(0, 'action_plan', v)} disabled={disabled} placeholder="원문에 명시된 확인 또는 조치사항을 입력하세요." />
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function DesignMeetingPreview({ table, issues, design, writerName, updateCell, removeRow, disabled }) {
   const rows = table.rows || [];
   const first = rows[0] || {};
@@ -3392,8 +3680,8 @@ function EditableGrid({ table, issues = [], updateCell, addRow, removeRow, addCo
       {showToolbar && (
         <div className="mb-3 flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
           <div className="flex flex-wrap items-center gap-2">
-            <button type="button" onClick={addRow} className="rounded-2xl bg-slate-100 px-4 py-2.5 text-xs font-black text-slate-700 hover:bg-slate-200">행 추가</button>
-            <button type="button" onClick={addColumn} className="rounded-2xl bg-slate-100 px-4 py-2.5 text-xs font-black text-slate-700 hover:bg-slate-200">컬럼 추가</button>
+            <button type="button" onClick={addRow} disabled={disabled} className="rounded-2xl bg-slate-100 px-4 py-2.5 text-xs font-black text-slate-700 hover:bg-slate-200 disabled:opacity-50">행 추가</button>
+            <button type="button" onClick={addColumn} disabled={disabled} className="rounded-2xl bg-slate-100 px-4 py-2.5 text-xs font-black text-slate-700 hover:bg-slate-200 disabled:opacity-50">컬럼 추가</button>
           </div>
           <button disabled={disabled} onClick={saveTable} className="rounded-2xl bg-gradient-to-r from-brand-500 to-brand-400 px-4 py-2.5 text-xs font-black text-white shadow-glow hover:from-brand-600 hover:to-brand-500 disabled:from-slate-300 disabled:to-slate-300">
             수정 저장
@@ -3410,9 +3698,10 @@ function EditableGrid({ table, issues = [], updateCell, addRow, removeRow, addCo
                     <input
                       value={cleanTableColumnLabel(col.label || col.key)}
                       onChange={(e) => updateColumnLabel?.(col.key, e.target.value)}
-                      className="min-w-0 flex-1 rounded-lg bg-white px-2 py-1 text-xs font-black outline-none ring-1 ring-slate-200 focus:ring-brand-400"
+                      disabled={disabled}
+                      className="min-w-0 flex-1 rounded-lg bg-white px-2 py-1 text-xs font-black outline-none ring-1 ring-slate-200 focus:ring-brand-400 disabled:opacity-70"
                     />
-                    <button type="button" onClick={() => removeColumn?.(col.key)} className="rounded-lg bg-rose-50 px-2 py-1 text-[11px] font-black text-rose-600">×</button>
+                    <button type="button" onClick={() => removeColumn?.(col.key)} disabled={disabled} className="rounded-lg bg-rose-50 px-2 py-1 text-[11px] font-black text-rose-600 disabled:opacity-40">×</button>
                   </div>
                   <p className="mt-1 truncate text-[10px] font-bold text-slate-400">{col.key}</p>
                 </th>
@@ -3425,10 +3714,10 @@ function EditableGrid({ table, issues = [], updateCell, addRow, removeRow, addCo
               <tr key={rowIndex} className={issues.some((issue) => Number(issue.rowIndex) === rowIndex) ? 'bg-amber-50' : 'bg-white'}>
                 {visibleColumns.map((col) => (
                   <td key={col.key} className="border-b border-slate-100 p-1">
-                    <input value={row[col.key] ?? ''} onChange={(e) => updateCell(rowIndex, col.key, e.target.value)} className="w-full rounded-xl px-3 py-2 text-sm font-bold outline-none focus:bg-brand-50 focus:ring-2 focus:ring-brand-500" />
+                    <input value={row[col.key] ?? ''} onChange={(e) => updateCell(rowIndex, col.key, e.target.value)} disabled={disabled} className="w-full rounded-xl px-3 py-2 text-sm font-bold outline-none focus:bg-brand-50 focus:ring-2 focus:ring-brand-500 disabled:opacity-70" />
                   </td>
                 ))}
-                <td className="border-b border-slate-100 p-1"><button onClick={() => removeRow(rowIndex)} className="rounded-xl bg-rose-50 px-3 py-2 text-xs font-black text-rose-600">삭제</button></td>
+                <td className="border-b border-slate-100 p-1"><button onClick={() => removeRow(rowIndex)} disabled={disabled} className="rounded-xl bg-rose-50 px-3 py-2 text-xs font-black text-rose-600 disabled:opacity-40">삭제</button></td>
               </tr>
             ))}
             {(!table.rows || table.rows.length === 0) && <tr><td colSpan={visibleColumns.length + 1} className="px-4 py-12 text-center font-bold text-slate-400">행 추가 또는 파일 분석 후 수정할 수 있습니다.</td></tr>}
@@ -3439,31 +3728,56 @@ function EditableGrid({ table, issues = [], updateCell, addRow, removeRow, addCo
   );
 }
 
-function ExcelPreview({ table, issues, outputMode, selectedTemplate, selectedDesign, writerName, templateLayoutMode, updateCell, addRow, removeRow, addColumn, removeColumn, updateColumnLabel, saveTable, disabled, candidateFields = [], onCandidateAction }) {
+
+function DirectTableEditPanel({ table, issues = [], updateCell, addRow, removeRow, addColumn, removeColumn, updateColumnLabel, saveTable, disabled, outputMode }) {
+  const isCompanyTemplateMode = outputMode === 'COMPANY_TEMPLATE';
+  return (
+    <div className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-card">
+      <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+        <div>
+          <h4 className="text-xl font-black text-slate-950">데이터 표 직접 편집</h4>
+          <p className="mt-1 text-sm text-slate-500">
+            컬럼 관리와 같은 기준의 원본 데이터 표입니다. {isCompanyTemplateMode ? '아래 회사 양식 미리보기에는 매핑된 필드가 적용됩니다.' : 'AI 추천양식도 이 표에서 셀·행·컬럼을 수정할 수 있습니다.'}
+          </p>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <Badge tone={issues.length ? 'amber' : 'green'}>{issues.length ? `확인 필요 ${issues.length}건` : '정상'}</Badge>
+          {isCompanyTemplateMode && <Badge tone="blue">자사 양식 적용 전 데이터</Badge>}
+        </div>
+      </div>
+      <EditableGrid
+        table={table}
+        issues={issues}
+        updateCell={updateCell}
+        addRow={addRow}
+        removeRow={removeRow}
+        addColumn={addColumn}
+        removeColumn={removeColumn}
+        updateColumnLabel={updateColumnLabel}
+        saveTable={saveTable}
+        disabled={disabled}
+        compact={false}
+        showToolbar={false}
+      />
+    </div>
+  );
+}
+
+function ExcelPreview({ table, issues = [], outputMode, selectedTemplate, selectedDesign, writerName, templateLayoutMode, templatePreview = null, templatePreviewLoading = false, templatePreviewError = '', updateCell, addRow, removeRow, addColumn, removeColumn, updateColumnLabel, saveTable, disabled, candidateFields = [], onCandidateAction }) {
   const isRegisteredTemplate = outputMode === 'COMPANY_TEMPLATE' && selectedTemplate;
   const activeDesign = !isRegisteredTemplate ? selectedDesign : null;
   return (
     <div className="space-y-4">
-      <PreviewEditToolbar table={table} addRow={addRow} addColumn={addColumn} removeColumn={removeColumn} updateColumnLabel={updateColumnLabel} saveTable={saveTable} disabled={disabled} candidateFields={candidateFields} onCandidateAction={onCandidateAction} />
+      <PreviewEditToolbar table={table} addRow={addRow} addColumn={addColumn} removeColumn={removeColumn} updateColumnLabel={updateColumnLabel} saveTable={saveTable} disabled={disabled} candidateFields={candidateFields} onCandidateAction={onCandidateAction} showColumnTools={true} />
       {isRegisteredTemplate ? (
-        <CompanyTemplatePreview table={table} issues={issues} selectedTemplate={selectedTemplate} writerName={writerName} templateLayoutMode={templateLayoutMode} updateCell={updateCell} removeRow={removeRow} disabled={disabled} />
+        <CompanyTemplatePreview table={table} issues={issues} selectedTemplate={selectedTemplate} writerName={writerName} templateLayoutMode={templateLayoutMode} templatePreview={templatePreview} templatePreviewLoading={templatePreviewLoading} templatePreviewError={templatePreviewError} updateCell={updateCell} removeRow={removeRow} disabled={disabled} />
       ) : activeDesign ? (
         <DesignCandidatePreview table={table} issues={issues} design={activeDesign} writerName={writerName} updateCell={updateCell} removeRow={removeRow} disabled={disabled} updateColumnLabel={updateColumnLabel} removeColumn={removeColumn} />
-      ) : (
-        <div className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-card">
-          <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-            <div>
-              <h4 className="text-xl font-black text-slate-950">AI/자유 편집 미리보기</h4>
-              <p className="mt-1 text-sm text-slate-500">추출된 데이터를 엑셀 형태로 바로 수정합니다.</p>
-            </div>
-            <Badge tone={issues.length ? 'amber' : 'green'}>{issues.length ? '확인 필요 행 포함' : '정상'}</Badge>
-          </div>
-          <EditableGrid table={table} issues={issues} updateCell={updateCell} addRow={addRow} removeRow={removeRow} addColumn={addColumn} removeColumn={removeColumn} updateColumnLabel={updateColumnLabel} saveTable={saveTable} disabled={disabled} compact={false} showToolbar={false} />
-        </div>
-      )}
+      ) : null}
     </div>
   );
 }
+
 
 function TableEditor({ table, updateCell, addRow, removeRow, addColumn, removeColumn, updateColumnLabel, saveTable, disabled, candidateFields = [], onCandidateAction }) {
   return (

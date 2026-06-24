@@ -13,7 +13,7 @@ from typing import Any, Callable, Dict, List, Tuple
 
 from fastapi import UploadFile
 
-from app.services.llm_client import call_local_llm_json, get_llm_config
+from app.services.llm_client import call_llm_json, get_llm_config
 from app.services.storage_service import repair_mojibake_filename, save_upload_file, validate_storage_path
 from app.services.unit_normalizer import clean_cell_text, enrich_row_units
 
@@ -664,15 +664,45 @@ def _request_vendor_terms_from_message(user_request: str) -> List[str]:
         # 공백으로 이어 쓴 업체명도 살리되, 일반 명령어 조각은 제거한다.
         for piece in re.split(r"\s+(?:랑|와|과|및)\s+|\s+", part):
             token = compact_text(piece)
-            if token and len(token) >= 2 and token not in stop:
+            if token and len(token) >= 2 and token not in stop and not _looks_like_work_item_term(token):
                 tokens.append(token)
         joined = compact_text(part)
-        if joined and len(joined) >= 3 and joined not in stop:
+        if joined and len(joined) >= 3 and joined not in stop and not _looks_like_work_item_term(joined):
             tokens.append(joined)
     # A회사/B회사 같은 별칭도 보존
     for m in re.finditer(r"[A-Za-z]\s*회사", text):
         tokens.append(compact_text(m.group(0)))
     return list(dict.fromkeys(tokens))
+
+
+
+_TEXT_WORK_ITEM_HINTS = ("설치", "포설", "배선", "조립", "제작", "철거", "교체", "시공", "공사", "공종", "항목")
+
+
+def _looks_like_work_item_term(term: str) -> bool:
+    token = compact_text(term)
+    if not token:
+        return False
+    return any(hint in token for hint in _TEXT_WORK_ITEM_HINTS)
+
+
+def _strip_corp_prefix(name: str) -> str:
+    value = clean_cell_text(name)
+    value = re.sub(r"^(?:㈜|\(주\)|주식회사)\s*", "", value)
+    value = re.sub(r"\s*(?:㈜)$", "", value)
+    return value.strip()
+
+
+def _text_report_vendor_match_terms(vendor: Dict[str, Any]) -> List[str]:
+    name = clean_cell_text(vendor.get('name'))
+    alias = clean_cell_text(vendor.get('alias'))
+    stripped = _strip_corp_prefix(name)
+    terms = [compact_text(name), compact_text(stripped), compact_text(alias)]
+    # 문장 안에서는 'B회사 ㈜대한전기설비'처럼 나오고, 사용자 요청은 보통 '대한전기설비'처럼 입력된다.
+    if stripped and name != stripped:
+        terms.append(compact_text(f"㈜{stripped}"))
+        terms.append(compact_text(f"(주){stripped}"))
+    return [term for term in dict.fromkeys(terms) if term and len(term) >= 2]
 
 
 def _request_has_explicit_vendor_mention(vendor_columns: List[Dict[str, Any]], user_request: str) -> bool:
@@ -1640,11 +1670,14 @@ def extract_text_vendor_total_rows(text: str) -> List[Dict[str, Any]]:
 
 
 def _extract_requested_quantity_value(user_request: str) -> Tuple[str, str]:
-    """사용자 요청의 수량을 추출한다. 예: '각 수량 50개' -> ('50', '개')."""
+    """사용자 요청의 작업 수량을 추출한다. 예: '각 수량 50개', '량은 50개' -> ('50', '개').
+
+    '2개 업체' 같은 업체 수는 수량으로 오인하지 않는다.
+    """
     text = str(user_request or "")
     patterns = [
-        r"(?:각\s*)?(?:수량|수량은)\s*(?P<qty>[0-9]+(?:\.[0-9]+)?)\s*(?P<unit>개|대|식|m|M|EA|ea|본|장|조)?",
-        r"(?P<qty>[0-9]+(?:\.[0-9]+)?)\s*(?P<unit>개|대|식|m|M|EA|ea|본|장|조)\s*(?:씩|로)?",
+        r"(?:각\s*)?(?:수량|량)\s*(?:은|는|:)?\s*(?P<qty>[0-9]+(?:\.[0-9]+)?)\s*(?P<unit>개|대|식|m|M|EA|ea|본|장|조)?",
+        r"(?P<qty>[0-9]+(?:\.[0-9]+)?)\s*(?P<unit>개|대|식|m|M|EA|ea|본|장|조)\s*(?:씩|로)?(?!\s*(?:업체|회사|거래처|개사))",
     ]
     for pattern in patterns:
         m = re.search(pattern, text)
@@ -1699,19 +1732,33 @@ def _select_text_report_vendors(text: str, user_request: str) -> List[Dict[str, 
     request_terms = _request_vendor_terms_from_message(user_request)
     compact_request = compact_text(user_request)
     selected: List[Dict[str, Any]] = []
+
+    # 1) 실제 업체명/별칭을 원문 요청에 직접 대조한다. ㈜, (주), 주식회사 유무 차이를 모두 허용한다.
     for vendor in all_vendors:
-        vendor_terms = [compact_text(vendor.get('name')), compact_text(vendor.get('alias'))]
-        if any(term and term in compact_request for term in vendor_terms):
+        vendor_terms = _text_report_vendor_match_terms(vendor)
+        if compact_request and any(term and term in compact_request for term in vendor_terms):
             selected.append(vendor)
             continue
         for req in request_terms:
             if any(req and term and (req in term or term in req) for term in vendor_terms):
                 selected.append(vendor)
                 break
+
     if selected:
-        return selected
+        deduped: List[Dict[str, Any]] = []
+        seen = set()
+        for vendor in selected:
+            ident = compact_text(vendor.get('name') or vendor.get('alias'))
+            if ident in seen:
+                continue
+            seen.add(ident)
+            deduped.append(vendor)
+        return deduped
+
+    # 2) 업체명이 전혀 없고 '2개 업체'처럼 수량만 있는 경우에만 앞에서부터 N개를 사용한다.
     requested_count = _requested_vendor_count(user_request)
-    if requested_count:
+    has_vendor_like_text = bool(request_terms)
+    if requested_count and not has_vendor_like_text:
         return all_vendors[:requested_count]
     return all_vendors
 
@@ -1781,11 +1828,11 @@ def extract_text_vendor_item_rows(text: str, user_request: str = "") -> Tuple[Li
                 if c_name and direct_name and (c_name in direct_name or direct_name in c_name):
                     matched_price = price
                     break
-            vendor_prices[name] = matched_price if matched_price else "확인 필요"
+            vendor_prices[name] = matched_price if matched_price else "원문 미기재"
             if request_qty and matched_price:
                 vendor_amounts[name] = int(float(request_qty) * to_number(matched_price))
             elif request_qty:
-                vendor_amounts[name] = "확인 필요"
+                vendor_amounts[name] = "원문 미기재"
         code = clean_cell_text(m.group('code'))
         key = compact_text(f"{code}{full_item}{low_vendor}{high_vendor}")
         if key in seen:
@@ -1796,8 +1843,8 @@ def extract_text_vendor_item_rows(text: str, user_request: str = "") -> Tuple[Li
             remark_parts.append(f"사용자 요청 수량 {request_qty}{request_unit or ''} 적용")
         if request_unit and clean_cell_text(m.group('unit')) and compact_text(request_unit) != compact_text(m.group('unit')):
             remark_parts.append(f"원문 단위 {clean_cell_text(m.group('unit'))}와 요청 단위 {request_unit} 확인 필요")
-        if any(value == "확인 필요" for value in vendor_prices.values()):
-            remark_parts.append("원문에 해당 업체 단가가 직접 제시되지 않은 칸은 확인 필요")
+        if any(value == "원문 미기재" for value in vendor_prices.values()):
+            remark_parts.append("원문에 해당 업체 단가가 직접 제시되지 않은 칸은 원문 미기재로 표시")
         rows.append(enrich_row_units({
             "construction_code": code,
             "item_name": item_name,
@@ -1820,21 +1867,51 @@ def build_text_vendor_comparison_item_table(text: str, user_request: str = "") -
     rows, selected_vendors = extract_text_vendor_item_rows(text, user_request=user_request)
     if not rows:
         return None
+
+    vendor_names: List[str] = []
+    for vendor in selected_vendors or []:
+        name = clean_cell_text(vendor.get('name'))
+        if name and name not in vendor_names:
+            vendor_names.append(name)
+    if not vendor_names:
+        for row in rows:
+            for name in (row.get('vendor_prices') or {}).keys():
+                clean_name = clean_cell_text(name)
+                if clean_name and clean_name not in vendor_names:
+                    vendor_names.append(clean_name)
+
     vendors_meta = []
-    for idx, vendor in enumerate(selected_vendors or []):
+    vendor_columns: List[Dict[str, Any]] = []
+    for idx, name in enumerate(vendor_names):
+        unit_price_key = _safe_compare_key(name, idx + 1, "unit_price")
+        amount_key = _safe_compare_key(name, idx + 1, "amount")
         vendors_meta.append({
             "index": idx,
-            "name": vendor.get('name'),
-            "vendorName": vendor.get('name'),
-            "label": vendor.get('name'),
+            "name": name,
+            "vendorName": name,
+            "label": name,
+            "unitPriceKey": unit_price_key,
+            "amountKey": amount_key,
         })
-    # 선택 업체가 없으면 첫 행의 vendor_prices 키를 기준으로 미리보기 업체를 구성한다.
-    if not vendors_meta and rows:
-        for idx, name in enumerate((rows[0].get('vendor_prices') or {}).keys()):
-            vendors_meta.append({"index": idx, "name": name, "vendorName": name, "label": name})
+        vendor_columns.extend([
+            {"key": unit_price_key, "label": f"{name} 단가"},
+            {"key": amount_key, "label": f"{name} 금액"},
+        ])
+
+    flattened_rows: List[Dict[str, Any]] = []
+    for row in rows:
+        out = dict(row)
+        vendor_prices = row.get('vendor_prices') or {}
+        vendor_amounts = row.get('vendor_amounts') or {}
+        for meta in vendors_meta:
+            name = meta["name"]
+            out[meta["unitPriceKey"]] = vendor_prices.get(name, "")
+            out[meta["amountKey"]] = vendor_amounts.get(name, "")
+        flattened_rows.append(out)
+
     return {
         "tableName": "서술형 업체별 단가 비교표",
-        "tableType": TEXT_VENDOR_COMPARISON_TABLE_TYPE,
+        "tableType": MULTI_VENDOR_COMPARE_TABLE_TYPE,
         "columns": [
             {"key": "construction_code", "label": "공종코드"},
             {"key": "item_name", "label": "품목명"},
@@ -1842,16 +1919,17 @@ def build_text_vendor_comparison_item_table(text: str, user_request: str = "") -
             {"key": "quantity", "label": "수량"},
             {"key": "unit", "label": "단위"},
             {"key": "standard_unit_price", "label": "표준단가"},
-            {"key": "lowest_vendor", "label": "최저업체"},
-            {"key": "highest_vendor", "label": "최고업체"},
-            {"key": "remark", "label": "검토의견"},
+            *vendor_columns,
+            {"key": "lowest_vendor", "label": "원문 최저업체"},
+            {"key": "highest_vendor", "label": "원문 최고업체"},
+            {"key": "remark", "label": "비고"},
         ],
-        "rows": rows,
+        "rows": flattened_rows,
         "meta": {
             "sourceMode": "text_only_vendor_comparison_item_rows",
             "vendors": vendors_meta,
             "templateLayoutMode": "COMPACT_VENDOR_GROUPS",
-            "notice": "표가 없는 보고서에서 공종별 최저/최고 견적 문장을 추출했습니다. 요청 업체 단가가 원문에 직접 없으면 확인 필요로 표시합니다.",
+            "notice": "표가 없는 보고서에서 공종별 최저/최고 견적 문장을 추출했습니다. 요청 업체 단가가 원문에 직접 없으면 원문 미기재로 표시합니다.",
             "requestedText": user_request or "",
         },
     }
@@ -3145,7 +3223,7 @@ def _build_llm_intent_prompt(user_request: str, file_summaries: List[Dict[str, A
 
 
 def infer_request_intent_by_rule(user_request: str, parsed_files: List[Dict[str, Any]], rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """로컬 LLM이 JSON을 실패해도 화면/표 생성이 멈추지 않도록 하는 결정론적 의도 분석."""
+    """Gemini JSON 응답이 실패해도 화면/표 생성이 멈추지 않도록 하는 결정론적 의도 분석."""
     request = str(user_request or "")
     compact = compact_text(request)
     if not compact:
@@ -3189,7 +3267,7 @@ async def interpret_request_with_llm(user_request: str, parsed_files: List[Dict[
     """
     rule_intent = infer_request_intent_by_rule(user_request, parsed_files, rows)
     cfg = get_llm_config()
-    if not cfg.enabled or cfg.provider != "ollama":
+    if not cfg.enabled:
         return rule_intent, ""
 
     file_summaries = []
@@ -3200,14 +3278,14 @@ async def interpret_request_with_llm(user_request: str, parsed_files: List[Dict[
             "pageCount": item.get("pageCount") or item.get("page_count"),
             "charCount": len(text),
             "rowCount": len(item.get("parsedRows") or item.get("rows") or []),
-            # 의도분석에서는 전체 본문을 넣지 않는다. 큰 PDF에서 qwen JSON 깨짐 방지.
+            # 의도분석에서는 전체 본문을 넣지 않는다. 큰 PDF에서 JSON 응답 불안정 방지.
             "textPreview": text[:80],
         })
 
     # 의도분석은 가볍게: 표 행 샘플 12개만 제공한다.
     prompt = _build_llm_intent_prompt(user_request, file_summaries, rows[:6])
     try:
-        result = await call_local_llm_json(prompt, cfg)
+        result = await call_llm_json(prompt, cfg)
         if not isinstance(result, dict):
             raise ValueError("LLM 의도분석 결과가 JSON 객체가 아닙니다.")
         result.setdefault("intent", rule_intent.get("intent") or "UNKNOWN")
@@ -3234,7 +3312,7 @@ def should_call_llm(user_request: str, combined_text: str, rows: List[Dict[str, 
     의도 보조·요약·검증 의견 생성이다. 표 추출/단가 계산은 규칙 파서가 유지한다.
     """
     cfg = get_llm_config()
-    if not cfg.enabled or cfg.provider != "ollama":
+    if not cfg.enabled:
         return False
     if not combined_text.strip() and not rows:
         return False
@@ -3356,7 +3434,7 @@ def build_llm_grounded_analysis_prompt(
 ) -> str:
     """이미 파서가 만든 표를 LLM이 해석/요약만 하도록 하는 작은 프롬프트.
 
-    큰 PDF 본문 전체를 넣지 않고 표 결과 일부만 넣어 qwen JSON 파싱 실패를 줄인다.
+    큰 PDF 본문 전체를 넣지 않고 표 결과 일부만 넣어 JSON 파싱 실패를 줄인다.
     LLM은 rows/columns를 다시 만들 수 없고, summary/keyValues/issues만 반환한다.
     """
     cfg = get_llm_config()
@@ -3433,15 +3511,17 @@ def normalize_llm_analysis_only(llm_result: Dict[str, Any], base_analysis: Dict[
             else:
                 merged[key] = str(value).strip()
 
-    kvs = merged.setdefault("keyValues", [])
     raw_kvs = raw_analysis.get("keyValues") if isinstance(raw_analysis.get("keyValues"), list) else []
+    grounded_llm_notes = []
     for kv in raw_kvs[:8]:
         if not isinstance(kv, dict):
             continue
         label = str(kv.get("label") or "").strip()
         value = str(kv.get("value") or "").strip()
         if label and value:
-            kvs.append({"label": label, "value": value})
+            grounded_llm_notes.append({"label": label, "value": value})
+    if grounded_llm_notes:
+        merged.setdefault("processingMeta", {})["llmReviewNotes"] = grounded_llm_notes
 
     merged.setdefault("llmMeta", llm_result.get("_llm", {}))
 
@@ -3525,9 +3605,9 @@ def normalize_llm_result(llm_result: Dict[str, Any], fallback_rows: List[Dict[st
     summary = str(analysis.get("summary") or "").strip()
     if not summary or ("견적" in summary and not normalized_rows and is_narrative_document(source_text)):
         if normalized_rows:
-            summary = f"문서에서 표 후보 {len(normalized_rows)}행을 추출했습니다. 추출값은 원문 근거 기준으로 확인이 필요합니다."
+            summary = _build_document_only_summary(source_text, table_type, len(normalized_rows), doc_type)
         else:
-            summary = "업로드 문서는 설명/명세 중심 문서로 보이며, 견적 단가표 형태의 품목·수량·단가 행은 확인되지 않았습니다."
+            summary = _build_document_only_summary(source_text, table_type, 0, doc_type)
 
     normalized_analysis = {
         "documentType": doc_type,
@@ -3589,14 +3669,50 @@ def _clean_business_sentence(value: Any) -> str:
     return text
 
 
+
+
+def _looks_like_system_or_processing_meta(value: Any) -> bool:
+    text = _clean_business_sentence(value)
+    if not text:
+        return False
+    meta_tokens = [
+        "첨부 파일", "파일 수", "총 페이지", "확인된 총 페이지", "페이지 수",
+        "표 후보", "파싱", "PyMuPDF", "pdfplumber", "PP-Structure", "PaddleOCR",
+        "OCR", "LLM", "ai-server", "저장 위치", "산출 방식", "요청 내용은",
+        "문서 분석", "엑셀 미리보기", "백그라운드", "분석 결과", "처리했습니다",
+    ]
+    return any(token.lower() in text.lower() for token in meta_tokens)
+
+
+def _document_only_sentences(items: List[str], limit: int = 8) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for item in items or []:
+        clean = _clean_business_sentence(item)
+        if not clean:
+            continue
+        if _looks_like_user_format_request(clean) or _looks_like_system_or_processing_meta(clean):
+            continue
+        if re.search(r"(보고서|검토보고|검토본)$", clean) or "/ 검토보고" in clean:
+            continue
+        key = compact_text(clean)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(clean)
+        if len(out) >= limit:
+            break
+    return out
+
 def _looks_like_user_format_request(value: Any) -> bool:
     text = _clean_business_sentence(value)
     if not text:
         return False
     prompt_tokens = [
-        "정리해줘", "작성해줘", "만들어줘", "써줘", "출력해줘",
-        "회사 업무보고서 형식", "회사 보고서 형식", "핵심 내용만",
-        "보고 목적·", "검토 결과·", "조치 계획 중심",
+        "정리해줘", "작성해줘", "만들어줘", "써줘", "출력해줘", "보여줘",
+        "보고서 형식", "보고서 형태", "보고서로", "업무보고서 형식",
+        "회사 업무보고서 형식", "회사 보고서 형식", "핵심 내용만", "요약과 검토내용",
+        "상세하게", "풍부하게", "보고 목적·", "검토 결과·", "조치 계획 중심",
         "원문에 없는 내용", "임의로 만들지", "확인 필요로 표시",
     ]
     return any(token in text for token in prompt_tokens)
@@ -3689,7 +3805,9 @@ def _extract_document_title_from_text(text: str, user_request: str = "") -> str:
 
 
 def _extract_key_topics(text: str, user_request: str = "", limit: int = 6) -> List[str]:
-    source = f"{user_request}\n{text[:6000]}"
+    # 보고서 본문 후보는 반드시 원문 텍스트에서만 뽑는다.
+    # 사용자 지시문(예: "보고서 형식으로 작성")은 제목/본문 근거로 사용하지 않는다.
+    source = str(text or "")[:6000]
     topics: List[str] = []
     patterns = [
         r"([가-힣A-Za-z0-9·ㆍ/()\-\s]{2,40})(?:\s*[:：]\s*)([가-힣A-Za-z0-9·ㆍ/()\-\s]{2,80})",
@@ -3717,8 +3835,9 @@ def _extract_key_topics(text: str, user_request: str = "", limit: int = 6) -> Li
 
 
 def _extract_action_candidates(text: str, issues: List[Dict[str, Any]], user_request: str = "", limit: int = 6) -> List[Dict[str, str]]:
-    source_lines = _split_business_sentences(f"{user_request}\n{text[:9000]}", limit=80)
-    action_words = ["조치", "처리", "미종결", "지시", "점검", "보완", "확인", "검토", "협의", "변경", "수립", "제출", "보고", "관리", "요청"]
+    # 조치계획 후보도 원문에 있는 조치/확인 문장만 사용한다.
+    source_lines = _split_business_sentences(str(text or "")[:9000], limit=80)
+    action_words = ["조치", "처리", "미종결", "지시", "점검", "보완", "협의", "변경", "수립", "제출", "요청", "재확인"]
     stop_exact = {"물량", "일정", "품질", "안전", "회의", "작업일보", "협력업체"}
     candidates: List[str] = []
     for line in source_lines:
@@ -3726,6 +3845,10 @@ def _extract_action_candidates(text: str, issues: List[Dict[str, Any]], user_req
         if compact in {compact_text(x) for x in stop_exact}:
             continue
         if len(line) < 8:
+            continue
+        if re.search(r"(보고서|검토보고|검토본)$", line) or "/ 검토보고" in line:
+            continue
+        if "조치 현황" in line and not any(word in line for word in ["미종결", "재확인", "보완", "처리", "지시", "계획"]):
             continue
         if any(word in line for word in action_words):
             candidates.append(line)
@@ -3747,7 +3870,7 @@ def _extract_action_candidates(text: str, issues: List[Dict[str, Any]], user_req
             continue
         seen.add(key)
         # 문장 자체가 너무 제목형이면 업무 지시문으로 바꾼다. 원문 항목명은 보존한다.
-        if not any(word in candidate for word in ["확인", "조치", "처리", "검토", "점검", "보완", "제출", "보고", "협의", "수립"]):
+        if not any(word in candidate for word in ["확인", "조치", "처리", "점검", "보완", "제출", "협의", "수립", "재확인"]):
             action_text = f"{candidate} 관련 처리 필요 여부 확인"
         else:
             action_text = candidate
@@ -3772,60 +3895,44 @@ def _make_business_drafts(
     file_profiles: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
     rows = table.get("rows") if isinstance(table, dict) and isinstance(table.get("rows"), list) else []
-    row_count = len(rows)
-    file_count = len(file_profiles or [])
-    title = _extract_document_title_from_text(combined_text, user_request)
-    topics = _extract_key_topics(combined_text, user_request=user_request, limit=6)
-    sentences = _split_business_sentences(combined_text, limit=6)
-    actions = _extract_action_candidates(combined_text, issues, user_request=user_request, limit=6)
+    title = _extract_document_title_from_text(combined_text, "")
+    topics = _document_only_sentences(_extract_key_topics(combined_text, user_request="", limit=8), limit=6)
+    sentences = _document_only_sentences(_split_business_sentences(combined_text, limit=10), limit=6)
+    actions = _extract_action_candidates(combined_text, issues, user_request="", limit=6)
 
-    request_text = _clean_business_sentence(user_request)
     purpose = _first_text(
         _safe_document_purpose(analysis.get("purpose")),
         _safe_document_purpose(analysis.get("documentPurpose") or analysis.get("document_purpose")),
         _infer_report_purpose_from_document(analysis, combined_text, topics),
     )
-    source_overview_parts = []
-    if file_count:
-        source_overview_parts.append(f"첨부 파일 {file_count}건을 기준으로 검토했습니다.")
-    page_total = sum(int(item.get("pageCount") or item.get("page_count") or 0) for item in file_profiles or [] if isinstance(item, dict))
-    if page_total:
-        source_overview_parts.append(f"확인된 총 페이지 수는 {page_total}페이지입니다.")
-    if row_count:
-        source_overview_parts.append(f"표 후보 {row_count}행을 함께 확인했습니다.")
-    else:
-        source_overview_parts.append("견적/단가표 형태의 반복 행은 별도로 확인되지 않았습니다.")
 
-    review_items = []
-    if topics:
-        review_items.extend(topics[:5])
-    if sentences:
-        review_items.extend(sentences[:3])
+    review_items = _document_only_sentences(sentences[:7], limit=7)
     if not review_items:
-        review_items.append(_clean_business_sentence(analysis.get("summary") or "첨부 문서의 본문 내용을 기준으로 검토했습니다."))
+        review_items = _document_only_sentences(topics[:7], limit=7)
+    if not review_items:
+        summary_candidate = _clean_business_sentence(analysis.get("summary") or "")
+        review_items = _document_only_sentences([summary_candidate], limit=3)
 
     issue_items = []
     if actions:
         issue_items.extend([item["action_item"] for item in actions[:4]])
     if issues:
         issue_items.extend([_clean_business_sentence(item.get("message") or item.get("fieldLabel") or "") for item in issues[:4]])
-    issue_items = [item for item in issue_items if item]
-    if not issue_items:
-        issue_items.append("원문에서 별도의 확정 결론보다 검토·확인 대상 중심의 내용이 확인됩니다.")
+    issue_items = _document_only_sentences(issue_items, limit=5)
 
     if actions:
-        action_plan = _bullet_text([f"{item['action_item']} / 담당자: {item['owner']} / 기한: {item['due_date']}" for item in actions])
+        action_plan = _bullet_text([item["action_item"] for item in actions])
     else:
-        action_plan = "• 원문에 명시된 후속 조치사항은 확인되지 않았습니다. 필요 시 담당자와 기한을 지정하여 후속 관리하세요."
+        action_plan = ""
 
     report = {
         "report_title": title if "보고" in title else f"{title} 보고서",
         "report_purpose": purpose,
-        "summary": _bullet_text([*source_overview_parts, *review_items[:5]]),
+        "summary": _bullet_text(review_items[:7]),
         "issue_summary": _bullet_text(issue_items[:5]),
         "review_opinion": _bullet_text(issue_items[:5]),
         "action_plan": action_plan,
-        "footer_note": "본 보고서는 첨부 문서에서 추출된 내용 기준의 초안입니다. 최종 제출 전 원문, 수치, 담당자, 기한을 확인하세요.",
+        "footer_note": "",
     }
 
     meeting = {
@@ -3834,7 +3941,7 @@ def _make_business_drafts(
         "meeting_place": "",
         "attendees": "",
         "agenda": _bullet_text([purpose, *topics[:4]], empty=purpose),
-        "discussion": _bullet_text([*source_overview_parts, *review_items[:5]]),
+        "discussion": _bullet_text(review_items[:5]),
         "decision": "원문에 명시된 최종 결정사항은 확인되지 않았습니다. 회의 확정 후 결정사항을 입력하세요.",
         "remark": "문서 분석 결과 기준 회의록 초안입니다. 참석자, 장소, 최종 결정사항은 회의 후 확정 입력하세요.",
         "action_items": actions,
@@ -3866,6 +3973,27 @@ def _make_business_drafts(
         "meeting": meeting,
         "officialLetter": official,
     }
+
+
+def _build_document_only_summary(combined_text: str, table_type: str, row_count: int, document_type: str) -> str:
+    sentences = _document_only_sentences(_split_business_sentences(combined_text, limit=8), limit=3)
+    if sentences:
+        return " ".join(sentences)[:700]
+    if table_type == MULTI_VENDOR_COMPARE_TABLE_TYPE:
+        return "업체별 견적 단가 비교 내용이 확인됩니다."
+    if table_type == TEXT_VENDOR_COMPARISON_TABLE_TYPE:
+        return "서술형 업체별 단가 비교 검토 내용이 확인됩니다."
+    if table_type in STANDARD_MARKET_TABLE_TYPES:
+        return "표준시장단가 관련 공종·규격·단가 내용이 확인됩니다."
+    if table_type in REFERENCE_TABLE_TYPES:
+        return "기준서 또는 지침서의 검토 항목과 확인 사항이 확인됩니다."
+    return f"{document_type or '업무 문서'}의 주요 내용이 확인됩니다."
+
+
+def _build_source_key_values(combined_text: str, file_profiles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    values = extract_key_values_from_text(combined_text)
+    # 파일 수, 페이지 수, OCR/LLM 등 처리 메타는 보고서/본문 후보에 넣지 않는다.
+    return values[:20]
 
 
 async def analyze_uploads(files: List[UploadFile], user_request: str, output_mode: str, template_id: str | None) -> Dict[str, Any]:
@@ -4025,38 +4153,20 @@ async def analyze_uploads(files: List[UploadFile], user_request: str, output_mod
     analysis = {
         "documentType": document_type,
         "purpose": profile.get("purpose") or "문서 데이터 엑셀화",
-        "summary": (
-            f"첨부 파일 {len(files)}개, 총 {total_page_count}페이지에서 PyMuPDF/pdfplumber/PP-Structure 기반으로 텍스트 {total_text_chars:,}자를 추출했습니다. "
-            + (f"업체 견적 단가를 비교하여 {len(all_rows)}행의 업체별 단가 비교표를 생성했습니다. " if table_type == MULTI_VENDOR_COMPARE_TABLE_TYPE else (f"표가 없는 서술형 비교보고서로 판단하여 총괄 업체별 비교 요약 {len(all_rows)}행을 추출했습니다. " if table_type == TEXT_VENDOR_COMPARISON_TABLE_TYPE else (f"표준시장단가 자료로 판단하여 공종별 단가 행 {len(all_rows)}행을 표로 정리했습니다. " if table_type in STANDARD_MARKET_TABLE_TYPES else (f"기준서/지침서 문서로 판단하여 원문에 있는 기준·단가·산정 문장 {len(all_rows)}행을 표로 정리했습니다. " if table_type in REFERENCE_TABLE_TYPES else f"표 후보 {len(all_rows)}행을 확인했습니다. "))))
-            + f"요청 내용은 '{user_request}'이며, 산출 방식은 {output_mode}입니다. "
-            + "원문에 근거가 없는 품목·금액·단가는 생성하지 않습니다."
-        ),
+        "summary": _build_document_only_summary(combined_text, table_type, len(all_rows), document_type),
         "confidence": profile.get("confidence") if profile else (0.86 if all_rows else 0.58),
         "fileProfiles": file_profiles,
-        "keyValues": [
-            *extract_key_values_from_text(combined_text),
-            *[
-                {
-                    "label": f"파일 {item.get('index')}: {item.get('roleLabel')}",
-                    "value": f"{item.get('fileName')} | {item.get('documentType')} | {item.get('summary')}"
-                }
-                for item in file_profiles[:8]
-            ],
-            {"label": "파일 수", "value": len(files)},
-            {"label": "PDF 총 페이지", "value": total_page_count},
-            {"label": "파싱 글자 수", "value": total_text_chars},
-            {"label": "OCR 사용", "value": "필요 시 PP-Structure/PaddleOCR"},
-            {"label": "표 후보 행", "value": len(all_rows)},
-            {"label": "저장 위치", "value": "ai-server"},
-            {"label": "LLM 모드", "value": get_llm_config().use_mode},
-            {"label": "LLM 의도분석", "value": ("사용" if (isinstance(llm_intent, dict) and llm_intent.get("_llmIntentUsed")) else ("규칙 보정" if llm_intent else ("실패" if llm_intent_error else "미사용")))},
-            *([{"label": "LLM 의도", "value": intent_name}] if intent_name else []),
-            *([{"label": "검색 키워드", "value": ", ".join(map(str, intent_keywords))}] if intent_keywords else []),
-            *([{"label": "LLM 의도분석 오류", "value": llm_intent_error[:120]}] if llm_intent_error else []),
-            *([{"label": "비교 모드", "value": "업체별 견적 단가 비교"}] if table_type == MULTI_VENDOR_COMPARE_TABLE_TYPE else []),
-            *([{"label": "비교 모드", "value": "서술형 업체별 비교보고서 요약"}] if table_type == TEXT_VENDOR_COMPARISON_TABLE_TYPE else []),
-            *([{"label": "비교 업체 수", "value": (multi_compare_table.get("meta", {}) or {}).get("vendorCount", 0)}] if multi_compare_table else []),
-        ],
+        "keyValues": _build_source_key_values(combined_text, file_profiles),
+        "processingMeta": {
+            "fileCount": len(files),
+            "totalPageCount": total_page_count,
+            "parsedTextChars": total_text_chars,
+            "rowCount": len(all_rows),
+            "outputMode": output_mode,
+            "llmIntentUsed": bool(isinstance(llm_intent, dict) and llm_intent.get("_llmIntentUsed")),
+            "llmIntent": intent_name or None,
+            "llmIntentError": llm_intent_error[:120] if llm_intent_error else "",
+        },
     }
     if multi_compare_table:
         table = multi_compare_table
@@ -4114,20 +4224,17 @@ async def analyze_uploads(files: List[UploadFile], user_request: str, output_mod
         cfg = get_llm_config()
         prompt = build_llm_grounded_analysis_prompt(user_request, analysis, table, issues, combined_text)
         try:
-            llm_result = await call_local_llm_json(prompt, cfg)
+            llm_result = await call_llm_json(prompt, cfg)
             analysis, merged_issues = normalize_llm_analysis_only(llm_result, analysis, issues)
             # 업체 비교표는 파서/계산 결과가 기준이다. LLM이 임의 확인사항을 늘리는 것은 막는다.
             if table_type not in {MULTI_VENDOR_COMPARE_TABLE_TYPE, "PRICE_COMPARISON", "STANDARD_MARKET_PRICE_TABLE"}:
                 issues = merged_issues
             llm_summary_used = True
             llm_used = True
-            model_name = f"ollama:{cfg.model}+grounded-parser"
-            prompt_version = "ollama-grounded-summary-v3"
-            analysis.setdefault("keyValues", []).extend([
-                {"label": "LLM 요약/검증", "value": "사용"},
-                {"label": "LLM 역할", "value": "의도분석·요약·검증 의견만 사용, 표 추출·단가 계산은 Python 파서"},
-                {"label": "모델", "value": cfg.model},
-            ])
+            model_name = f"gemini:{cfg.model}+grounded-parser"
+            prompt_version = "gemini-grounded-summary-v1"
+            analysis.setdefault("processingMeta", {})["llmSummaryUsed"] = True
+            analysis.setdefault("processingMeta", {})["llmModel"] = cfg.model
         except Exception as exc:  # noqa: BLE001
             llm_summary_error = str(exc)
             # 실패해도 분석 자체는 성공이다. 화면에는 오류 대신 fallback 상태만 남긴다.
@@ -4141,7 +4248,7 @@ async def analyze_uploads(files: List[UploadFile], user_request: str, output_mod
         cfg = get_llm_config()
         prompt = build_llm_prompt(user_request, output_mode, template_id, combined_text, all_rows)
         try:
-            llm_result = await call_local_llm_json(prompt, cfg)
+            llm_result = await call_llm_json(prompt, cfg)
             llm_analysis, llm_table, llm_issues = normalize_llm_result(llm_result, all_rows, table_type, combined_text, user_request)
             analysis = llm_analysis
             table = llm_table
@@ -4154,19 +4261,13 @@ async def analyze_uploads(files: List[UploadFile], user_request: str, output_mod
             issues = list(dedup.values())
             llm_structure_used = True
             llm_used = True
-            model_name = f"ollama:{cfg.model}"
-            prompt_version = "ollama-structure-v1"
-            analysis.setdefault("keyValues", [])
-            analysis["keyValues"].extend([
-                {"label": "LLM 구조화", "value": "사용"},
-                {"label": "모델", "value": cfg.model},
-            ])
+            model_name = f"gemini:{cfg.model}"
+            prompt_version = "gemini-structure-v1"
+            analysis.setdefault("processingMeta", {})["llmStructureUsed"] = True
+            analysis.setdefault("processingMeta", {})["llmModel"] = cfg.model
         except Exception as exc:  # noqa: BLE001
             llm_structure_error = str(exc)
-            analysis["summary"] += " LLM 구조화는 실패했지만 원문 파서 결과 기준으로 분석을 유지합니다."
-            analysis.setdefault("keyValues", []).extend([
-                {"label": "LLM 구조화", "value": "실패 → 원문 파서 결과 유지"},
-            ])
+            analysis.setdefault("processingMeta", {})["llmStructureError"] = llm_structure_error[:120]
 
     # LLM이 analysis 객체를 보정해도 업무 양식 초안은 유지한다.
     if "business_drafts" in locals():
@@ -4179,12 +4280,12 @@ async def analyze_uploads(files: List[UploadFile], user_request: str, output_mod
             meta["drafts"] = business_drafts
             table["meta"] = meta
 
-    # LLM/파서 역할을 화면에서 명확히 구분한다.
-    analysis.setdefault("keyValues", []).extend([
-        {"label": "표 추출", "value": "PyMuPDF/pdfplumber"},
-        {"label": "단가 계산", "value": "Python 규칙 파서"},
-        {"label": "LLM 직접 표 생성", "value": "미사용" if current_rows_for_llm else ("사용" if llm_structure_used else "실패 또는 불필요")},
-    ])
+    # 처리 방식 정보는 보고서 본문/keyValues에 섞지 않고 별도 메타에만 보관한다.
+    analysis.setdefault("processingMeta", {}).update({
+        "tableExtractionSource": "PyMuPDF/pdfplumber",
+        "priceCalculationSource": "Python rule parser",
+        "llmDirectTableGeneration": "unused" if current_rows_for_llm else ("used" if llm_structure_used else "skipped_or_failed"),
+    })
 
     # 표 행이 없는데 LLM/규칙 파서가 값을 만들지 못한 경우, 빈 표를 유지하고 확인 필요만 표시한다.
     current_rows = []
@@ -4227,12 +4328,12 @@ async def analyze_uploads(files: List[UploadFile], user_request: str, output_mod
         },
         "summaryAnalysis": {
             "used": llm_summary_used,
-            "source": f"ollama:{get_llm_config().model}" if llm_summary_used else "rule summary",
+            "source": f"gemini:{get_llm_config().model}" if llm_summary_used else "rule summary",
             "status": "LLM 사용" if llm_summary_used else ("파서 요약 유지" if current_rows else "미사용"),
         },
         "structureGeneration": {
             "used": llm_structure_used,
-            "source": f"ollama:{get_llm_config().model}" if llm_structure_used else "parser/fallback",
+            "source": f"gemini:{get_llm_config().model}" if llm_structure_used else "parser/fallback",
             "status": "LLM 사용" if llm_structure_used else "미사용 또는 실패 시 파서 유지",
         },
     }

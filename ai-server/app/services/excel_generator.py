@@ -14,7 +14,19 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter, column_index_from_string
 from openpyxl.worksheet.worksheet import Worksheet
 
-from app.services.layout_registry import LAYOUT_REGISTRY, normalize_layout_for_renderer, build_layout_candidates
+
+
+def request_output_intent(text: str = "") -> str:
+    raw = str(text or "")
+    wants_report = any(token in raw for token in ["보고서 형식", "보고서", "업무보고서", "검토보고서", "서술형", "문장형", "보고용"])
+    wants_table = any(token in raw for token in ["표로", "표 형태", "표 형식", "비교표", "단가표", "조사표", "테이블", "그리드", "엑셀 표"])
+    if wants_table and not wants_report:
+        return "TABLE"
+    if wants_table and re.search(r"표로|비교표|단가표|조사표|테이블|그리드|엑셀\s*표", raw):
+        return "TABLE"
+    if wants_report:
+        return "REPORT"
+    return "AUTO"
 
 BASE_DIR = Path(__file__).resolve().parents[2]
 RESULT_DIR = BASE_DIR / "storage" / "results"
@@ -39,6 +51,7 @@ DOCUMENT_TYPE_LABELS = {
     "MEETING_MINUTES": "회의록",
     "OFFICIAL_LETTER": "공문",
     "NORMAL_TABLE": "문서 정리표",
+    "CUSTOM_DOCUMENT_FORM": "문서 양식",
 }
 
 TYPE_KEYWORDS = {
@@ -242,6 +255,27 @@ def ignore_plain_status(value: Any) -> bool:
     return not text or text in {"정상", "완료", "없음", "해당없음", "확인"} or len(text) <= 2
 
 
+def looks_like_user_prompt_or_meta(value: Any) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    prompt_tokens = [
+        "정리해줘", "작성해줘", "만들어줘", "써줘", "출력해줘", "보여줘",
+        "보고서 형식", "보고서 형태", "보고서로", "요약과 검토내용", "상세하게", "풍부하게",
+    ]
+    meta_pattern = r"첨부\s*파일|총\s*페이지|확인된\s*총\s*페이지|표\s*후보|PyMuPDF|pdfplumber|PP-Structure|PaddleOCR|OCR|LLM|ai-server|저장\s*위치|산출\s*방식|요청\s*내용은|백그라운드|엑셀\s*미리보기"
+    return any(token in text for token in prompt_tokens) or bool(re.search(meta_pattern, text, re.I))
+
+
+def document_only_text(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text or looks_like_user_prompt_or_meta(text):
+        return ""
+    lines = [line.strip() for line in re.split(r"\r?\n", text) if line.strip()]
+    clean_lines = [line for line in lines if not looks_like_user_prompt_or_meta(line)]
+    return "\n".join(clean_lines)
+
+
 def build_report_first_row(payload: Dict[str, Any], rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     first = rows[0] if rows else {}
     analysis = get_payload_analysis(payload)
@@ -251,12 +285,12 @@ def build_report_first_row(payload: Dict[str, Any], rows: List[Dict[str, Any]]) 
         issue_value = first_text(report.get("issue_summary"), report.get("review_result"), report.get("review_opinion"))
     return {
         **first,
-        "report_title": first_text(first.get("report_title"), first.get("document_title"), report.get("report_title"), report.get("title"), "업무 보고서"),
-        "report_purpose": first_text(first.get("report_purpose"), first.get("purpose"), report.get("report_purpose"), report.get("purpose"), analysis.get("purpose"), "첨부 문서의 주요 내용을 업무 보고서 형식으로 정리합니다."),
-        "summary": first_text(first.get("summary"), first.get("content"), report.get("summary"), analysis.get("summary")),
-        "issue_summary": first_text(issue_value, "원문 기준으로 추가 확인이 필요한 항목은 담당자가 확인해야 합니다."),
-        "action_plan": first_text(first.get("action_plan"), report.get("action_plan"), "원문에 명시된 후속 조치사항이 없으면 담당자와 기한을 지정한 뒤 보완 여부를 확인하세요."),
-        "footer_note": first_text(first.get("footer_note"), report.get("footer_note"), "본 보고서는 첨부 문서에서 추출된 내용 기준의 초안입니다. 최종 제출 전 원문, 수치, 담당자, 기한을 확인하세요."),
+        "report_title": first_text(document_only_text(first.get("report_title")), document_only_text(first.get("document_title")), document_only_text(report.get("report_title")), document_only_text(report.get("title")), "업무 보고서"),
+        "report_purpose": first_text(document_only_text(first.get("report_purpose")), document_only_text(first.get("purpose")), document_only_text(report.get("report_purpose")), document_only_text(report.get("purpose")), document_only_text(analysis.get("purpose")), "첨부 문서의 주요 내용을 업무 보고서 형식으로 정리합니다."),
+        "summary": first_text(document_only_text(first.get("summary")), document_only_text(first.get("content")), document_only_text(report.get("summary")), document_only_text(analysis.get("summary"))),
+        "issue_summary": first_text(document_only_text(issue_value)),
+        "action_plan": first_text(document_only_text(first.get("action_plan")), document_only_text(report.get("action_plan"))),
+        "footer_note": first_text(document_only_text(first.get("footer_note")), document_only_text(report.get("footer_note"))),
     }
 
 
@@ -470,6 +504,8 @@ def detect_document_type(payload: Dict[str, Any]) -> str:
         return "ESTIMATE_COMPARISON"
     if "UNIT_PRICE" in text or "STANDARD_MARKET" in text or any(k in korean_text for k in TYPE_KEYWORDS["UNIT_PRICE_TABLE"]):
         return "UNIT_PRICE_TABLE"
+    if "CUSTOM_DOCUMENT_FORM" in text or "DOCUMENT_FORM" in text:
+        return "CUSTOM_DOCUMENT_FORM"
     if "MEETING" in text or any(k in korean_text for k in TYPE_KEYWORDS["MEETING_MINUTES"]):
         return "MEETING_MINUTES"
     if "OFFICIAL" in text or any(k in korean_text for k in TYPE_KEYWORDS["OFFICIAL_LETTER"]):
@@ -687,6 +723,115 @@ def create_price_table_workbook(payload: Dict[str, Any]) -> Tuple[Workbook, Dict
     write_table(ws, columns, rows, 5)
     return wb, {"template_kind": "UNIT_PRICE_TABLE", "columns": columns}
 
+
+def resolve_binding_value(payload: Dict[str, Any], row: Dict[str, Any], binding_key: str, default: str = "") -> Any:
+    key = str(binding_key or "").strip()
+    if not key:
+        return default
+    if key in ("today", "document_date"):
+        return row.get(key) or today_text()
+    if key in row and row.get(key) not in (None, ""):
+        return row.get(key)
+    analysis = (payload.get("job") or {}).get("analysis") or {}
+    camel = re.sub(r"_([a-z])", lambda m: m.group(1).upper(), key)
+    for candidate in (key, camel):
+        if isinstance(analysis, dict) and analysis.get(candidate) not in (None, ""):
+            return analysis.get(candidate)
+    if key in ("requester_name", "writer_name", "created_by"):
+        return payload.get("author_name") or default
+    if key in ("summary", "purpose", "content"):
+        return analysis.get("summary") or analysis.get("purpose") or (payload.get("job") or {}).get("userRequest") or default
+    if key in ("review_opinion", "review", "issue_summary"):
+        return analysis.get("reviewSummary") or analysis.get("review_summary") or analysis.get("summary") or default
+    if key == "action_plan":
+        return analysis.get("actionPlan") or analysis.get("nextSteps") or default
+    return default
+
+
+def create_custom_document_workbook(payload: Dict[str, Any]) -> Tuple[Workbook, Dict[str, Any]]:
+    """Gemini가 만든 sections/headerPairs를 그대로 렌더링하는 범용 회사 문서형 엑셀."""
+    rows = as_list(payload.get("rows"))
+    first = rows[0] if rows else {}
+    mapping = payload.get("mapping_json") or {}
+    sections = as_list(mapping.get("sections"))
+    if not sections:
+        sections = [
+            {"title": "1. 작성 목적", "bindingKey": "purpose", "height": 3},
+            {"title": "2. 주요 내용", "bindingKey": "summary", "height": 4},
+            {"title": "3. 검토 의견", "bindingKey": "review_opinion", "height": 4},
+            {"title": "4. 후속 조치", "bindingKey": "action_plan", "height": 3},
+        ]
+    header_pairs = as_list(mapping.get("headerPairs")) or [
+        {"label": "작성일", "bindingKey": "document_date"},
+        {"label": "작성자", "bindingKey": "requester_name"},
+        {"label": "공사명", "bindingKey": "project_name"},
+        {"label": "현장명", "bindingKey": "site_name"},
+    ]
+    approvals = [str(x) for x in as_list(mapping.get("approvalLines")) if str(x).strip()] or ["담당", "검토", "승인"]
+    total_cols = 8
+    wb = Workbook()
+    ws = wb.active
+    ws.title = str(mapping.get("sheetName") or mapping.get("sheet") or "AI문서양식")[:31]
+
+    title = str(mapping.get("title") or first.get("document_title") or first.get("report_title") or "AI 생성 문서 양식")
+    merge_write(ws, 1, 1, 1, total_cols, title, bold=True, size=18, fill=TITLE_FILL)
+
+    # 우측 결재란
+    start_approval_col = max(5, total_cols - len(approvals) + 1)
+    for idx, label in enumerate(approvals[:4], start=start_approval_col):
+        write_cell(ws, 2, idx, label, bold=True, fill=HEADER_FILL)
+        write_cell(ws, 3, idx, "")
+        ws.row_dimensions[3].height = 32
+
+    r = 3
+    c = 1
+    for pair in header_pairs[:8]:
+        label = str(pair.get("label") or "").strip()
+        binding = str(pair.get("bindingKey") or pair.get("fieldKey") or "").strip()
+        if not label or not binding:
+            continue
+        write_cell(ws, r, c, label, bold=True, fill=HEADER_FILL)
+        merge_write(ws, r, c + 1, r, min(c + 2, total_cols), resolve_binding_value(payload, first, binding, ""))
+        c += 4
+        if c > total_cols:
+            r += 1
+            c = 1
+
+    r += 2
+    for idx, section in enumerate(sections[:12], start=1):
+        section_title = str(section.get("title") or section.get("label") or f"{idx}. 문서 내용")
+        binding = str(section.get("bindingKey") or section.get("fieldKey") or section.get("key") or "summary")
+        height = section.get("height", 3)
+        try:
+            height = int(height)
+        except Exception:
+            height = 3
+        height = max(1, min(8, height))
+        merge_write(ws, r, 1, r, total_cols, section_title, bold=True, fill=HEADER_FILL)
+        value = resolve_binding_value(payload, first, binding, "")
+        merge_write(ws, r + 1, 1, r + height, total_cols, value or "")
+        for rr in range(r + 1, r + height + 1):
+            ws.row_dimensions[rr].height = 24
+        r += height + 2
+
+    # 표 컬럼이 같이 필요한 문서 양식이면 하단에 첨부 내역표를 붙인다.
+    base_columns = as_list(mapping.get("baseColumns"))
+    if base_columns and rows:
+        merge_write(ws, r, 1, r, total_cols, "첨부 내역", bold=True, fill=HEADER_FILL)
+        norm_cols = []
+        for item in base_columns[:total_cols]:
+            key = normalize_key(item.get("fieldKey") or item.get("key"))
+            if key:
+                norm_cols.append({"key": key, "label": label_for(key, item.get("label"))})
+        if norm_cols:
+            write_table(ws, norm_cols, rows, r + 1)
+
+    set_widths(ws, total_cols, 16)
+    ws.column_dimensions["B"].width = 22
+    ws.column_dimensions["C"].width = 18
+    ws.column_dimensions["D"].width = 18
+    return wb, {"template_kind": "CUSTOM_DOCUMENT_FORM", "section_count": len(sections)}
+
 def create_report_workbook(payload: Dict[str, Any], doc_type: str) -> Tuple[Workbook, Dict[str, Any]]:
     rows = as_list(payload.get("rows"))
     first = rows[0] if rows else {}
@@ -755,8 +900,8 @@ def create_report_workbook(payload: Dict[str, Any], doc_type: str) -> Tuple[Work
     write_cell(ws, 3, 2, today_text())
     write_cell(ws, 3, 3, "작성자", bold=True, fill=HEADER_FILL)
     write_cell(ws, 3, 4, payload.get("author_name") or "")
-    write_cell(ws, 3, 5, "검토건수", bold=True, fill=HEADER_FILL)
-    merge_write(ws, 3, 6, 3, 8, f"{len(rows)}건")
+    write_cell(ws, 3, 5, "문서구분", bold=True, fill=HEADER_FILL)
+    merge_write(ws, 3, 6, 3, 8, "보고서")
     sections = [
         ("1. 보고 목적", first.get("report_purpose") or first.get("purpose") or ""),
         ("2. 주요 검토 내용", first.get("summary") or first.get("content") or ""),
@@ -883,6 +1028,8 @@ def create_design_workbook(payload: Dict[str, Any]) -> Tuple[Workbook, Dict[str,
         return create_estimate_form_workbook(payload)
     if "PRICE" in layout or "UNIT_PRICE" in layout:
         return create_price_table_workbook(payload)
+    if "CUSTOM_DOCUMENT_FORM" in layout or "DOCUMENT_FORM" in layout:
+        return create_custom_document_workbook(payload)
     if "OFFICIAL" in layout:
         return create_report_workbook(payload, "OFFICIAL_LETTER")
     if "MEETING" in layout:
@@ -947,88 +1094,11 @@ def make_template_skeleton(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def build_design_candidates(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    이전 layout registry 기반 후보 생성 기능은 사용하지 않는다.
+    Gemini가 실제 양식 JSON을 생성하고, 서버가 sanitize 후 openpyxl 렌더링한다.
+    """
     analysis = payload.get("analysis") or {}
-    user_request = payload.get("user_request") or ""
-    columns = as_list(payload.get("columns"))
-    rows = as_list(payload.get("rows"))
-    probe = {"columns": columns, "rows": rows, "job": {"user_request": user_request, "analysis": analysis}}
-    doc_type = detect_document_type(probe)
-    standard_fields = as_list(payload.get("standard_fields"))
+    doc_type = str(analysis.get("documentType") or analysis.get("document_type") or "업무 문서")
+    return {"document_type": doc_type, "design_candidates": []}
 
-    def field_item(key: str, label: Optional[str] = None) -> Dict[str, str]:
-        sf = next((f for f in standard_fields if (f.get("fieldKey") or f.get("field_key")) == key), None)
-        return {"fieldKey": key, "label": label or (sf.get("label") if sf else None) or (sf.get("field_label") if sf else None) or label_for(key)}
-
-    table_keys = [c.get("key") for c in columns if c.get("key")]
-    default_base = [field_item(k, next((c.get("label") for c in columns if c.get("key") == k), None)) for k in table_keys[:12]]
-    if not default_base:
-        default_base = [field_item(k) for k in ["row_no", "item_name", "spec", "quantity", "unit", "unit_price", "amount", "remark"]]
-
-    registry_candidates = build_layout_candidates(
-        analysis=analysis,
-        table={"columns": columns, "rows": rows, "tableType": doc_type, "tableName": DOCUMENT_TYPE_LABELS.get(doc_type, doc_type)},
-        user_request=user_request,
-    )
-    if registry_candidates:
-        candidates = []
-        for item in registry_candidates[:5]:
-            layout_type = str(item.get("layoutType") or item.get("layout") or "BASIC_TABLE")
-            layout = normalize_layout_for_renderer(layout_type)
-            is_vendor = layout == "AI_GENERATED_DYNAMIC_VENDOR_TABLE"
-            is_table_like = any(token in layout for token in ["TABLE", "PRICE", "ESTIMATE", "VENDOR"])
-            candidates.append({
-                "designId": item.get("designId") or layout_type,
-                "name": item.get("name") or item.get("title") or layout_type,
-                "score": int(item.get("score") or 0),
-                "layout": layout,
-                "layoutType": layout_type,
-                "reason": item.get("reason") or "layout registry 기준 추천 양식입니다.",
-                "sections": item.get("sections") or [],
-                "baseColumns": [field_item(k) for k in ["row_no", "item_name", "spec", "quantity", "unit"]] if is_vendor else (default_base if is_table_like else []),
-                "repeatGroups": [{"groupKey": "vendors", "repeatBy": "vendor", "columns": [field_item("unit_price", "단가"), field_item("amount", "금액")]}] if is_vendor else [],
-                "summaryColumns": [field_item("lowest_target", "최저 업체"), field_item("calculated_unit_price", "최저 단가"), field_item("remark", "비고")] if is_vendor else [],
-            })
-        for c in candidates:
-            c.update({
-                "templateName": f"AI_{c['name']}",
-                "templateType": c.get("layoutType") or doc_type,
-                "sheetName": str(c["name"])[:31],
-                "title": c["name"],
-                "confidence": min(0.98, max(0.5, c["score"] / 100)),
-            })
-        return {"document_type": doc_type, "design_candidates": candidates}
-
-    candidates = []
-    if doc_type == "ESTIMATE_COMPARISON":
-        candidates = [
-            {"designId": "vendor_compare", "name": "업체 비교형", "score": 92, "layout": "AI_GENERATED_DYNAMIC_VENDOR_TABLE", "reason": "업체별 단가/금액을 반복 컬럼으로 비교합니다.", "baseColumns": [field_item(k) for k in ["row_no", "item_name", "spec", "quantity", "unit"]], "repeatGroups": [{"groupKey": "vendors", "repeatBy": "vendor", "columns": [field_item("unit_price", "단가"), field_item("amount", "금액")]}], "summaryColumns": [field_item("lowest_target", "최저 업체"), field_item("calculated_unit_price", "최저 단가"), field_item("remark", "비고")]},
-            {"designId": "summary_first", "name": "요약 우선형", "score": 86, "layout": "HEADER_SUMMARY_TABLE", "reason": "상단 요약과 하단 상세표로 보고용 산출에 적합합니다.", "baseColumns": default_base, "repeatGroups": [], "summaryColumns": [field_item("total_amount", "합계"), field_item("remark", "비고")]},
-            {"designId": "simple_table", "name": "기본 표형", "score": 78, "layout": "TABLE_ONLY", "reason": "추출된 표 데이터를 단순 표 형태로 정리합니다.", "baseColumns": default_base, "repeatGroups": [], "summaryColumns": []},
-        ]
-    elif doc_type == "MEETING_MINUTES":
-        candidates = [
-            {"designId": "minutes_action", "name": "회의록 조치사항형", "score": 90, "layout": "MEETING_ACTION_TABLE", "reason": "안건·결정사항·조치사항 중심으로 회의록을 정리합니다.", "baseColumns": [field_item(k) for k in ["row_no", "agenda", "decision", "action_item", "remark"]], "repeatGroups": [], "summaryColumns": []},
-            {"designId": "minutes_summary", "name": "요약 회의록형", "score": 84, "layout": "SECTION_REPORT", "reason": "회의 개요와 요약을 먼저 보여줍니다.", "baseColumns": default_base, "repeatGroups": [], "summaryColumns": []},
-            {"designId": "simple_table", "name": "기본 표형", "score": 75, "layout": "TABLE_ONLY", "reason": "원본 표 구조를 유지합니다.", "baseColumns": default_base, "repeatGroups": [], "summaryColumns": []},
-        ]
-    elif doc_type == "OFFICIAL_LETTER":
-        candidates = [
-            {"designId": "official_letter", "name": "공문 양식형", "score": 88, "layout": "OFFICIAL_LETTER", "reason": "수신·참조·제목·본문 구조로 공문형 엑셀을 만듭니다.", "baseColumns": [field_item(k) for k in ["row_no", "recipient", "reference", "document_title", "body", "remark"]], "repeatGroups": [], "summaryColumns": []},
-            {"designId": "approval_report", "name": "결재 보고형", "score": 82, "layout": "APPROVAL_FORM", "reason": "내부 결재 검토용으로 사용하기 좋습니다.", "baseColumns": default_base, "repeatGroups": [], "summaryColumns": []},
-            {"designId": "simple_table", "name": "기본 표형", "score": 74, "layout": "TABLE_ONLY", "reason": "추출 데이터를 표로 정리합니다.", "baseColumns": default_base, "repeatGroups": [], "summaryColumns": []},
-        ]
-    else:
-        candidates = [
-            {"designId": "report_summary", "name": "요약 보고서형", "score": 88, "layout": "SECTION_REPORT", "reason": "보고 목적, 주요 검토 내용, 검토 결과, 조치 계획 중심의 회사 보고서 양식입니다.", "baseColumns": [], "repeatGroups": [], "summaryColumns": []},
-            {"designId": "approval_report", "name": "결재 보고서형", "score": 84, "layout": "APPROVAL_FORM", "reason": "결재 검토에 필요한 본문 섹션과 참고사항 중심으로 구성합니다.", "baseColumns": [], "repeatGroups": [], "summaryColumns": []},
-            {"designId": "review_opinion", "name": "검토 의견서형", "score": 79, "layout": "SECTION_REPORT", "reason": "검토 의견과 후속 조치 내용을 문서형으로 정리합니다.", "baseColumns": [], "repeatGroups": [], "summaryColumns": []},
-        ]
-    for c in candidates:
-        c.update({
-            "templateName": f"AI_{c['name']}",
-            "templateType": doc_type,
-            "sheetName": c["name"][:31],
-            "title": c["name"],
-            "confidence": min(0.98, max(0.5, c["score"] / 100)),
-        })
-    return {"document_type": doc_type, "design_candidates": candidates}
