@@ -17,12 +17,14 @@ const {
   createChatSession,
   getChatSession,
   deleteChatSession,
-  aiChat
+  aiChat,
+  getDashboardStats,
 } = require('../controllers/documentJobController');
 const { authenticate } = require('../middleware/authMiddleware');
 const { documentUpload } = require('../middleware/uploadMiddleware');
 
 const router = express.Router();
+router.get('/stats', authenticate, getDashboardStats);
 router.get('/downloads', authenticate, listDownloads);
 router.get('/chats', authenticate, listChatSessions);
 router.post('/chats', authenticate, createChatSession);

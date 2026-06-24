@@ -175,14 +175,35 @@ async function query(sql, params = []) {
   if (q === "select id from roles where role_code = 'general_user'") {
     return [rows(await Role.findOne({ role_code: 'GENERAL_USER' }).lean())];
   }
+  if (q.startsWith('select * from roles where active_yn')) {
+    return [await Role.find({ active_yn: 'Y' }).sort({ id: 1 }).lean()];
+  }
+  if (q.startsWith('select u.*, r.role_code, r.role_name from users u join roles r') && q.includes('where u.id = ?')) {
+    return [rows(await userWithRole({ id: toId(params[0]) }))];
+  }
   if (q.startsWith('update users set last_login_at')) {
     await User.updateOne({ id: toId(params[0]) }, { $set: { last_login_at: new Date() } });
     return [{ affectedRows: 1 }];
   }
+  if (q.startsWith('update users set') && q.includes('where id = ?')) {
+    const setMatch = q.match(/update users set (.+?),\s*updated_at\s*=\s*now\(\)\s*where id = \?/);
+    if (setMatch) {
+      const setParts = setMatch[1].split(',').map((s) => s.trim());
+      const allowedFields = new Set(['user_name', 'email', 'phone', 'department_name', 'position_name', 'role_id', 'status', 'password_hash']);
+      const $set = { updated_at: new Date() };
+      for (let i = 0; i < setParts.length; i++) {
+        const fieldName = setParts[i].replace(/\s*=\s*\?.*/, '').trim();
+        if (allowedFields.has(fieldName)) {
+          $set[fieldName] = fieldName === 'role_id' ? toId(params[i]) : (params[i] !== undefined ? params[i] : null);
+        }
+      }
+      await User.updateOne({ id: toId(params[params.length - 1]) }, { $set });
+    }
+    return [{ affectedRows: 1 }];
+  }
   if (q.startsWith('insert into users')) {
-    return [await createRow(User, 'users', {
-      role_id: toId(params[0]), login_id: params[1], password_hash: params[2], user_name: params[3], email: params[4] || null, phone: params[5] || null, department_name: params[6] || '공사팀', position_name: params[7] || '사용자', status: 'ACTIVE'
-    })];
+    const data = { role_id: toId(params[0]), login_id: params[1], password_hash: params[2], user_name: params[3], email: params[4] || null, phone: params[5] || null, department_name: params[6] || null, position_name: params[7] || null, status: params[8] || 'ACTIVE' };
+    return [await createRow(User, 'users', data)];
   }
 
   // ===== standard fields =====

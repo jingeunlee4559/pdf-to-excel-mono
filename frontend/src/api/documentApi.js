@@ -103,3 +103,8 @@ export const excelDownloadUrl = (jobId, excelId) => {
   const token = localStorage.getItem('accessToken');
   return `${base}/document-jobs/${jobId}/excels/${excelId}/download${token ? `?token=${encodeURIComponent(token)}` : ''}`;
 };
+
+export const getDashboardStatsApi = async () => {
+  const { data } = await api.get('/document-jobs/stats');
+  return data;
+};

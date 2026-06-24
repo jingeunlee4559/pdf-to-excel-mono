@@ -47,6 +47,7 @@ class ExcelGenerateRequest(BaseModel):
     author_name: str = ""
     template_layout_mode: str = "COMPACT_VENDOR_GROUPS"
     design_id: Optional[str] = None
+    analysis: dict = Field(default_factory=dict)
 
 
 class TemplateSkeletonRequest(BaseModel):

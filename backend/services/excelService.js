@@ -88,7 +88,7 @@ function sanitizeExcelName(fileName, fallback) {
   return safeName.endsWith('.xlsx') ? safeName : `${safeName}.xlsx`;
 }
 
-async function createExcelFile({ jobId, fileName, columns, rows, job = {}, authorName = '', mappingJson = null, designId = null }) {
+async function createExcelFile({ jobId, fileName, columns, rows, job = {}, authorName = '', mappingJson = null, designId = null, analysis = null }) {
   const safeName = sanitizeExcelName(fileName, `document_job_${jobId}.xlsx`);
   const result = await generateExcelWithAiServer({
     jobId,
@@ -102,6 +102,7 @@ async function createExcelFile({ jobId, fileName, columns, rows, job = {}, autho
     job: job || {},
     authorName,
     designId,
+    analysis: analysis || {},
   });
   return {
     fileName: result.file_name || result.fileName || safeName,
@@ -149,3 +150,4 @@ async function createMappedTemplateExcel({ jobId, fileName, template, mappings, 
 }
 
 module.exports = { createExcelFile, createMappedTemplateExcel, inferVendors };
+

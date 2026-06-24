@@ -29,9 +29,22 @@ async function postForm(path, form, timeout = 120000) {
   return data;
 }
 
-async function postJson(path, payload, timeout = 120000) {
-  const { data } = await axios.post(`${aiBaseUrl()}${path}`, payload, { timeout });
-  return data;
+async function postJson(path, payload, timeout = 120000, retries = 1) {
+  let lastErr;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const { data } = await axios.post(`${aiBaseUrl()}${path}`, payload, {
+        timeout,
+        headers: { 'Content-Type': 'application/json' },
+      });
+      return data;
+    } catch (err) {
+      lastErr = err;
+      if (err.response?.status && err.response.status < 500) throw err; // 4xx는 재시도 안 함
+      if (attempt < retries) await new Promise((r) => setTimeout(r, 1500));
+    }
+  }
+  throw lastErr;
 }
 
 async function uploadFileToAiServer(file, uploadType = 'documents') {
@@ -74,7 +87,7 @@ async function getExcelPreview({ filePath, sheetName, maxRows = 80, maxCols = 26
   return data;
 }
 
-async function generateExcelWithAiServer({ jobId, fileName, outputMode, template, mappings, mappingJson, columns, rows, job, authorName, templateLayoutMode, designId }) {
+async function generateExcelWithAiServer({ jobId, fileName, outputMode, template, mappings, mappingJson, columns, rows, job, authorName, templateLayoutMode, designId, analysis }) {
   return postJson('/api/excel/generate', {
     job_id: jobId,
     file_name: fileName || null,
@@ -88,6 +101,7 @@ async function generateExcelWithAiServer({ jobId, fileName, outputMode, template
     author_name: authorName || '',
     template_layout_mode: templateLayoutMode || 'COMPACT_VENDOR_GROUPS',
     design_id: designId || null,
+    analysis: analysis || {},
   }, Number(process.env.AI_EXCEL_GENERATE_TIMEOUT_MS || 180000));
 }
 

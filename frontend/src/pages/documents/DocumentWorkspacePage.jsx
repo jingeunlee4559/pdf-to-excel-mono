@@ -1,367 +1,43 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import Swal from 'sweetalert2';
 import { createAiTemplateApi, createChatSessionApi, createDocumentJobApi, deleteChatSessionApi, excelDownloadUrl, generateExcelApi, getExcelPreviewApi, generateExcelPreviewOnlyApi, getChatSessionApi, getDocumentJobApi, listChatSessionsApi, listDownloadsApi, revalidateJobApi, sendAiChatApi, updateCandidateFieldApi, updateTableApi } from '../../api/documentApi.js';
 import { getTemplatePreviewApi, listTemplatesApi } from '../../api/templateApi.js';
 import { useAuth } from '../../context/AuthContext.jsx';
 
-const emptyAnalysis = {
-  summary: '아직 분석된 문서가 없습니다. 오른쪽 영역에서 파일과 요청 내용을 입력한 뒤 분석을 실행하세요.',
-  documentType: '대기',
-  confidence: 0,
-  tableCount: 0,
-  issueCount: 0,
-  purpose: '문서 분석 대기',
-  keyValues: [],
-  fileProfiles: [],
-  llmUsage: null,
-  llmUsed: false,
-  llmIntentUsed: false
-};
+// constants
+import { emptyAnalysis, defaultColumns, backgroundStatuses, completeStatuses } from '../../components/DocumentWorkspace/constants.js';
 
-const defaultColumns = [
-  { key: 'vendor_name', label: '업체명' },
-  { key: 'item_name', label: '품목명' },
-  { key: 'spec', label: '규격' },
-  { key: 'quantity', label: '수량' },
-  { key: 'unit', label: '단위' },
-  { key: 'unit_price', label: '단가' },
-  { key: 'amount', label: '금액' },
-  { key: 'remark', label: '비고' }
-];
+// utils
+import {
+  isReferenceTableType,
+  isStandardMarketTableType,
+  isMultiVendorCompareTableType,
+  isTextVendorComparisonReportType,
+  isBackgroundRunning,
+  statusLabel,
+  makeFileKey,
+  toChatFile,
+  normalizeServerMessages,
+  welcomeMessage,
+  mergeFileList,
+  isUserRegisteredCompanyTemplate,
+  mergeAiDesignOptions,
+  getDraftRowFromAnalysis,
+  mergeDraftIntoRows,
+  isProductPriceSurveyTemplate,
+} from '../../components/DocumentWorkspace/utils.js';
 
-const isReferenceTableType = (tableType) => ['REFERENCE_GUIDELINE_TABLE', 'GUIDELINE_SUMMARY_TABLE'].includes(tableType);
-const isStandardMarketTableType = (tableType) => tableType === 'STANDARD_MARKET_PRICE_TABLE';
-const isMultiVendorCompareTableType = (tableType) => tableType === 'MULTI_VENDOR_PRICE_COMPARISON';
-const isTextVendorComparisonReportType = (tableType) => tableType === 'TEXT_VENDOR_COMPARISON_REPORT';
+// ui components
+import { Badge, TabButton, ActionButton, Input, Select } from '../../components/DocumentWorkspace/ui.jsx';
 
-const tableTypeLabel = (tableType) => {
-  if (isReferenceTableType(tableType)) return '기준서 항목 표';
-  if (isStandardMarketTableType(tableType)) return '표준시장단가 표';
-  if (isMultiVendorCompareTableType(tableType)) return '업체별 단가 비교표';
-  if (isTextVendorComparisonReportType(tableType)) return '서술형 비교 요약';
-  return '추출 결과';
-};
-
-
-const getVisibleColumns = (columns = [], rows = []) => {
-  // 빈 컬럼 제거는 백엔드가 columns_json을 갱신해서 처리한다.
-  // 프론트에서 매번 행 값을 보고 숨기면, 사용자가 채팅으로 다시 추가한 컬럼이
-  // 값 입력 전에는 즉시 사라지는 문제가 생긴다.
-  if (!Array.isArray(columns) || !columns.length) return defaultColumns;
-  return columns;
-};
-
-const makeFileKey = (file) => `${file.name}__${file.size}__${file.lastModified || 0}`;
-
-const toChatFile = (file) => ({
-  name: file.name,
-  size: file.size,
-  type: file.type || '',
-  lastModified: file.lastModified || 0
-});
-
-
-const normalizeServerMessages = (messages = []) => {
-  const normalized = (messages || []).map((msg) => {
-    const payload = msg.payload || {};
-    return {
-      id: msg.id || `${Date.now()}-${Math.random()}`,
-      role: String(msg.role || 'assistant').toLowerCase(),
-      content: msg.content || msg.messageText || msg.message_text || '',
-      quickReplies: payload.quickReplies || msg.quickReplies || [],
-      files: payload.files || msg.files || [],
-      generatedExcel: payload.generatedExcel || msg.generatedExcel || null,
-      meta: msg.llmModel || payload.model || null,
-      createdAt: msg.createdAt
-    };
-  });
-  return normalized.length ? normalized : [welcomeMessage()];
-};
-
-const welcomeMessage = () => ({
-  id: 'welcome',
-  role: 'assistant',
-  content: '선택한 양식 기준으로 문서를 분석합니다. 파일을 첨부하거나 “기준 항목 표로 정리해줘”, “단가 기준만 표로 정리해줘”처럼 입력해보세요.',
-  quickReplies: ['기준 항목 표로 정리해줘', '단가 기준만 표로 정리해줘', '이 문서 뭐야?']
-});
-
-const mergeFileList = (prevFiles, nextFileList) => {
-  const nextFiles = Array.from(nextFileList || []);
-  if (!nextFiles.length) return prevFiles;
-  const seen = new Set(prevFiles.map(makeFileKey));
-  const merged = [...prevFiles];
-  nextFiles.forEach((file) => {
-    const key = makeFileKey(file);
-    if (!seen.has(key)) {
-      seen.add(key);
-      merged.push(file);
-    }
-  });
-  return merged;
-};
-
-const backgroundStatuses = new Set(['QUEUED', 'PROCESSING', 'PARSING', 'ANALYZING', 'VALIDATING']);
-const completeStatuses = new Set(['READY_TO_GENERATE', 'NEED_REVIEW', 'GENERATED', 'FAILED']);
-
-const isBackgroundRunning = (status) => backgroundStatuses.has(String(status || '').toUpperCase());
-
-const statusLabel = (status) => {
-  const value = String(status || '').toUpperCase();
-  if (value === 'QUEUED') return '대기열 등록';
-  if (value === 'PROCESSING') return '백그라운드 분석 중';
-  if (value === 'PARSING') return '문서 파싱 중';
-  if (value === 'ANALYZING') return 'AI 분석 중';
-  if (value === 'VALIDATING') return '검증 중';
-  if (value === 'READY_TO_GENERATE') return '엑셀 생성 가능';
-  if (value === 'NEED_REVIEW') return '확인 필요';
-  if (value === 'GENERATED') return '엑셀 생성됨';
-  if (value === 'FAILED') return '실패';
-  return value || '대기';
-};
-
-const SYSTEM_DEFAULT_TEMPLATE_CODES = new Set([
-  'NORMAL_TABLE_V1', 'COMPARISON_MATRIX_V1', 'WORK_LOG_TABLE_V1',
-  'ESTIMATE_FORM_V1', 'UNIT_PRICE_TABLE_V1', 'BUSINESS_REPORT_V1',
-  'MEETING_MINUTES_V1', 'OFFICIAL_LETTER_V1'
-]);
-
-function isSystemDefaultTemplate(template = {}) {
-  const code = String(template.templateCode || template.template_code || '').toUpperCase();
-  const mapping = template.mapping || template.mappingJson || template.mapping_json || {};
-  return SYSTEM_DEFAULT_TEMPLATE_CODES.has(code) || Boolean(mapping?.locked);
-}
-
-function isUserRegisteredCompanyTemplate(template = {}) {
-  if (!template) return false;
-  if (isAiGeneratedTemplate(template)) return false;
-  if (isSystemDefaultTemplate(template)) return false;
-  const code = String(template.templateCode || template.template_code || '').toUpperCase();
-  if (code.startsWith('AI_')) return false;
-  return true;
-}
-
-
-function cleanTableColumnLabel(label = '') {
-  return String(label || '')
-    .replace(/^\s*[A-Z]\s*회사\s*[·ㆍ:：\-–—]*\s*/i, '')
-    .replace(/^\s*[A-Z]\s*회사(?=㈜|\(주\)|주식회사|[가-힣A-Za-z0-9])/i, '')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-
-function detectDocumentDesignType({ analysis = {}, table = {}, userRequest = '' } = {}) {
-  const source = [
-    analysis.documentType,
-    analysis.purpose,
-    analysis.summary,
-    table.tableName,
-    table.tableType,
-    userRequest,
-  ].filter(Boolean).join(' ').toLowerCase();
-  if (/회의|meeting|minutes|안건|조치사항|결정사항/.test(source)) return 'MEETING_MINUTES';
-  if (/공문|시행|수신|참조|official|letter/.test(source)) return 'OFFICIAL_LETTER';
-  if (/보고서|보고|리포트|report|현황|progress|감리/.test(source)) return 'REPORT';
-  if (/단가표|price\s*list|단가\s*목록|표준시장단가|market_price/.test(source)) return 'PRICE_TABLE';
-  if (/견적|비교|업체|vendor|estimate|comparison/.test(source)) return 'ESTIMATE';
-  return 'BASIC_TABLE';
-}
-
-function buildDefaultDesignCandidates() {
-  // 기존 layoutRegistry 기반 후보 목록은 사용하지 않는다.
-  return [];
-}
-
-function templateToAiDesignCandidate(template) {
-  if (!template || !isAiGeneratedTemplate(template)) return null;
-  const mapping = template.mapping || template.mappingJson || template.mapping_json || {};
-  const layout = mapping.layout || mapping.layoutType || template.templateType || template.template_type || 'BASIC_TABLE';
-  const designId = String(mapping.designId || template.templateCode || template.template_code || template.id || '').trim() || `AI_TEMPLATE_${template.id || Date.now()}`;
-  return {
-    ...mapping,
-    designId,
-    name: template.templateName || template.template_name || mapping.templateName || mapping.name || 'AI 생성 양식',
-    documentKind: mapping.documentKind || mapping.templateType || template.templateType || template.template_type || 'AI 생성',
-    layout,
-    title: mapping.title || template.templateName || template.template_name || 'AI 생성 양식',
-    score: Number(mapping.score || 80),
-    reason: mapping.reason || 'AI가 DB 표준필드를 기준으로 생성한 양식입니다.',
-    sourceType: 'AI_TEMPLATE',
-  };
-}
-
-function getRecommendationContextText(context = {}) {
-  const { analysis = {}, table = {}, userRequest = '' } = context || {};
-  return [
-    analysis.documentType,
-    analysis.document_type,
-    analysis.purpose,
-    analysis.summary,
-    analysis.businessPurpose,
-    analysis.business_purpose,
-    table.tableName,
-    table.table_name,
-    table.tableType,
-    table.table_type,
-    ...(Array.isArray(table.columns) ? table.columns.map((c) => `${c.label || ''} ${c.key || ''}`) : []),
-    userRequest,
-  ].filter(Boolean).join(' ');
-}
-
-function normalizeDesignLayoutType(value = '') {
-  const layout = String(value || '').toUpperCase();
-  if (!layout) return 'BASIC_TABLE';
-  if (layout === 'VENDOR_COMPARISON_REVIEW_FORM' || layout.includes('VENDOR_COMPARE_REVIEW')) return 'VENDOR_COMPARISON_REVIEW_FORM';
-  if (layout === 'REVIEW_OPINION_FORM' || layout.includes('REVIEW_OPINION')) return 'REVIEW_OPINION_FORM';
-  if (layout === 'INSPECTION_REPORT' || layout.includes('INSPECTION')) return 'INSPECTION_REPORT';
-  if (layout === 'WORK_DAILY_REPORT' || layout.includes('WORK_DAILY')) return 'WORK_DAILY_REPORT';
-  if (layout.includes('DYNAMIC_VENDOR') || layout.includes('VENDOR_COMPARE')) return 'VENDOR_COMPARISON_TABLE';
-  if (layout === 'PRICE_TABLE' || layout.includes('PRICE_SURVEY') || layout.includes('UNIT_PRICE')) return 'PRICE_SURVEY_TABLE';
-  if (layout === 'ESTIMATE_FORM' || layout.includes('ESTIMATE')) return 'ESTIMATE_REVIEW_FORM';
-  if (['SECTION_REPORT', 'APPROVAL_FORM', 'HEADER_SUMMARY_TABLE', 'REPORT', 'REPORT_FORM'].includes(layout)) return 'REPORT_FORM';
-  if (layout.includes('MEETING')) return 'MEETING_MINUTES';
-  if (layout.includes('OFFICIAL')) return 'OFFICIAL_LETTER';
-  return layout;
-}
-
-function recomputeDesignScore(item = {}) {
-  return Math.max(0, Math.min(100, Number(item.score || item.confidence * 100 || 80) || 80));
-}
-
-function mergeAiDesignOptions(designCandidates = [], templates = []) {
-  const list = [
-    ...(Array.isArray(designCandidates) ? designCandidates : []),
-    ...(Array.isArray(templates) ? templates.map(templateToAiDesignCandidate).filter(Boolean) : []),
-  ];
-  const seenIds = new Set();
-  return list
-    .filter((item) => item && (item.designId || item.name || item.layout || item.templateName))
-    .map((item, index) => {
-      const rawLayoutType = item.layoutType || item.layout_type || item.templateType || item.template_type || item.layout || 'CUSTOM_DOCUMENT_FORM';
-      const layoutType = normalizeDesignLayoutType(rawLayoutType);
-      return {
-        ...item,
-        designId: String(item.designId || item.design_id || item.templateCode || item.template_code || layoutType || item.name || `AI_DESIGN_${index}`),
-        name: item.name || item.templateName || item.title || `AI 생성 양식 ${index + 1}`,
-        layoutType,
-        layout: item.layout || layoutType,
-        score: recomputeDesignScore(item),
-      };
-    })
-    .filter((item) => {
-      const idKey = String(item.designId || '').toUpperCase();
-      if (seenIds.has(idKey)) return false;
-      seenIds.add(idKey);
-      return true;
-    })
-    .slice(0, 5);
-}
-
-function indexSafeLayout(layout = '') {
-  return ['REPORT_FORM', 'REVIEW_OPINION_FORM', 'VENDOR_COMPARISON_REVIEW_FORM', 'INSPECTION_REPORT', 'BASIC_TABLE'].includes(String(layout || '').toUpperCase());
-}
-
-
-
-function firstNonEmpty(...values) {
-  for (const value of values) {
-    if (value !== undefined && value !== null && String(value).trim() !== '') return value;
-  }
-  return '';
-}
-
-function looksLikeUserFormattingPrompt(value = '') {
-  const text = String(value || '').trim();
-  if (!text) return false;
-  const normalized = text.replace(/\s+/g, ' ');
-  const promptTokens = [
-    '정리해줘', '작성해줘', '만들어줘', '써줘', '출력해줘',
-    '회사 업무보고서 형식', '회사 보고서 형식', '핵심 내용만',
-    '보고 목적·', '검토 결과·', '조치 계획 중심',
-    '원문에 없는 내용', '임의로 만들지', '확인 필요로 표시'
-  ];
-  return promptTokens.some((token) => normalized.includes(token));
-}
-
-function sanitizeBusinessPurpose(value = '') {
-  const text = firstNonEmpty(value).trim();
-  if (!text || looksLikeUserFormattingPrompt(text)) return '';
-  return text;
-}
-
-function inferBusinessPurposeFromRow(row = {}) {
-  const source = firstNonEmpty(row.document_title, row.report_title, row.summary, row.content, row.issue_summary, row.review_opinion);
-  const text = String(source || '').replace(/^[•\-–—*\s]+/gm, '').replace(/\s+/g, ' ').trim();
-  if (!text || looksLikeUserFormattingPrompt(text)) return '첨부 문서의 주요 내용과 확인 필요 사항을 업무 보고 형식으로 정리합니다.';
-  if (/점검|안전|위험|현장|감리/.test(text)) return '첨부 문서의 현장 점검 내용과 확인 필요 사항을 검토하기 위한 보고입니다.';
-  if (/견적|단가|금액|업체|비교/.test(text)) return '첨부 문서의 견적·단가·업체 비교 내용을 검토하기 위한 보고입니다.';
-  if (/회의|안건|결정|조치/.test(text)) return '첨부 문서의 논의 내용과 후속 조치 사항을 정리하기 위한 보고입니다.';
-  return '첨부 문서의 주요 내용과 확인 필요 사항을 업무 보고 형식으로 정리합니다.';
-}
-
-function getDraftRowFromAnalysis(analysis = {}, layout = '') {
-  const drafts = analysis?.drafts && typeof analysis.drafts === 'object' ? analysis.drafts : {};
-  const layoutText = String(layout || '').toUpperCase();
-  if (layoutText.includes('MEETING')) {
-    const meeting = drafts.meeting || drafts.meetingMinutes || {};
-    if (!Object.keys(meeting).length) return null;
-    return {
-      meeting_title: firstNonEmpty(meeting.meeting_title, meeting.title, '회의록'),
-      meeting_date: firstNonEmpty(meeting.meeting_date, meeting.date),
-      meeting_place: firstNonEmpty(meeting.meeting_place, meeting.place),
-      attendees: firstNonEmpty(meeting.attendees),
-      agenda: firstNonEmpty(meeting.agenda, meeting.summary),
-      discussion: firstNonEmpty(meeting.discussion, meeting.content),
-      decision: firstNonEmpty(meeting.decision, meeting.decisions),
-      action_item: firstNonEmpty(meeting.action_item, meeting.action_items, meeting.actionPlan),
-      remark: firstNonEmpty(meeting.remark, meeting.footer_note),
-    };
-  }
-  if (layoutText.includes('OFFICIAL')) {
-    const letter = drafts.officialLetter || drafts.official || {};
-    if (!Object.keys(letter).length) return null;
-    return {
-      letter_title: firstNonEmpty(letter.letter_title, letter.title, '공문'),
-      document_no: firstNonEmpty(letter.document_no, letter.documentNo),
-      recipient: firstNonEmpty(letter.recipient),
-      reference: firstNonEmpty(letter.reference),
-      document_title: firstNonEmpty(letter.document_title, letter.subject, letter.title),
-      body: firstNonEmpty(letter.body, letter.content, letter.summary),
-      attachment_note: firstNonEmpty(letter.attachment_note, letter.attachments),
-      sender: firstNonEmpty(letter.sender),
-    };
-  }
-  const report = drafts.report || {};
-  if (!Object.keys(report).length) return null;
-  return {
-    report_title: firstNonEmpty(report.report_title, report.title, analysis.documentTitle, analysis.documentType, '업무 보고서'),
-    document_title: firstNonEmpty(report.document_title, report.report_title, report.title),
-    report_purpose: firstNonEmpty(sanitizeBusinessPurpose(report.report_purpose), sanitizeBusinessPurpose(report.purpose), sanitizeBusinessPurpose(analysis.purpose), inferBusinessPurposeFromRow({ ...report, summary: analysis.summary })),
-    summary: firstNonEmpty(report.summary, analysis.summary),
-    content: firstNonEmpty(report.content, report.summary, analysis.summary),
-    issue_summary: firstNonEmpty(report.issue_summary, report.review_result, report.review_opinion),
-    review_result: firstNonEmpty(report.review_result, report.issue_summary, report.review_opinion),
-    review_opinion: firstNonEmpty(report.review_opinion, report.review_result, report.issue_summary),
-    action_plan: firstNonEmpty(report.action_plan, report.actionPlan),
-    footer_note: firstNonEmpty(report.footer_note, report.note),
-  };
-}
-
-function mergeDraftIntoRows(rows = [], draftRow = null) {
-  if (!draftRow || !Object.values(draftRow).some((value) => String(value || '').trim())) return rows;
-  if (!Array.isArray(rows) || rows.length === 0) return [draftRow];
-  const first = { ...(rows[0] || {}) };
-  Object.entries(draftRow).forEach(([key, value]) => {
-    const nextValue = String(value || '').trim();
-    const currentValue = String(first[key] || '').trim();
-    const currentLooksPrompt = ['report_purpose', 'purpose', 'report_title', 'document_title'].includes(key) && looksLikeUserFormattingPrompt(currentValue);
-    if (nextValue && (!currentValue || currentLooksPrompt)) first[key] = value;
-  });
-  if (looksLikeUserFormattingPrompt(first.report_purpose || first.purpose || '')) {
-    first.report_purpose = firstNonEmpty(sanitizeBusinessPurpose(draftRow.report_purpose), inferBusinessPurposeFromRow(first));
-  }
-  return [first, ...rows.slice(1)];
-}
-
+// page components
+import { TableSelector } from '../../components/DocumentWorkspace/TableSelector.jsx';
+import { SourceView } from '../../components/DocumentWorkspace/SourceView.jsx';
+import { AnalysisView } from '../../components/DocumentWorkspace/AnalysisView/index.jsx';
+import { ReportView } from '../../components/DocumentWorkspace/ReportView.jsx';
+import { ChatAssistantPanel } from '../../components/DocumentWorkspace/ChatPanel/index.jsx';
+import { ExcelPreview } from '../../components/DocumentWorkspace/ExcelPreview/index.jsx';
+import { AiTemplateRecommendationBox } from '../../components/DocumentWorkspace/AiTemplateRecommendationBox.jsx';
 
 export default function DocumentWorkspacePage() {
   const { user } = useAuth();
@@ -371,7 +47,8 @@ export default function DocumentWorkspacePage() {
   const [aiTemplateDesignCandidates, setAiTemplateDesignCandidates] = useState([]);
   const [candidateFields, setCandidateFields] = useState([]);
   const [selectedDesignId, setSelectedDesignId] = useState('');
-  const [chatFormatDesign, setChatFormatDesign] = useState(null); // 채팅에서 선택한 임시 양식
+  const [chatFormatDesign, setChatFormatDesign] = useState(null);
+  const [chatFormatRequest, setChatFormatRequest] = useState(null); // 채팅에서 설정한 포맷 요청 유지
   const [aiTemplateCreating, setAiTemplateCreating] = useState(false);
   const [tab, setTab] = useState('analysis');
   const [outputMode, setOutputMode] = useState('FREE_FORM');
@@ -394,6 +71,7 @@ export default function DocumentWorkspacePage() {
   const [generatedExcel, setGeneratedExcel] = useState(null);
   const [generatedExcelPreview, setGeneratedExcelPreview] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [loadingStep, setLoadingStep] = useState(''); // 단계별 로딩 메시지
   const [message, setMessage] = useState('');
   const [chatMessages, setChatMessages] = useState([welcomeMessage()]);
   const [chatSessions, setChatSessions] = useState([]);
@@ -440,7 +118,6 @@ export default function DocumentWorkspacePage() {
     if (!selectedDesignId) return null;
     return aiDesignOptions.find((item) => String(item.designId || '') === String(selectedDesignId || '')) || null;
   }, [aiDesignOptions, selectedDesignId]);
-  // 채팅에서 선택한 임시 양식이 있으면 우선 적용
   const selectedDesign = chatFormatDesign || selectedDesignBase;
 
   useEffect(() => {
@@ -473,8 +150,6 @@ export default function DocumentWorkspacePage() {
   useEffect(() => {
     if (outputMode !== 'FREE_FORM') return;
     if (templateId) setTemplateId('');
-    // selectedDesignId가 비어있으면 자동 선택하지 않음 (새 채팅, 사용자가 직접 초기화한 경우)
-    // selectedDesignId가 있지만 현재 옵션 목록에 없을 때만 첫 번째 옵션으로 보정
     if (selectedDesignId && aiDesignOptions.length && !aiDesignOptions.some((item) => String(item.designId || '') === String(selectedDesignId || ''))) {
       setSelectedDesignId(aiDesignOptions[0].designId);
     }
@@ -489,7 +164,7 @@ export default function DocumentWorkspacePage() {
 
   const changeOutputMode = (value) => {
     setOutputMode(value);
-    setChatFormatDesign(null); // 사용자가 직접 모드 변경 시 채팅 임시 양식 초기화
+    setChatFormatDesign(null);
     if (value === 'COMPANY_TEMPLATE') {
       setSelectedDesignId('');
       const nextTemplateId = templateId && registeredTemplates.some((item) => String(item.id) === String(templateId))
@@ -543,7 +218,18 @@ export default function DocumentWorkspacePage() {
       setChatMessages(normalizeServerMessages(session.messages || []));
       if (session.activeJob) {
         bindJobResult(session.activeJob);
-        setGeneratedExcel(session.activeJob.excels?.[0] || null);
+        const excel = session.activeJob.excels?.[0] || null;
+        setGeneratedExcel(excel);
+        if (excel?.id) {
+          try {
+            const previewData = await getExcelPreviewApi(session.activeJob.id, excel.id);
+            const preview = previewData?.preview || previewData?.excel?.preview;
+            if (preview && Array.isArray(preview.rows) && preview.rows.length > 0
+              && Array.isArray(preview.columns) && preview.columns.length > 0) {
+              setGeneratedExcelPreview(preview);
+            }
+          } catch (_) {}
+        }
         if (isBackgroundRunning(session.activeJob.status)) startJobPolling(session.activeJob.id, session.id);
       }
     } catch (err) {
@@ -585,8 +271,19 @@ export default function DocumentWorkspacePage() {
   const handleFiles = (fileList) => {
     const incoming = Array.from(fileList || []);
     if (!incoming.length) return;
-    setPendingFiles((prev) => mergeFileList(prev, incoming));
-    setMessage('파일이 첨부되었습니다. 채팅창에는 첨부 파일명이 표시되고, 하단의 첨부 아이콘으로 목록을 펼쳐 관리할 수 있습니다.');
+    const ALLOWED_TYPES = ['.pdf', '.xlsx', '.xls', '.docx', '.doc', '.csv', '.txt', '.hwp'];
+    const MAX_SIZE_MB = 30;
+    const rejected = [];
+    const valid = incoming.filter((f) => {
+      const ext = '.' + f.name.split('.').pop().toLowerCase();
+      if (!ALLOWED_TYPES.includes(ext)) { rejected.push(`${f.name} (지원하지 않는 형식)`); return false; }
+      if (f.size > MAX_SIZE_MB * 1024 * 1024) { rejected.push(`${f.name} (${(f.size / 1024 / 1024).toFixed(1)}MB → 최대 ${MAX_SIZE_MB}MB)`); return false; }
+      return true;
+    });
+    if (rejected.length) setMessage(`첨부 불가 파일: ${rejected.join(', ')}`);
+    if (!valid.length) return;
+    setPendingFiles((prev) => mergeFileList(prev, valid));
+    if (!rejected.length) setMessage(`파일 ${valid.length}개 첨부됨. 분석 요청을 입력하거나 바로 분석하세요.`);
   };
 
   const removePendingFile = (index) => {
@@ -596,7 +293,6 @@ export default function DocumentWorkspacePage() {
   const clearPendingFiles = () => {
     setPendingFiles([]);
   };
-
 
   const updateProcessingState = (jobId, status, title) => {
     if (!jobId) return;
@@ -613,7 +309,8 @@ export default function DocumentWorkspacePage() {
 
   const deleteChatSession = async (sessionId) => {
     if (!sessionId) return;
-    if (!window.confirm('이 채팅을 삭제할까요? 연결된 분석 작업/엑셀 파일은 삭제하지 않고 채팅 기록만 삭제합니다.')) return;
+    const { isConfirmed } = await Swal.fire({ title: '채팅 삭제', text: '채팅 기록만 삭제됩니다. 연결된 분석 작업과 엑셀 파일은 유지됩니다.', icon: 'warning', showCancelButton: true, confirmButtonText: '삭제', cancelButtonText: '취소', confirmButtonColor: '#ef4444', reverseButtons: true });
+    if (!isConfirmed) return;
     try {
       setLoading(true);
       await deleteChatSessionApi(sessionId);
@@ -640,31 +337,46 @@ export default function DocumentWorkspacePage() {
         if (nextJob) {
           bindJobResult(nextJob);
           updateProcessingState(nextJob.id, nextJob.status, nextJob.title);
+          if (isBackgroundRunning(nextJob.status)) {
+            setLoadingStep('AI 문서 분석 중... 잠시 기다려 주세요.');
+          }
           if (completeStatuses.has(String(nextJob.status || '').toUpperCase())) {
-            setMessage(nextJob.status === 'FAILED' ? (nextJob.errorMessage || '문서 분석이 실패했습니다.') : '백그라운드 문서 분석이 완료되었습니다.');
+            setLoadingStep('');
+            const failMsg = nextJob.errorMessage || nextJob.error_message || '문서 분석이 실패했습니다.';
+            setMessage(nextJob.status === 'FAILED' ? `분석 실패: ${failMsg}` : '✓ 문서 분석이 완료되었습니다.');
             if (nextJob.tables?.length && nextJob.status !== 'FAILED') {
-              setTab((current) => (current === 'analysis' ? 'excel' : current));
-              const rowCount = nextJob.tables?.[0]?.rows?.length || 0;
-              // 분석 완료 시 자동으로 Excel 생성 → 색상 미리보기 즉시 표시
-              try {
-                const autoResult = await generateExcelApi(nextJob.id, {
-                  outputMode: 'FREE_FORM',
-                  tableId: nextJob.tables?.[0]?.id || null,
+              const hasNarrative = !!(nextJob.analysis?.narrativeReport || nextJob.analysis?.narrative_report);
+              if (hasNarrative) {
+                // 보고서 요청 → 보고서 탭으로만 이동, Excel 자동 생성 안 함
+                setTab('report');
+                appendChat({
+                  role: 'assistant',
+                  content: '보고서가 준비됐습니다. "보고서" 탭에서 확인하시고 PDF 다운로드도 가능합니다. 엑셀로도 필요하시면 "엑셀 만들기"를 누르세요.',
+                  quickReplies: ['PDF 다운로드', '엑셀로도 만들어줘', '내용 수정하기'],
                 });
-                if (autoResult?.excel) setGeneratedExcel(autoResult.excel);
-                const preview = autoResult?.excel?.preview || autoResult?.preview;
-                if (preview && Array.isArray(preview.rows) && preview.rows.length > 0
-                    && Array.isArray(preview.columns) && preview.columns.length > 0) {
-                  setGeneratedExcelPreview(preview);
-                }
-                await refreshDownloads();
-              } catch (_) { /* 자동 생성 실패 시 조용히 무시 */ }
-              appendChat({
-                role: 'assistant',
-                content: `분석 완료: ${rowCount}행 추출됐습니다. 아래에서 데이터를 수정하거나, 다른 양식을 원하면 "보고서 형식으로" 등 입력 후 "엑셀 만들기"를 누르세요.`,
-                showPreview: true,
-                quickReplies: ['보고서 형식으로 만들어줘', '비교표로 만들어줘', '이 문서 뭐야?'],
-              });
+              } else {
+                setTab((current) => (current === 'analysis' ? 'excel' : current));
+                const rowCount = nextJob.tables?.[0]?.rows?.length || 0;
+                try {
+                  const autoResult = await generateExcelApi(nextJob.id, {
+                    outputMode: 'FREE_FORM',
+                    tableId: nextJob.tables?.[0]?.id || null,
+                  });
+                  if (autoResult?.excel) setGeneratedExcel(autoResult.excel);
+                  const preview = autoResult?.excel?.preview || autoResult?.preview;
+                  if (preview && Array.isArray(preview.rows) && preview.rows.length > 0
+                      && Array.isArray(preview.columns) && preview.columns.length > 0) {
+                    setGeneratedExcelPreview(preview);
+                  }
+                  await refreshDownloads();
+                } catch (_) {}
+                appendChat({
+                  role: 'assistant',
+                  content: `분석 완료: ${rowCount}행 추출됐습니다. 엑셀 미리보기에서 수정 후 다운로드하세요.`,
+                  showPreview: true,
+                  quickReplies: ['보고서로 만들어줘', '비교표로 만들어줘', '이 문서 뭐야?'],
+                });
+              }
             }
           }
         }
@@ -688,7 +400,6 @@ export default function DocumentWorkspacePage() {
     pollingTimersRef.current[jobId] = setTimeout(poll, 700);
   };
 
-
   const runAnalysis = async () => {
     setMessage('');
     if (!pendingFiles.length) {
@@ -698,6 +409,7 @@ export default function DocumentWorkspacePage() {
     const uploadFiles = pendingFiles;
     try {
       setLoading(true);
+      setLoadingStep('파일 업로드 중...');
       const result = await createDocumentJobApi({
         title: uploadFiles[0]?.name || '문서 분석 작업',
         userRequest: userRequest || '첨부한 문서를 분석해줘',
@@ -706,6 +418,7 @@ export default function DocumentWorkspacePage() {
         files: uploadFiles,
         chatSessionId: activeSessionId || null
       });
+      setLoadingStep('분석 대기열 등록 중...');
       if (result.job) {
         bindJobResult(result.job);
         updateProcessingState(result.job.id, result.job.status, result.job.title);
@@ -716,12 +429,16 @@ export default function DocumentWorkspacePage() {
       await refreshChatSessions();
       setPendingFiles([]);
       setUserRequest('');
+      setChatFormatRequest(null); // 새 분석 시 이전 format 요청 초기화
       setTab('analysis');
-      setMessage('작업이 백그라운드 대기열에 등록되었습니다. 기다리는 동안 다른 파일 업로드, 채팅, 표 확인을 계속할 수 있습니다.');
+      setMessage('작업이 백그라운드 대기열에 등록되었습니다. 완료되면 결과가 자동으로 표시됩니다.');
     } catch (err) {
-      setMessage(err.response?.data?.message || '문서 분석 작업 등록 중 오류가 발생했습니다.');
+      const errMsg = err.response?.data?.message || err.message || '문서 분석 작업 등록 중 오류가 발생했습니다.';
+      const detail = err.response?.status === 413 ? '파일 크기가 너무 큽니다. 20MB 이하 파일을 사용해 주세요.' : err.response?.status === 415 ? '지원하지 않는 파일 형식입니다. PDF, Excel, Word 파일을 사용해 주세요.' : errMsg;
+      setMessage(detail);
     } finally {
       setLoading(false);
+      setLoadingStep('');
     }
   };
 
@@ -747,8 +464,13 @@ export default function DocumentWorkspacePage() {
       fileProfiles: jobData?.analysis?.fileProfiles || jobData?.analysis?.raw?.fileProfiles || [],
       llmUsage: jobData?.analysis?.llmUsage || jobData?.analysis?.raw?.llmUsage || null,
       llmUsed: Boolean(jobData?.analysis?.llmUsed || jobData?.analysis?.raw?.llmUsed),
-      llmIntentUsed: Boolean(jobData?.analysis?.llmIntentUsed || jobData?.analysis?.raw?.llmIntentUsed)
+      llmIntentUsed: Boolean(jobData?.analysis?.llmIntentUsed || jobData?.analysis?.raw?.llmIntentUsed),
+      narrativeReport: jobData?.analysis?.narrativeReport || jobData?.analysis?.narrative_report || null,
     });
+    const _nr = jobData?.analysis?.narrativeReport || jobData?.analysis?.narrative_report;
+    if (_nr) {
+      setTab('report');
+    }
     const resultTables = Array.isArray(jobData?.tables) ? jobData.tables : [];
     setTables(resultTables);
     setSelectedTableIndex(0);
@@ -1029,36 +751,76 @@ export default function DocumentWorkspacePage() {
       });
       if (chat.recommendedTab) setTab(chat.recommendedTab);
 
-      // 채팅에서 GENERATE_EXCEL 액션: Gemini가 요청에 맞는 양식 직접 설계 → 미리보기 반영 → 엑셀 생성
+      // newTable 처리: FORMAT_REQUEST 시 테이블 구조 교체
+      if (chat.newTable && chat.newTable.columns && chat.newTable.rows) {
+        const nt = chat.newTable;
+        setTable((prev) => ({
+          ...prev,
+          columns: nt.columns,
+          rows: nt.rows,
+          tableType: nt.tableType || prev.tableType,
+          tableName: nt.tableName || prev.tableName,
+          _theme: nt.theme || null,
+        }));
+        setGeneratedExcelPreview(null);
+        setTab('excel');
+        if (chat.targetFormat) setChatFormatRequest({ format: chat.targetFormat, label: text, theme: nt.theme });
+      }
+
+      // targetFormat 저장 (newTable 없어도)
+      if (chat.targetFormat && !chat.newTable) {
+        setChatFormatRequest({ format: chat.targetFormat, label: text, theme: null });
+      }
+
       if (chat.action === 'GENERATE_EXCEL' && job?.id) {
+        const isNarrativeRequest = chat.intent === 'NARRATIVE_REPORT' || chat.targetFormat === 'NARRATIVE_REPORT';
+        const hasStoredReport = !!(analysis?.narrativeReport || analysis?.narrative_report);
+
+        // 보고서 요청: 이미 보고서가 있으면 보고서 탭으로
+        if (isNarrativeRequest) {
+          if (hasStoredReport) {
+            setTab('report');
+            appendChat({
+              role: 'assistant',
+              content: '보고서가 준비됐습니다. "보고서" 탭에서 확인하세요. 엑셀로도 받고 싶으시면 "엑셀 만들기"를 누르세요.',
+              quickReplies: ['엑셀로도 만들어줘', '내용 수정하기'],
+            });
+          } else {
+            // 보고서 없음 → 파일 재업로드 안내
+            appendChat({
+              role: 'assistant',
+              content: '보고서 형식으로 생성하려면 문서 분석 시 "보고서 형식으로" 요청이 함께 있어야 합니다. "+" 버튼으로 같은 파일을 다시 첨부해 "보고서양식으로 정리해줘"라고 입력하면 바로 보고서가 생성됩니다.',
+              quickReplies: ['파일 다시 첨부하기'],
+            });
+          }
+          return;
+        }
+
         const FORMAT_LABEL_MAP = {
-          REPORT: '보고서', MEETING_MINUTES: '회의록', OFFICIAL_LETTER: '공문', ESTIMATE_COMPARISON: '비교견적서',
+          NARRATIVE_REPORT: '검토보고서', REPORT: '보고서', MEETING_MINUTES: '회의록',
+          OFFICIAL_LETTER: '공문', ESTIMATE_COMPARISON: '비교견적서', VENDOR_COMPARISON: '업체비교표',
         };
-        const targetLabel = FORMAT_LABEL_MAP[chat.targetFormat] || '보고서';
-        // 사용자가 채팅에 입력한 원문을 Gemini에 전달해 맞춤 설계
+        const targetLabel = FORMAT_LABEL_MAP[chat.targetFormat] || '문서';
         const userRequestForDesign = `${text} (${targetLabel} 형식으로 작성)`;
         setAiTemplateCreating(true);
         try {
           await saveTable();
-          // Step 1: Gemini가 문서+요청 기반으로 양식 설계
           const designResult = await createAiTemplateApi(job.id, {
             tableId: table?.id || null,
             forceGeminiDesign: true,
             userRequestOverride: userRequestForDesign,
           });
           const nextDesign = designResult.design;
-          // Step 2: 미리보기 업데이트 (AI 설계 결과로)
           if (nextDesign?.designId) {
             setAiTemplateDesignCandidates((prev) => {
               const exists = (prev || []).some((item) => String(item.designId || '') === String(nextDesign.designId || ''));
               return exists ? prev : [nextDesign, ...(prev || [])];
             });
             setSelectedDesignId(nextDesign.designId);
-            setChatFormatDesign(null); // 실제 design이 생겼으므로 임시 override 해제
+            setChatFormatDesign(null);
           }
           setOutputMode('FREE_FORM');
           if (designResult.job) bindJobResult(designResult.job);
-          // Step 3: 설계된 양식으로 엑셀 생성
           const excelResult = await generateExcelApi(job.id, {
             fileName,
             outputMode: 'FREE_FORM',
@@ -1066,14 +828,17 @@ export default function DocumentWorkspacePage() {
             chatSessionId: activeSessionId || null,
             design: nextDesign || null,
             designId: nextDesign?.designId || null,
+            userFormatRequest: chat.targetFormat || null,
           });
           setGeneratedExcel(excelResult.excel);
+          const preview = excelResult.excel?.preview || excelResult.preview;
+          if (preview?.rows?.length && preview?.columns?.length) setGeneratedExcelPreview(preview);
           await refreshDownloads();
           setTab('excel');
           appendChat({
             role: 'assistant',
-            content: `Gemini가 "${targetLabel}" 양식을 새로 설계하고 엑셀을 생성했습니다. 미리보기와 다운로드 버튼에서 확인하세요.`,
-            quickReplies: ['다운로드', '다른 형식으로 바꿔줘', '비교표로 만들어줘'],
+            content: `"${targetLabel}" 양식으로 엑셀을 생성했습니다. 미리보기와 다운로드 버튼에서 확인하세요.`,
+            quickReplies: ['다운로드', '다른 형식으로', '수정하기'],
           });
         } catch (excelErr) {
           appendChat({
@@ -1093,7 +858,6 @@ export default function DocumentWorkspacePage() {
         quickReplies: fallback?.quickReplies || ['이 문서 뭐야?', '확인 필요한 부분만 보여줘'],
       });
       if (fallback?.recommendedTab) setTab(fallback.recommendedTab);
-      // 로컬 fallback에서도 GENERATE_EXCEL: Gemini 맞춤 설계
       if (fallback?.action === 'GENERATE_EXCEL' && job?.id) {
         const FORMAT_LABEL_MAP = { REPORT: '보고서', MEETING_MINUTES: '회의록', OFFICIAL_LETTER: '공문' };
         const targetLabel = FORMAT_LABEL_MAP[fallback.targetFormat] || '보고서';
@@ -1129,6 +893,21 @@ export default function DocumentWorkspacePage() {
     }
   };
 
+  const handlePreviewCellEdit = (address, newText) => {
+    setGeneratedExcelPreview((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        rows: prev.rows.map((row) => ({
+          ...row,
+          cells: (row.cells || []).map((cell) =>
+            cell.address === address ? { ...cell, text: newText } : cell
+          ),
+        })),
+      };
+    });
+  };
+
   const updateCell = (rowIndex, key, value) => {
     setTable((prev) => {
       const baseColumns = prev.columns || [];
@@ -1143,10 +922,32 @@ export default function DocumentWorkspacePage() {
 
   const addRow = () => {
     setTable((prev) => ({ ...prev, rows: [...prev.rows, Object.fromEntries(prev.columns.map((col) => [col.key, '']))] }));
+    setGeneratedExcelPreview((prev) => {
+      if (!prev || !Array.isArray(prev.rows) || !Array.isArray(prev.columns) || prev.columns.length === 0) return prev;
+      const lastRowNum = prev.rows.reduce((max, r) => Math.max(max, r.rowNumber || 0), 0);
+      const newRowNum = lastRowNum + 1;
+      return {
+        ...prev,
+        rows: [...prev.rows, {
+          rowNumber: newRowNum,
+          heightPx: 22,
+          cells: prev.columns
+            .filter((col) => !col.hidden)
+            .map((col) => ({ address: `${col.letter}${newRowNum}`, text: '', style: { backgroundColor: '#ffffff', textAlign: 'left' } })),
+        }],
+      };
+    });
   };
 
   const removeRow = (rowIndex) => {
     setTable((prev) => ({ ...prev, rows: prev.rows.filter((_, index) => index !== rowIndex) }));
+  };
+
+  const removePreviewRow = (rowNumber) => {
+    setGeneratedExcelPreview((prev) => {
+      if (!prev || !Array.isArray(prev.rows)) return prev;
+      return { ...prev, rows: prev.rows.filter((r) => r.rowNumber !== rowNumber) };
+    });
   };
 
   const makeUniqueColumnKey = (base, columns = []) => {
@@ -1158,9 +959,9 @@ export default function DocumentWorkspacePage() {
     return `${clean}_${index}`;
   };
 
-  const addColumn = () => {
-    const label = window.prompt('추가할 컬럼명을 입력하세요. 예: 납기일, 공급조건, 설치비');
-    if (!label) return;
+  const addColumn = async () => {
+    const { isConfirmed, value: label } = await Swal.fire({ title: '컬럼 추가', input: 'text', inputLabel: '추가할 컬럼명을 입력하세요', inputPlaceholder: '예: 납기일, 공급조건, 설치비', showCancelButton: true, confirmButtonText: '추가', cancelButtonText: '취소', confirmButtonColor: '#6366f1', inputValidator: (v) => !v?.trim() ? '컬럼명을 입력해주세요.' : undefined });
+    if (!isConfirmed || !label?.trim()) return;
     setTable((prev) => {
       const key = makeUniqueColumnKey(label, prev.columns);
       return {
@@ -1169,10 +970,149 @@ export default function DocumentWorkspacePage() {
         rows: (prev.rows || []).map((row) => ({ ...row, [key]: '' })),
       };
     });
+    setGeneratedExcelPreview((prev) => {
+      if (!prev || !Array.isArray(prev.columns) || !Array.isArray(prev.rows)) return prev;
+      const allLetters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+      const usedLetters = new Set(prev.columns.map((c) => c.letter));
+      const nextLetter = allLetters.split('').find((l) => !usedLetters.has(l));
+      if (!nextLetter) return prev;
+
+      // 헤더 row 감지: 첫 8행 중 스타일 있는(비흰색 배경) 셀 + 텍스트가 가장 많은 row
+      const isNonWhite = (bg) => {
+        if (!bg) return false;
+        const n = bg.replace('#', '').toLowerCase();
+        return n !== 'ffffff' && n !== 'fff' && n.length >= 3;
+      };
+      const firstRows = prev.rows.filter((r) => r.rowNumber <= 8);
+      const headerRow = firstRows.reduce((best, r) => {
+        const visibleCells = (r.cells || []).filter((c) => !c.isMergedHidden);
+        const styledTextCount = visibleCells.filter((c) => c.text?.trim() && isNonWhite(c.style?.backgroundColor)).length;
+        return styledTextCount > (best?.score || 0) ? { row: r, score: styledTextCount } : best;
+      }, null)?.row
+        // fallback: 첫 8행 중 텍스트 셀이 가장 많은 row (row 1 제외)
+        || firstRows.filter((r) => r.rowNumber > 1).reduce((best, r) => {
+          const cnt = (r.cells || []).filter((c) => !c.isMergedHidden && c.text?.trim()).length;
+          return cnt > (best?.score || 0) ? { row: r, score: cnt } : best;
+        }, null)?.row;
+
+      const headerRowNum = headerRow?.rowNumber;
+      const sampleHeaderStyle = headerRow?.cells?.find((c) => !c.isMergedHidden && c.text?.trim() && isNonWhite(c.style?.backgroundColor))?.style
+        || { backgroundColor: '#374151', color: '#ffffff', textAlign: 'center', fontWeight: 700 };
+      const colLetters = prev.columns.map((c) => c.letter);
+      const currentColCount = colLetters.length;
+      const newCols = [...prev.columns, { letter: nextLetter, widthPx: 80, hidden: false }];
+      const newRows = prev.rows.map((r) => {
+        // 기존 셀 중 colSpan이 마지막 컬럼까지 닿는 셀을 찾아 colSpan 확장
+        const updatedCells = (r.cells || []).map((cell) => {
+          // colSpan > 1 인 실제 병합셀만 처리 (colSpan:1 은 비병합 일반 셀)
+          if (!cell.colSpan || cell.colSpan <= 1 || cell.isMergedHidden) return cell;
+          const cellLetter = cell.address.match(/^([A-Z]+)/)?.[1] || '';
+          const cellColIdx = colLetters.indexOf(cellLetter);
+          if (cellColIdx >= 0 && cellColIdx + cell.colSpan === currentColCount) {
+            return { ...cell, colSpan: cell.colSpan + 1 };
+          }
+          return cell;
+        });
+        // 이 행의 어떤 셀이 마지막 컬럼까지 병합돼 있으면 새 셀은 숨김 처리
+        const isRowFullyMerged = updatedCells.some((cell) => {
+          if (cell.isMergedHidden || !cell.colSpan || cell.colSpan <= 1) return false;
+          const cellLetter = cell.address.match(/^([A-Z]+)/)?.[1] || '';
+          const cellColIdx = colLetters.indexOf(cellLetter);
+          return cellColIdx >= 0 && cellColIdx + cell.colSpan > currentColCount;
+        });
+        const newCell = {
+          address: `${nextLetter}${r.rowNumber}`,
+          text: !isRowFullyMerged && r.rowNumber === headerRowNum ? label.trim() : '',
+          style: !isRowFullyMerged && r.rowNumber === headerRowNum ? { ...sampleHeaderStyle } : { backgroundColor: '#ffffff', textAlign: 'left' },
+          ...(isRowFullyMerged ? { isMergedHidden: true } : {}),
+        };
+        return { ...r, cells: [...updatedCells, newCell] };
+      });
+      return { ...prev, columns: newCols, rows: newRows };
+    });
   };
 
-  const removeColumn = (key) => {
-    if (!key || !window.confirm('이 컬럼을 삭제할까요?')) return;
+  const removePreviewColumn = (letter) => {
+    setGeneratedExcelPreview((prev) => {
+      if (!prev || !Array.isArray(prev.columns) || !Array.isArray(prev.rows)) return prev;
+      const newCols = prev.columns.filter((c) => c.letter !== letter);
+      const newRows = prev.rows.map((r) => ({
+        ...r,
+        cells: (r.cells || []).filter((c) => {
+          const cellLetter = c.address.match(/^([A-Z]+)/)?.[1];
+          return cellLetter !== letter;
+        }),
+      }));
+      return { ...prev, columns: newCols, rows: newRows };
+    });
+  };
+
+  const mergePreviewCells = (topLeftAddr, rowSpan, colSpan, allAddresses) => {
+    const mergeSet = new Set(allAddresses);
+    setGeneratedExcelPreview((prev) => {
+      if (!prev || !Array.isArray(prev.rows)) return prev;
+      const newRows = prev.rows.map((row) => ({
+        ...row,
+        cells: (row.cells || []).map((cell) => {
+          if (cell.address === topLeftAddr) {
+            return { ...cell, rowSpan: rowSpan > 1 ? rowSpan : undefined, colSpan: colSpan > 1 ? colSpan : undefined };
+          }
+          if (mergeSet.has(cell.address) && cell.address !== topLeftAddr) {
+            return { ...cell, isMergedHidden: true };
+          }
+          return cell;
+        }),
+      }));
+      return { ...prev, rows: newRows };
+    });
+  };
+
+  const splitPreviewCell = (address) => {
+    setGeneratedExcelPreview((prev) => {
+      if (!prev || !Array.isArray(prev.rows)) return prev;
+      let targetCell = null;
+      for (const row of prev.rows) {
+        for (const cell of (row.cells || [])) {
+          if (cell.address === address) { targetCell = cell; break; }
+        }
+        if (targetCell) break;
+      }
+      if (!targetCell) return prev;
+      const rowSpan = targetCell.rowSpan || 1;
+      const colSpan = targetCell.colSpan || 1;
+      if (rowSpan <= 1 && colSpan <= 1) return prev;
+      const letter = address.match(/^([A-Z]+)/)?.[1];
+      const rowNum = parseInt(address.match(/([0-9]+)$/)?.[1]);
+      if (!letter || !rowNum) return prev;
+      const allLetters = prev.columns.map((c) => c.letter);
+      const startCI = allLetters.indexOf(letter);
+      const affected = new Set();
+      for (let r = rowNum; r < rowNum + rowSpan; r++) {
+        for (let ci = startCI; ci < startCI + colSpan; ci++) {
+          if (allLetters[ci]) affected.add(`${allLetters[ci]}${r}`);
+        }
+      }
+      const newRows = prev.rows.map((row) => ({
+        ...row,
+        cells: (row.cells || []).map((cell) => {
+          if (cell.address === address) {
+            const { rowSpan: _rs, colSpan: _cs, ...rest } = cell;
+            return rest;
+          }
+          if (affected.has(cell.address) && cell.address !== address) {
+            return { ...cell, isMergedHidden: false };
+          }
+          return cell;
+        }),
+      }));
+      return { ...prev, rows: newRows };
+    });
+  };
+
+  const removeColumn = async (key) => {
+    if (!key) return;
+    const { isConfirmed } = await Swal.fire({ title: '컬럼 삭제', text: '이 컬럼과 해당 데이터를 삭제합니다.', icon: 'warning', showCancelButton: true, confirmButtonText: '삭제', cancelButtonText: '취소', confirmButtonColor: '#ef4444', reverseButtons: true });
+    if (!isConfirmed) return;
     setTable((prev) => ({
       ...prev,
       columns: (prev.columns || []).filter((col) => col.key !== key),
@@ -1234,7 +1174,6 @@ export default function DocumentWorkspacePage() {
     }
   };
 
-
   const applyRecommendedTemplate = (recommendation) => {
     const rawTemplateId = recommendation?.templateId || recommendation?.id || recommendation?.template?.id;
     const rawTemplateName = recommendation?.templateName || recommendation?.template_name || recommendation?.template?.templateName || recommendation?.template?.template_name || '';
@@ -1263,8 +1202,6 @@ export default function DocumentWorkspacePage() {
       setAiTemplateCreating(true);
       setLoading(true);
       await saveTable();
-      // 여기서는 선택한 후보를 그대로 저장하지 않고, Gemini 2.5 Flash가 현재 요청/분석결과/표 구조를 기준으로
-      // 실제 회사 문서형 엑셀 양식 구조를 새로 설계하도록 맡긴다.
       const result = await createAiTemplateApi(job.id, { tableId: table.id || null, forceGeminiDesign: true });
       const newTemplate = result.template;
       const nextDesign = result.design || null;
@@ -1309,25 +1246,27 @@ export default function DocumentWorkspacePage() {
         chatSessionId: activeSessionId || null,
         templateLayoutMode: outputMode === 'COMPANY_TEMPLATE' ? templateLayoutMode : null,
         design: outputMode === 'FREE_FORM' ? selectedDesign : null,
-        designId: outputMode === 'FREE_FORM' ? selectedDesign?.designId : null
+        designId: outputMode === 'FREE_FORM' ? selectedDesign?.designId : null,
+        userFormatRequest: chatFormatRequest?.format || null,
+        theme: chatFormatRequest?.theme || table._theme || null,
       });
       setGeneratedExcel(result.excel);
       await refreshDownloads();
       setMessage('엑셀 파일이 생성되었습니다. 다운로드 버튼을 누르세요.');
-      // 엑셀 생성 응답에 미리보기 데이터가 포함되면 바로 표시
       const preview = result.excel?.preview || result.preview;
       if (preview && Array.isArray(preview.rows) && preview.rows.length > 0
           && Array.isArray(preview.columns) && preview.columns.length > 0) {
         setGeneratedExcelPreview(preview);
-        setTab('excel');
+      } else {
+        setGeneratedExcelPreview(null);
       }
+      setTab('excel');
     } catch (err) {
       setMessage(err.response?.data?.message || '엑셀 생성 중 오류가 발생했습니다.');
     } finally {
       setLoading(false);
     }
   };
-
 
   const activeProcessingList = Object.values(processingJobs);
   const currentJobRunning = isBackgroundRunning(job?.status);
@@ -1412,11 +1351,24 @@ export default function DocumentWorkspacePage() {
         )}
       </section>
 
-      {message && <div className="rounded-3xl border border-brand-100 bg-brand-50 px-5 py-4 text-sm font-bold text-brand-700">{message}</div>}
+      {/* 단계별 로딩 표시 */}
+      {loadingStep && (
+        <div className="flex items-center gap-3 rounded-3xl border border-blue-100 bg-blue-50 px-5 py-3.5 text-sm font-bold text-blue-700">
+          <svg className="h-4 w-4 animate-spin text-blue-500" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+          {loadingStep}
+        </div>
+      )}
+
+      {message && (
+        <div className={`rounded-3xl border px-5 py-4 text-sm font-bold ${message.startsWith('분석 실패') || message.startsWith('오류') ? 'border-red-200 bg-red-50 text-red-700' : message.startsWith('✓') ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-brand-100 bg-brand-50 text-brand-700'}`}>
+          {message}
+        </div>
+      )}
 
       {activeProcessingList.length > 0 && (
-        <div className="rounded-3xl border border-amber-100 bg-amber-50 px-5 py-4 text-sm font-bold text-amber-800">
-          백그라운드 처리 중: {activeProcessingList.map((item) => `${item.title || `작업 ${item.id}`} · ${statusLabel(item.status)}`).join(' / ')}
+        <div className="flex items-center gap-3 rounded-3xl border border-amber-100 bg-amber-50 px-5 py-3.5 text-sm font-bold text-amber-800">
+          <svg className="h-4 w-4 animate-spin text-amber-500" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+          AI 분석 진행 중: {activeProcessingList.map((item) => item.title || `작업 ${item.id}`).join(', ')}
         </div>
       )}
 
@@ -1452,7 +1404,12 @@ export default function DocumentWorkspacePage() {
             </div>
             <div className="flex flex-wrap gap-2">
               <TabButton active={tab === 'analysis'} onClick={() => setTab('analysis')}>문서 분석</TabButton>
-              <TabButton active={tab === 'excel'} onClick={() => setTab('excel')}>엑셀 미리보기</TabButton>
+              {(analysis.narrativeReport || analysis.narrative_report) && (
+                <TabButton active={tab === 'report'} onClick={() => setTab('report')}>보고서</TabButton>
+              )}
+              {((table?.rows?.length || 0) > 0 || generatedExcelPreview) && (
+                <TabButton active={tab === 'excel'} onClick={() => setTab('excel')}>엑셀 미리보기</TabButton>
+              )}
               <TabButton active={tab === 'source'} onClick={() => setTab('source')}>원본 문서</TabButton>
             </div>
           </div>
@@ -1460,7 +1417,8 @@ export default function DocumentWorkspacePage() {
           <div className="scroll-thin min-h-0 flex-1 overflow-y-auto p-5">
             <TableSelector tables={tables} selectedIndex={selectedTableIndex} onSelect={selectTableByIndex} />
             {tab === 'analysis' && <AnalysisView analysis={analysis} issues={issues} table={table} onMoveTable={() => setTab('excel')} onMoveExcel={() => setTab('excel')} />}
-            {tab === 'excel' && <ExcelPreview table={table} issues={issues} outputMode={outputMode} selectedTemplate={selectedTemplate} selectedDesign={selectedDesign} writerName={writerName} templateLayoutMode={templateLayoutMode} templatePreview={templatePreview} templatePreviewLoading={templatePreviewLoading} templatePreviewError={templatePreviewError} updateCell={updateCell} addRow={addRow} removeRow={removeRow} addColumn={addColumn} removeColumn={removeColumn} updateColumnLabel={updateColumnLabel} saveTable={saveTable} disabled={loading} candidateFields={candidateFields} onCandidateAction={handleCandidateFieldAction} generatedExcelPreview={generatedExcelPreview} analysis={analysis} />}
+            {tab === 'report' && <ReportView analysis={analysis} />}
+            {tab === 'excel' && <ExcelPreview table={table} issues={issues} outputMode={outputMode} selectedTemplate={selectedTemplate} selectedDesign={selectedDesign} writerName={writerName} templateLayoutMode={templateLayoutMode} templatePreview={templatePreview} templatePreviewLoading={templatePreviewLoading} templatePreviewError={templatePreviewError} updateCell={updateCell} addRow={addRow} removeRow={removeRow} addColumn={addColumn} removeColumn={removeColumn} updateColumnLabel={updateColumnLabel} saveTable={saveTable} disabled={loading} candidateFields={candidateFields} onCandidateAction={handleCandidateFieldAction} generatedExcelPreview={generatedExcelPreview} analysis={analysis} onPreviewCellEdit={handlePreviewCellEdit} onRemovePreviewRow={removePreviewRow} onRemovePreviewColumn={removePreviewColumn} onMergePreview={mergePreviewCells} onSplitPreview={splitPreviewCell} onRefreshPreview={generatedExcel && job?.id ? createExcel : null} />}
             {tab === 'source' && <SourceView files={analyzedFiles} sourceText={sourceText} />}
           </div>
         </section>
@@ -1508,2611 +1466,3 @@ export default function DocumentWorkspacePage() {
     </div>
   );
 }
-
-
-
-function classifyDesign(layout = '') {
-  const text = String(layout || '').toUpperCase();
-  if (text.includes('VENDOR_COMPARISON_REVIEW') || text.includes('VENDOR_COMPARE_REVIEW')) return '비교 검토보고서';
-  if (text.includes('REVIEW_OPINION')) return '검토 의견서';
-  if (text.includes('DYNAMIC_VENDOR') || (text.includes('VENDOR') && !text.includes('REVIEW'))) return '업체 반복';
-  if (text.includes('ESTIMATE')) return '견적서';
-  if (text.includes('PRICE') || text.includes('UNIT')) return '단가표';
-  if (text.includes('MEETING')) return '회의록';
-  if (text.includes('OFFICIAL')) return '공문';
-  if (text.includes('REPORT') || text.includes('SECTION') || text.includes('APPROVAL')) return '보고서';
-  return '기본 표';
-}
-
-function AiTemplateRecommendationBox({ job, recommendations = [], designCandidates = [], candidateFields = [], outputMode = 'FREE_FORM', selectedTemplate, selectedTemplateId, selectedDesignId, registeredTemplates = [], onSelectDesign, onApply, onChangeOutputMode, onCreateAiTemplate, creating, loading }) {
-  const isCompanyMode = outputMode === 'COMPANY_TEMPLATE';
-  const [showAllAiCandidates, setShowAllAiCandidates] = useState(false);
-  const designs = Array.isArray(designCandidates) ? designCandidates : [];
-  const registeredTemplateIds = new Set((registeredTemplates || []).map((tpl) => String(tpl.id || tpl.templateId || '')).filter(Boolean));
-  const list = (Array.isArray(recommendations) ? recommendations : [])
-    .filter((item) => registeredTemplateIds.has(String(item.templateId || item.id || '')))
-    .sort((a, b) => Number(b.score || 0) - Number(a.score || 0));
-  const activeDesign = !isCompanyMode ? (designs.find((item) => String(item.designId || '') === String(selectedDesignId || '')) || null) : null;
-  const activeRecommendation = isCompanyMode ? (list.find((item) => String(item.templateId || item.id || '') === String(selectedTemplateId || '')) || null) : null;
-  const recommendedIds = new Set(list.map((item) => String(item.templateId || item.id || '')).filter(Boolean));
-  const directTemplates = (registeredTemplates || [])
-    .filter((tpl) => !recommendedIds.has(String(tpl.id || tpl.templateId || '')))
-    .map((tpl, index) => ({
-      templateId: tpl.id || tpl.templateId,
-      templateName: tpl.templateName || tpl.template_name,
-      templateType: tpl.templateType || tpl.template_type,
-      score: 0,
-      rank: list.length + index + 1,
-      reasons: ['등록된 회사 양식입니다. 적용 전 미리보기에서 입력 위치를 확인하세요.'],
-      template: tpl,
-      recommendationType: 'REGISTERED_TEMPLATE',
-    }));
-  const companyChoices = [...list, ...directTemplates]
-    .filter((item, index, arr) => arr.findIndex((other) => String(other.templateId || other.id || '') === String(item.templateId || item.id || '')) === index);
-  const visibleAiDesigns = showAllAiCandidates ? designs : designs.slice(0, 3);
-  const currentTitle = isCompanyMode
-    ? (selectedTemplate?.templateName || activeRecommendation?.templateName || '등록한 회사 양식을 선택하세요')
-    : (activeDesign?.name || 'Gemini로 새 양식을 생성하세요');
-  const currentDescription = isCompanyMode
-    ? ((activeRecommendation?.reasons || [])[0] || selectedTemplate?.description || '등록한 엑셀 양식에 분석 데이터를 매핑합니다.')
-    : (activeDesign?.reason || 'Gemini가 사용자 요청과 문서 분석 결과를 기준으로 새 회사 문서 양식을 생성합니다.');
-  const visibleCandidateFields = (candidateFields || []).slice(0, 6);
-  const needNewTemplate = job?.id && !companyChoices.length && designs.length > 0;
-
-  const tabButtonClass = (active) => `rounded-2xl px-4 py-2 text-sm font-black transition ${active ? 'bg-slate-950 text-white shadow-glow' : 'bg-white text-slate-600 ring-1 ring-slate-200 hover:bg-slate-50'}`;
-
-  return (
-    <div className="mt-4 rounded-[28px] border border-slate-200 bg-gradient-to-br from-slate-50 to-white p-4 shadow-card">
-      <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
-        <div className="min-w-0">
-          <div className="flex flex-wrap items-center gap-2">
-            <p className="text-[11px] font-black uppercase tracking-[0.18em] text-brand-500">출력 양식 선택</p>
-            {job?.id ? <Badge tone="green">현재 문서 분석 기준</Badge> : <Badge tone="slate">파일 분석 후 자동 추천</Badge>}
-            {needNewTemplate && <Badge tone="amber">회사 양식 없음</Badge>}
-          </div>
-          <h4 className="mt-2 text-lg font-black text-slate-950">Gemini가 사용자 요청에 맞는 회사 문서형 엑셀 양식을 새로 만듭니다.</h4>
-        </div>
-        {!isCompanyMode && (
-          <button
-            type="button"
-            onClick={onCreateAiTemplate}
-            disabled={!job?.id || loading || creating}
-            className="shrink-0 rounded-2xl bg-gradient-to-r from-slate-900 to-brand-700 px-4 py-2.5 text-xs font-black text-white shadow-glow disabled:bg-slate-200 disabled:from-slate-200 disabled:to-slate-200 disabled:text-slate-400"
-            title="Gemini 2.5 Flash가 사용자 요청과 문서 분석 결과를 기준으로 새 엑셀 양식을 설계합니다."
-          >
-            {creating ? 'Gemini 양식 생성 중' : 'Gemini로 회사 양식 생성'}
-          </button>
-        )}
-      </div>
-
-      <div className="mt-4 flex flex-wrap gap-2">
-        <button type="button" onClick={() => onChangeOutputMode?.('FREE_FORM')} className={tabButtonClass(!isCompanyMode)}>AI 생성양식</button>
-        <button type="button" onClick={() => onChangeOutputMode?.('COMPANY_TEMPLATE')} className={tabButtonClass(isCompanyMode)}>등록한 회사 양식</button>
-      </div>
-
-      <div className="mt-4 rounded-3xl border border-white bg-white/90 p-4 shadow-card">
-        <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
-          <div className="min-w-0">
-            <p className="text-[11px] font-black uppercase tracking-[0.18em] text-slate-400">현재 선택</p>
-            <h5 className="mt-1 truncate text-base font-black text-slate-950">{currentTitle}</h5>
-            <p className="mt-2 line-clamp-2 text-xs font-bold leading-5 text-slate-600">{currentDescription}</p>
-          </div>
-          <div className="flex shrink-0 flex-wrap gap-2 md:justify-end">
-            <Badge tone={isCompanyMode ? 'blue' : 'green'}>{isCompanyMode ? '등록한 회사 양식' : 'AI 생성양식'}</Badge>
-            {!isCompanyMode && activeDesign?.layout && <Badge tone="slate">{classifyDesign(activeDesign.layout)}</Badge>}
-            {!isCompanyMode && activeDesign?.score ? <Badge tone={Number(activeDesign.score) >= 85 ? 'green' : Number(activeDesign.score) >= 70 ? 'amber' : 'slate'}>{Math.round(Number(activeDesign.score))}점</Badge> : null}
-            {isCompanyMode && activeRecommendation?.score ? <Badge tone={Number(activeRecommendation.score) >= 80 ? 'green' : Number(activeRecommendation.score) >= 60 ? 'amber' : 'slate'}>{Math.round(Number(activeRecommendation.score))}점</Badge> : null}
-          </div>
-        </div>
-      </div>
-
-      {!isCompanyMode ? (
-        <div className="mt-3 rounded-3xl border border-emerald-100 bg-white/90 p-4 shadow-card">
-          <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-            <div>
-              <p className="text-xs font-black text-slate-800">Gemini AI 생성양식</p>
-              <p className="mt-1 text-xs font-bold leading-5 text-slate-500">
-                기존 후보 점수표를 고르지 않고, 사용자 요청과 분석된 문서 내용을 기준으로 Gemini가 새 엑셀 양식 JSON을 설계합니다.
-              </p>
-            </div>
-            <Badge tone={activeDesign ? 'green' : 'slate'}>{activeDesign ? '생성됨' : '생성 전'}</Badge>
-          </div>
-          {activeDesign ? (
-            <div className="mt-3 rounded-2xl border border-emerald-100 bg-emerald-50 p-3 text-xs font-bold leading-5 text-emerald-800">
-              현재 생성 양식: {activeDesign.name || activeDesign.title || 'AI 생성 양식'} · {classifyDesign(activeDesign.layout || activeDesign.layoutType)}
-            </div>
-          ) : (
-            <div className="mt-3 rounded-2xl border border-dashed border-slate-200 bg-slate-50 p-4 text-xs font-bold leading-5 text-slate-500">
-              문서 분석이 완료되면 오른쪽 위의 <span className="font-black text-slate-700">Gemini로 회사 양식 생성</span> 버튼을 눌러 새 양식을 만드세요. 상단 후보 목록과 점수 추천은 사용하지 않습니다.
-            </div>
-          )}
-        </div>
-      ) : (
-        <div className="mt-3 rounded-3xl border border-brand-100 bg-white/90 p-3 shadow-card">
-          <div className="mb-3 flex items-center justify-between gap-2">
-            <div>
-              <p className="text-xs font-black text-slate-800">등록한 회사 양식</p>
-              <p className="mt-1 text-[11px] font-bold text-slate-400">관리자/사용자가 업로드한 회사 양식만 표시합니다. 기본 후보와 AI 생성 후보는 제외됩니다.</p>
-            </div>
-            <Badge tone="blue">{companyChoices.length}개</Badge>
-          </div>
-          {companyChoices.length > 0 ? (
-            <div className="space-y-2">
-              {companyChoices.map((item) => {
-                const active = String(selectedTemplateId || '') === String(item.templateId || item.id || '');
-                return (
-                  <div key={`${item.templateId || item.id}-${item.rank || item.templateName}`} className={`flex flex-col gap-3 rounded-2xl border p-3 md:flex-row md:items-center md:justify-between ${active ? 'border-brand-300 bg-brand-50' : 'border-slate-200 bg-white'}`}>
-                    <div className="min-w-0 flex-1">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <p className="text-sm font-black text-slate-900">{item.rank || 1}순위 · {item.templateName}</p>
-                        {Number(item.score || 0) > 0 && <Badge tone={Number(item.score || 0) >= 80 ? 'green' : Number(item.score || 0) >= 60 ? 'amber' : 'slate'}>{Math.round(Number(item.score || 0))}점</Badge>}
-                        {active && <Badge tone="blue">적용됨</Badge>}
-                      </div>
-                      <p className="mt-1 text-xs font-bold text-slate-500">{(item.reasons || []).slice(0, 2).join(' · ') || item.templateType || '등록한 회사 양식'}</p>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => onApply(item)}
-                      disabled={loading}
-                      className={`shrink-0 rounded-2xl px-4 py-2 text-xs font-black ${active ? 'bg-brand-100 text-brand-700' : 'bg-slate-900 text-white hover:bg-brand-700'} disabled:opacity-50`}
-                    >
-                      {active ? '적용됨' : '이 양식 적용'}
-                    </button>
-                  </div>
-                );
-              })}
-            </div>
-          ) : (
-            <div className="rounded-2xl border border-dashed border-slate-200 bg-slate-50 p-4 text-xs font-bold leading-5 text-slate-500">
-              등록된 회사 양식이 없습니다. Gemini로 새 회사 문서 양식을 생성하세요.
-            </div>
-          )}
-        </div>
-      )}
-
-      {candidateFields.length > 0 && (
-        <div className="mt-3 rounded-2xl border border-amber-100 bg-amber-50 px-3 py-2 text-xs font-bold text-amber-800">
-          신규 컬럼 후보 {candidateFields.length}개{visibleCandidateFields.length ? `: ${visibleCandidateFields.map((item) => `${item.originalLabel}→${item.suggestedFieldKey}`).join(' / ')}` : ''}
-          {candidateFields.length > visibleCandidateFields.length ? ` 외 ${candidateFields.length - visibleCandidateFields.length}개` : ''}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function ChatAssistantPanel({
-  files,
-  handleFiles,
-  removePendingFile,
-  clearPendingFiles,
-  fileInputRef,
-  userRequest,
-  setUserRequest,
-  selectedTemplate,
-  outputMode = 'FREE_FORM',
-  loading,
-  backgroundRunning = false,
-  jobStatus = '',
-  onSend,
-  chatMessages,
-  chatSessions = [],
-  activeSessionId = '',
-  downloads = [],
-  onNewChat,
-  onSelectSession,
-  onDeleteSession
-}) {
-  const hasFiles = files.length > 0;
-  const quickRequests = ['기준 항목 표로 정리해줘', '단가 기준만 표로 정리해줘', '이 문서 뭐야?'];
-  const messagesBodyRef = useRef(null);
-  const stickToBottomRef = useRef(true);
-  const [dragActive, setDragActive] = useState(false);
-  const [isComposing, setIsComposing] = useState(false);
-  const [showFileList, setShowFileList] = useState(false);
-  const [showDownloadList, setShowDownloadList] = useState(false);
-  const [showJumpToBottom, setShowJumpToBottom] = useState(false);
-
-  const scrollChatToBottom = (behavior = 'auto') => {
-    const container = messagesBodyRef.current;
-    if (!container) return;
-    container.scrollTo({ top: container.scrollHeight, behavior });
-    stickToBottomRef.current = true;
-    setShowJumpToBottom(false);
-  };
-
-  const handleMessagesScroll = () => {
-    const container = messagesBodyRef.current;
-    if (!container) return;
-    const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
-    const nearBottom = distanceFromBottom < 90;
-    stickToBottomRef.current = nearBottom;
-    setShowJumpToBottom(!nearBottom);
-  };
-
-  useEffect(() => {
-    const lastMessage = (chatMessages || [])[chatMessages.length - 1];
-    const shouldAutoScroll = lastMessage?.role === 'user';
-    if (!shouldAutoScroll) {
-      const container = messagesBodyRef.current;
-      if (container) {
-        const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
-        setShowJumpToBottom(distanceFromBottom > 90);
-      }
-      return;
-    }
-    requestAnimationFrame(() => scrollChatToBottom('auto'));
-  }, [chatMessages]);
-
-  useEffect(() => {
-    setShowFileList(false);
-  }, [files.length]);
-
-  useEffect(() => {
-    setShowDownloadList(false);
-  }, [downloads.length]);
-
-  const stopDragEvent = (event) => {
-    event.preventDefault();
-    event.stopPropagation();
-  };
-
-  const handleDragOver = (event) => {
-    stopDragEvent(event);
-    setDragActive(true);
-  };
-
-  const handleDragLeave = (event) => {
-    stopDragEvent(event);
-    if (!event.currentTarget.contains(event.relatedTarget)) {
-      setDragActive(false);
-    }
-  };
-
-  const handleDrop = (event) => {
-    stopDragEvent(event);
-    setDragActive(false);
-    handleFiles(event.dataTransfer.files);
-  };
-
-  const submitCurrent = () => {
-    const text = String(userRequest || '').trim();
-    if (!text && !hasFiles) return;
-    onSend(text || '첨부한 문서를 분석해줘');
-  };
-
-  return (
-    <aside
-      onDragOver={handleDragOver}
-      onDragLeave={handleDragLeave}
-      onDrop={handleDrop}
-      className={`relative flex min-h-[680px] flex-col overflow-hidden rounded-[32px] border bg-white shadow-soft 2xl:h-full 2xl:min-h-0 ${dragActive ? 'border-brand-400 ring-4 ring-brand-100' : 'border-slate-200'}`}
-    >
-      {dragActive && (
-        <div className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center bg-brand-50/80 backdrop-blur-sm">
-          <div className="rounded-[28px] border-2 border-dashed border-brand-400 bg-white px-8 py-6 text-center shadow-card">
-            <p className="text-lg font-black text-brand-700">여기에 파일을 놓으세요</p>
-            <p className="mt-2 text-sm font-bold text-slate-500">파일은 바로 업로드되지 않고 전송 시 요청 내용과 함께 올라갑니다.</p>
-          </div>
-        </div>
-      )}
-
-      <div className="flex items-center justify-between gap-3 border-b border-slate-200 bg-white px-5 py-4">
-        <div>
-          <h4 className="text-lg font-black text-slate-950">AI 작업 채팅</h4>
-          <p className="mt-1 text-xs font-bold text-slate-500">첨부 파일은 채팅창에 표시되고 목록은 아이콘으로 관리합니다.</p>
-        </div>
-        <div className="flex items-center gap-2">
-          <button type="button" onClick={onNewChat} disabled={loading} className="rounded-2xl bg-slate-100 px-3 py-2 text-xs font-black text-slate-600 hover:bg-slate-200 disabled:opacity-50">새 채팅</button>
-          <Badge tone={loading || backgroundRunning ? 'amber' : 'blue'}>{loading ? '응답 중' : (backgroundRunning ? statusLabel(jobStatus) : '준비됨')}</Badge>
-        </div>
-      </div>
-
-
-      <div className="border-b border-slate-100 bg-white px-4 py-3">
-        <div className="mb-2 flex items-center justify-between">
-          <p className="text-xs font-black text-slate-500">채팅 목록</p>
-          <p className="text-[11px] font-bold text-slate-400">새 채팅 전까지 현재 문서 유지</p>
-        </div>
-        <div className="scroll-thin flex gap-2 overflow-x-auto pb-1">
-          {(chatSessions || []).map((session) => (
-            <div
-              key={session.id}
-              className={`group relative max-w-[240px] shrink-0 rounded-2xl border pr-9 ${String(activeSessionId) === String(session.id) ? 'border-brand-300 bg-brand-50 text-brand-700' : 'border-slate-200 bg-slate-50 text-slate-600 hover:bg-slate-100'}`}
-            >
-              <button
-                type="button"
-                onClick={() => onSelectSession?.(session.id)}
-                disabled={loading}
-                className="block w-full px-3 py-2 text-left text-xs font-black disabled:opacity-50"
-              >
-                <span className="block truncate">{session.title || session.jobTitle || '문서 작업 채팅'}</span>
-                <span className="mt-1 block truncate text-[11px] font-bold opacity-70">{session.messageCount || 0}개 메시지 · {session.jobStatus || '대기'}</span>
-              </button>
-              <button
-                type="button"
-                onClick={(event) => { event.stopPropagation(); onDeleteSession?.(session.id); }}
-                disabled={loading}
-                title="채팅 삭제"
-                className="absolute right-2 top-1/2 flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded-full bg-white text-[13px] font-black text-slate-400 shadow-sm ring-1 ring-slate-200 hover:bg-rose-50 hover:text-rose-600 disabled:opacity-40"
-              >×</button>
-            </div>
-          ))}
-          {(!chatSessions || chatSessions.length === 0) && <span className="rounded-2xl bg-slate-50 px-3 py-2 text-xs font-bold text-slate-400">저장된 채팅 없음</span>}
-        </div>
-      </div>
-
-      <div ref={messagesBodyRef} onScroll={handleMessagesScroll} className="scroll-thin flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto bg-gradient-to-b from-white to-brand-50/30 px-4 py-5">
-        <div className="flex items-start gap-3">
-          <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-2xl bg-gradient-to-br from-brand-500 to-brand-300 text-sm font-black text-white shadow-card">AI</div>
-          <div className="max-w-[88%] rounded-[24px] rounded-tl-md border border-slate-200 bg-white px-4 py-3 shadow-card">
-            <p className="text-sm font-bold leading-6 text-slate-700">파일을 첨부한 뒤 요청 내용을 입력하고 Enter를 누르면 파일과 요청이 함께 업로드됩니다. 분석 결과가 있으면 표/이슈 기준으로 답변합니다.</p>
-            <div className="mt-3 rounded-2xl border border-brand-100 bg-brand-50 px-3 py-2 text-xs font-black text-brand-700">
-              현재 기준<br />{outputMode === 'COMPANY_TEMPLATE' ? (selectedTemplate?.templateName ? `등록 양식 적용 · ${selectedTemplate.templateName}` : '등록 양식 적용 · 템플릿 선택 필요') : 'AI 추천양식 · 미리보기 기준'}
-            </div>
-          </div>
-        </div>
-
-        {(chatMessages || []).map((msg) => (
-          <ChatBubble key={msg.id} message={msg} onQuickSend={onSend} disabled={loading} onPreview={() => setTab('excel')} />
-        ))}
-
-        {hasFiles && (
-          <PendingFilesBubble
-            files={files}
-            onRemove={removePendingFile}
-            onClear={clearPendingFiles}
-            onOpenList={() => setShowFileList(true)}
-            disabled={loading}
-          />
-        )}
-
-        {loading && (
-          <div className="flex items-start gap-3">
-            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-2xl bg-brand-50 text-xs font-black text-brand-700">AI</div>
-            <div className="max-w-[88%] rounded-[24px] rounded-tl-md border border-slate-200 bg-white px-4 py-3 text-sm font-bold text-slate-500 shadow-card">
-              요청을 처리하는 중입니다...
-            </div>
-          </div>
-        )}
-        {showJumpToBottom && (
-          <button
-            type="button"
-            onClick={() => scrollChatToBottom('smooth')}
-            className="sticky bottom-2 ml-auto rounded-full bg-slate-900 px-3 py-2 text-[11px] font-black text-white shadow-glow"
-          >맨 아래로</button>
-        )}
-      </div>
-
-      <div className="shrink-0 border-t border-slate-200 bg-white p-4">
-        <div className="mb-3 flex flex-wrap gap-2">
-          {quickRequests.map((text) => (
-            <button
-              key={text}
-              type="button"
-              onClick={() => onSend(text)}
-              disabled={loading}
-              className="rounded-full bg-brand-50 px-3 py-1.5 text-xs font-black text-brand-700 hover:bg-brand-100 disabled:opacity-50"
-            >{text}</button>
-          ))}
-        </div>
-
-        <input
-          ref={fileInputRef}
-          multiple
-          type="file"
-          className="hidden"
-          accept=".pdf,.xlsx,.xls,.csv,.txt,.docx,.json,.md"
-          onChange={(e) => {
-            handleFiles(e.target.files);
-            e.target.value = '';
-          }}
-        />
-
-        {hasFiles && showFileList && (
-          <div className="mb-3 rounded-[22px] border border-brand-100 bg-brand-50/70 p-3">
-            <div className="mb-2 flex items-center justify-between gap-2">
-              <p className="text-xs font-black text-brand-700">첨부 파일 관리 {files.length}개</p>
-              <div className="flex items-center gap-1">
-                <button
-                  type="button"
-                  onClick={() => setShowFileList(false)}
-                  disabled={loading}
-                  className="rounded-full px-2 py-1 text-[11px] font-black text-slate-500 hover:bg-white disabled:opacity-50"
-                >숨김</button>
-                <button
-                  type="button"
-                  onClick={clearPendingFiles}
-                  disabled={loading}
-                  className="rounded-full px-2 py-1 text-[11px] font-black text-slate-500 hover:bg-white disabled:opacity-50"
-                >전체 삭제</button>
-              </div>
-            </div>
-            <div className="scroll-thin max-h-36 space-y-2 overflow-y-auto pr-1">
-              {files.map((file, index) => (
-                <div key={`${file.name}-${file.size}-${file.lastModified || index}`} className="flex items-center gap-3 rounded-2xl border border-slate-200 bg-white px-3 py-2 shadow-card">
-                  <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-brand-50 text-brand-600">📄</div>
-                  <div className="min-w-0 flex-1">
-                    <p className="truncate text-xs font-black text-slate-800">{file.name}</p>
-                    <p className="mt-0.5 text-[11px] font-bold text-slate-400">전송 대기 · {Math.ceil(file.size / 1024).toLocaleString()} KB</p>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => removePendingFile(index)}
-                    disabled={loading}
-                    className="shrink-0 rounded-xl px-2 py-1 text-xs font-black text-slate-400 hover:bg-rose-50 hover:text-rose-600 disabled:opacity-50"
-                  >×</button>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
-
-
-        {downloads.length > 0 && showDownloadList && (
-          <div className="mb-3 rounded-[22px] border border-emerald-100 bg-emerald-50/70 p-3">
-            <div className="mb-2 flex items-center justify-between gap-2">
-              <p className="text-xs font-black text-emerald-700">최근 다운로드 목록</p>
-              <button
-                type="button"
-                onClick={() => setShowDownloadList(false)}
-                className="rounded-full px-2 py-1 text-[11px] font-black text-slate-500 hover:bg-white"
-              >숨김</button>
-            </div>
-            <div className="scroll-thin max-h-24 space-y-1.5 overflow-y-auto pr-1">
-              {downloads.slice(0, 5).map((item) => (
-                <a key={item.id} href={excelDownloadUrl(item.jobId, item.id)} target="_blank" rel="noreferrer" className="block truncate rounded-2xl bg-white px-3 py-2 text-xs font-black text-slate-700 hover:bg-emerald-50">
-                  ⬇ {item.fileName}
-                </a>
-              ))}
-            </div>
-          </div>
-        )}
-
-        <div className="flex items-end gap-2 rounded-[26px] border border-slate-200 bg-white p-2 shadow-card focus-within:border-brand-400 focus-within:ring-4 focus-within:ring-brand-100">
-          <button
-            type="button"
-            onClick={() => fileInputRef.current?.click()}
-            className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl bg-brand-50 text-xl font-black text-brand-700 hover:bg-brand-100"
-            aria-label="파일 첨부"
-          >＋</button>
-          {hasFiles && (
-            <button
-              type="button"
-              onClick={() => setShowFileList((prev) => !prev)}
-              className="flex h-11 shrink-0 items-center justify-center rounded-2xl bg-slate-100 px-3 text-xs font-black text-slate-700 hover:bg-slate-200"
-              title={showFileList ? '첨부 파일 목록 숨김' : '첨부 파일 목록 보기'}
-            >📎 {files.length}</button>
-          )}
-          {downloads.length > 0 && (
-            <button
-              type="button"
-              onClick={() => setShowDownloadList((prev) => !prev)}
-              className="flex h-11 shrink-0 items-center justify-center rounded-2xl bg-emerald-50 px-3 text-xs font-black text-emerald-700 hover:bg-emerald-100"
-              title={showDownloadList ? '최근 다운로드 목록 숨김' : '최근 다운로드 목록 보기'}
-            >⬇ {downloads.length}</button>
-          )}
-          <textarea
-            value={userRequest}
-            onChange={(e) => setUserRequest(e.target.value)}
-            onCompositionStart={() => setIsComposing(true)}
-            onCompositionEnd={() => setIsComposing(false)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' && !e.shiftKey && !isComposing && !e.nativeEvent.isComposing) {
-                e.preventDefault();
-                submitCurrent();
-              }
-            }}
-            rows={1}
-            placeholder="요청 입력 후 Enter · Shift+Enter 줄바꿈"
-            className="scroll-thin max-h-24 min-h-[44px] flex-1 resize-none bg-transparent px-2 py-3 text-sm font-bold leading-5 text-slate-800 outline-none placeholder:text-slate-400"
-          />
-          <button
-            type="button"
-            onClick={submitCurrent}
-            disabled={loading || (!String(userRequest || '').trim() && !hasFiles)}
-            className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl bg-gradient-to-br from-brand-500 to-brand-300 text-lg font-black text-white shadow-glow hover:from-brand-600 hover:to-brand-400 disabled:from-slate-300 disabled:to-slate-300"
-            aria-label="요청 전송"
-          >▶</button>
-        </div>
-      </div>
-    </aside>
-  );
-}
-
-
-function PendingFilesBubble({ files, onRemove, onClear, onOpenList, disabled }) {
-  if (!Array.isArray(files) || files.length === 0) return null;
-
-  return (
-    <div className="ml-auto max-w-[92%] rounded-[24px] rounded-tr-md border border-brand-100 bg-brand-50 px-4 py-3 shadow-card">
-      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-        <div>
-          <p className="text-sm font-black text-brand-800">첨부 파일 {files.length}개</p>
-          <p className="mt-1 text-xs font-bold text-slate-500">요청 입력 후 Enter를 누르면 이 파일들로 분석 작업이 등록됩니다.</p>
-        </div>
-        <div className="flex shrink-0 items-center gap-1">
-          <button type="button" onClick={onOpenList} disabled={disabled} className="rounded-xl bg-white px-2.5 py-1.5 text-[11px] font-black text-brand-700 hover:bg-brand-100 disabled:opacity-50">목록</button>
-          <button type="button" onClick={onClear} disabled={disabled} className="rounded-xl bg-white px-2.5 py-1.5 text-[11px] font-black text-slate-500 hover:bg-rose-50 hover:text-rose-600 disabled:opacity-50">삭제</button>
-        </div>
-      </div>
-      <div className="mt-3 space-y-1.5">
-        {files.slice(0, 4).map((file, index) => (
-          <div key={`${file.name}-${file.size}-${file.lastModified || index}`} className="flex items-center gap-2 rounded-2xl bg-white px-3 py-2 text-xs font-black text-slate-700">
-            <span className="shrink-0">📄</span>
-            <span className="min-w-0 flex-1 truncate">{file.name}</span>
-            <span className="shrink-0 text-[11px] text-slate-400">{Math.ceil((file.size || 0) / 1024).toLocaleString()} KB</span>
-            <button
-              type="button"
-              onClick={() => onRemove(index)}
-              disabled={disabled}
-              className="shrink-0 rounded-lg px-1.5 py-0.5 text-xs font-black text-slate-400 hover:bg-rose-50 hover:text-rose-600 disabled:opacity-50"
-              aria-label="첨부 파일 제거"
-            >×</button>
-          </div>
-        ))}
-        {files.length > 4 && <p className="px-1 text-[11px] font-bold text-slate-400">외 {files.length - 4}개 파일은 목록 버튼으로 확인할 수 있습니다.</p>}
-      </div>
-    </div>
-  );
-}
-
-function ChatBubble({ message, onQuickSend, disabled, onPreview }) {
-  const isUser = message.role === 'user';
-  if (isUser) {
-    return (
-      <div className="ml-auto max-w-[88%] rounded-[24px] rounded-tr-md bg-gradient-to-r from-brand-500 to-brand-300 px-4 py-3 text-sm font-black leading-6 text-white shadow-glow">
-        <p className="whitespace-pre-wrap">{message.content}</p>
-        {Array.isArray(message.files) && message.files.length > 0 && (
-          <div className="mt-3 space-y-1.5">
-            {message.files.map((file, index) => (
-              <div key={`${file.name}-${index}`} className="rounded-2xl bg-white/15 px-3 py-2 text-xs font-black text-white">
-                📄 {file.name} · {Math.ceil((file.size || 0) / 1024).toLocaleString()} KB
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
-    );
-  }
-
-  const showPreviewButton = message.action === 'SHOW_PREVIEW' || message.showPreview;
-
-  return (
-    <div className="flex items-start gap-3">
-      <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-2xl bg-brand-50 text-xs font-black text-brand-700">AI</div>
-      <div className="max-w-[88%] rounded-[24px] rounded-tl-md border border-slate-200 bg-white px-4 py-3 shadow-card">
-        <p className="whitespace-pre-wrap text-sm font-bold leading-6 text-slate-700">{message.content}</p>
-        {/* 엑셀 생성 완료 버튼 */}
-        {message.generatedExcel && (
-          <div className="mt-3 flex flex-wrap gap-2">
-            <button type="button" onClick={onPreview} className="inline-flex items-center gap-1 rounded-2xl bg-brand-50 px-3 py-2 text-xs font-black text-brand-700 hover:bg-brand-100">
-              📊 엑셀 미리보기
-            </button>
-            <a href={excelDownloadUrl(message.generatedExcel.jobId, message.generatedExcel.id)} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 rounded-2xl bg-gradient-to-r from-emerald-500 to-brand-500 px-3 py-2 text-xs font-black text-white">
-              ⬇ 다운로드
-            </a>
-          </div>
-        )}
-        {/* 분석 완료 후 미리보기 버튼 */}
-        {showPreviewButton && !message.generatedExcel && (
-          <div className="mt-3">
-            <button type="button" onClick={onPreview} className="inline-flex items-center gap-1 rounded-2xl bg-brand-50 px-3 py-2 text-xs font-black text-brand-700 hover:bg-brand-100">
-              📊 엑셀 미리보기 열기
-            </button>
-          </div>
-        )}
-        {Array.isArray(message.quickReplies) && message.quickReplies.length > 0 && (
-          <div className="mt-3 flex flex-wrap gap-2">
-            {message.quickReplies.slice(0, 3).map((text) => (
-              <button
-                key={text}
-                type="button"
-                disabled={disabled}
-                onClick={() => onQuickSend(text)}
-                className="rounded-2xl bg-brand-50 px-3 py-1.5 text-[11px] font-black text-brand-700 hover:bg-brand-100 disabled:opacity-50"
-              >{text}</button>
-            ))}
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function TableSelector({ tables, selectedIndex, onSelect }) {
-  if (!Array.isArray(tables) || tables.length <= 1) return null;
-
-  return (
-    <div className="mb-4 rounded-3xl border border-brand-100 bg-brand-50/80 p-4">
-      <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-        <div>
-          <p className="text-sm font-black text-brand-700">추출된 표 선택</p>
-          <p className="mt-1 text-xs font-bold text-slate-500">이미지 표가 여러 개면 페이지/표 단위로 나누어 저장됩니다. 선택한 표만 수정·엑셀 생성 대상입니다.</p>
-        </div>
-        <select
-          value={selectedIndex}
-          onChange={(event) => onSelect(event.target.value)}
-          className="min-w-[260px] rounded-2xl border border-brand-200 bg-white px-4 py-3 text-sm font-black text-slate-800 outline-none focus:border-brand-500 focus:ring-4 focus:ring-brand-100"
-        >
-          {tables.map((item, index) => {
-            const page = item.page || item.tableJson?.page;
-            const rowCount = item.rowCount ?? (item.rows || []).length;
-            const title = item.tableName || `표 ${index + 1}`;
-            return (
-              <option key={item.id || `${index}-${title}`} value={index}>
-                {index + 1}. {page ? `${page}페이지 · ` : ''}{title} · {rowCount}행
-              </option>
-            );
-          })}
-        </select>
-      </div>
-    </div>
-  );
-}
-
-
-const parseAmountValue = (value) => {
-  const num = Number(String(value ?? '').replace(/[^0-9.-]/g, ''));
-  return Number.isFinite(num) ? num : 0;
-};
-
-const formatWonValue = (value) => {
-  const num = parseAmountValue(value);
-  return num ? `${num.toLocaleString()}원` : '-';
-};
-
-const cleanVendorLabel = (value) => {
-  const raw = String(value ?? '').trim();
-  if (!raw) return '';
-  return raw
-    .replace(/^[A-Z]회사\s*/g, '')
-    .replace(/^[A-Z]\s*회사\s*/g, '')
-    .replace(/\s+/g, ' ')
-    .trim();
-};
-
-const normalizeVendorName = (value) => cleanVendorLabel(value)
-  .replace(/[\s·,._()\[\]{}㈜주식회사]/g, '')
-  .toLowerCase();
-
-const getVendorNameFromColumn = (column) => {
-  const label = cleanVendorLabel(column?.label || column?.header || column?.name || column?.key || '');
-  if (!label) return '';
-  return label
-    .replace(/\s*(단가|금액|업체\s*단가|업체\s*금액)\s*$/g, '')
-    .replace(/\s+/g, ' ')
-    .trim();
-};
-
-const getVendorColumnGroups = (table) => {
-  const columns = Array.isArray(table?.columns) ? table.columns : [];
-  const groups = new Map();
-
-  columns.forEach((column) => {
-    const label = String(column?.label || column?.header || column?.name || '').trim();
-    if (!label) return;
-    if (/최저|표준|기준|요청|수량|공종|규격|단위|비고|관리/.test(label)) return;
-    if (!/(단가|금액)/.test(label)) return;
-
-    const vendor = getVendorNameFromColumn(column);
-    const normalized = normalizeVendorName(vendor);
-    if (!normalized) return;
-    const existing = groups.get(normalized) || { vendor, unitPriceKey: null, amountKey: null, unitPriceLabel: '', amountLabel: '' };
-    if (/단가/.test(label) && !existing.unitPriceKey) {
-      existing.unitPriceKey = column.key;
-      existing.unitPriceLabel = label;
-    }
-    if (/금액/.test(label) && !existing.amountKey) {
-      existing.amountKey = column.key;
-      existing.amountLabel = label;
-    }
-    groups.set(normalized, existing);
-  });
-
-  return Array.from(groups.values());
-};
-
-const getCompareVendorCount = (table) => {
-  const groups = getVendorColumnGroups(table);
-  if (groups.length) return groups.length;
-  const meta = table?.tableJson?.meta || table?.meta || {};
-  if (Number(meta.vendorCount || 0)) return Number(meta.vendorCount);
-  return 0;
-};
-
-const getRequestedQuantityText = (rows) => {
-  const quantities = [...new Set(rows.map((row) => row.quantity || row.request_quantity).filter((v) => v !== undefined && v !== null && String(v).trim() !== ''))];
-  if (!quantities.length) return '-';
-  return quantities.slice(0, 5).join(', ');
-};
-
-const getItemNameSummary = (rows, limit = 6) => {
-  const names = [...new Set(rows.map((row) => row.item_name || row.itemName || row.name).filter(Boolean))];
-  if (!names.length) return '-';
-  const shown = names.slice(0, limit).join(', ');
-  return names.length > limit ? `${shown} 외 ${names.length - limit}건` : shown;
-};
-
-const buildVendorSummaryCards = (table) => {
-  const rows = Array.isArray(table?.rows) ? table.rows : [];
-  const groups = getVendorColumnGroups(table);
-  if (!rows.length || !groups.length) return [];
-  const lowestVendors = rows.map((row) => normalizeVendorName(row.lowest_vendor)).filter(Boolean);
-
-  return groups.map((group) => {
-    const totalAmount = rows.reduce((sum, row) => sum + parseAmountValue(row[group.amountKey]), 0);
-    const avgUnitPrice = rows.length
-      ? Math.round(rows.reduce((sum, row) => sum + parseAmountValue(row[group.unitPriceKey]), 0) / rows.length)
-      : 0;
-    const lowestCount = lowestVendors.filter((vendor) => vendor && vendor === normalizeVendorName(group.vendor)).length;
-    return {
-      vendor: group.vendor,
-      totalAmount,
-      avgUnitPrice,
-      lowestCount,
-      rows: rows.length,
-      desc: `최저 ${lowestCount}건 · 평균 단가 ${avgUnitPrice ? avgUnitPrice.toLocaleString() : '-'}원`,
-    };
-  }).sort((a, b) => {
-    if (b.lowestCount !== a.lowestCount) return b.lowestCount - a.lowestCount;
-    return a.totalAmount - b.totalAmount;
-  });
-};
-
-const buildAnalysisTextCards = (analysis) => {
-  const keyValues = Array.isArray(analysis?.keyValues) ? analysis.keyValues : [];
-  const getValue = (patterns) => {
-    const hit = keyValues.find((kv) => patterns.some((pattern) => pattern.test(String(kv.label || ''))));
-    return hit?.value;
-  };
-  return [
-    { label: '분석 요약', value: analysis?.summary },
-    { label: 'LLM 검토', value: getValue([/LLM\s*검토/, /검토/]) },
-    { label: '검색 키워드', value: getValue([/검색\s*키워드/, /키워드/]) },
-    { label: 'LLM 역할', value: getValue([/LLM\s*역할/, /역할/]) },
-  ].filter((item) => item.value && String(item.value).trim());
-};
-
-const buildCoreDataCards = (analysis, table, issues = []) => {
-  const rows = Array.isArray(table?.rows) ? table.rows : [];
-  const meta = table?.tableJson?.meta || table?.meta || {};
-  const tableType = table?.tableType || table?.table_type || '';
-  if (isMultiVendorCompareTableType(tableType)) {
-    const vendorSummaries = buildVendorSummaryCards(table);
-    const bestVendorText = vendorSummaries
-      .filter((item) => item.lowestCount > 0)
-      .slice(0, 3)
-      .map((item) => `${item.vendor} ${item.lowestCount}건`)
-      .join(', ') || '-';
-    const lowestTotal = rows.reduce((sum, row) => sum + parseAmountValue(row.lowest_amount), 0);
-    const selectedVendors = getVendorColumnGroups(table).map((item) => item.vendor).join(', ') || '-';
-    const tableColumnCount = Array.isArray(table?.columns) ? table.columns.length : 0;
-    return [
-      { label: '분석된 비교 행', value: `${rows.length.toLocaleString()}행` },
-      { label: '표 컬럼 수', value: `${tableColumnCount.toLocaleString()}개` },
-      { label: '비교 업체', value: selectedVendors },
-      { label: '비교 업체 수', value: `${getCompareVendorCount(table).toLocaleString()}개` },
-      { label: '요청/대상 품목', value: getItemNameSummary(rows, 6) },
-      { label: '요청 수량', value: getRequestedQuantityText(rows) },
-      { label: '최저 업체 요약', value: bestVendorText },
-      { label: '최저 금액 합계', value: lowestTotal ? `${lowestTotal.toLocaleString()}원` : '-' },
-      { label: '표준시장단가 표시', value: meta.standardPriceHidden ? '기본 숨김' : (meta.standardPriceShown ? '표시' : '기본 숨김') },
-      { label: '확인 필요', value: `${issues.length}건` },
-    ];
-  }
-
-  const firstRow = rows[0] || {};
-  const priorityKeys = ['item_name', 'spec', 'quantity', 'unit', 'unit_price', 'amount', 'lowest_amount', 'remark'];
-  const cards = priorityKeys
-    .filter((key) => firstRow[key] !== undefined && String(firstRow[key] ?? '').trim() !== '')
-    .map((key) => ({ label: key, value: String(firstRow[key]) }));
-  if (cards.length) return cards.slice(0, 8);
-  return [
-    { label: '문서 유형', value: analysis?.documentType || '-' },
-    { label: '표 행 수', value: `${rows.length.toLocaleString()}행` },
-    { label: '확인 필요', value: `${issues.length}건` },
-  ];
-};
-
-function AnalysisView({ analysis, issues, table, onMoveTable, onMoveExcel }) {
-  const coreDataCards = buildCoreDataCards(analysis, table, issues);
-  const vendorSummaryCards = buildVendorSummaryCards(table);
-  const analysisTextCards = buildAnalysisTextCards(analysis);
-  const isCompareTable = isMultiVendorCompareTableType(table?.tableType || table?.table_type || '');
-  return (
-    <div className="w-full max-w-none space-y-4">
-      <div className="overflow-hidden rounded-[30px] border border-slate-200 bg-white shadow-card">
-        <div className="border-b border-slate-200 bg-gradient-to-br from-brand-50 via-white to-emerald-50 p-6">
-          <div className="flex flex-col gap-5 2xl:flex-row 2xl:items-center 2xl:justify-between">
-            <div>
-              <div className="flex flex-wrap items-center gap-2">
-                <Badge tone="blue">AI 문서 분석</Badge>
-                <Badge tone="green">엑셀화 가능</Badge>
-                <Badge tone={issues.length ? 'amber' : 'green'}>확인 필요 {issues.length}건</Badge>
-              </div>
-              <h4 className="mt-4 text-2xl font-black tracking-tight text-slate-950 lg:text-3xl">이 문서는 <span className="text-brand-700">{analysis.documentType}</span>입니다.</h4>
-              <p className="mt-3 max-w-5xl text-sm leading-7 text-slate-600 lg:text-base">{analysis.summary}</p>
-            </div>
-            <div className="grid w-full grid-cols-3 gap-2 2xl:w-[430px]">
-              <Metric label="분석 신뢰도" value={`${analysis.confidence || 0}%`} tone="blue" />
-              <Metric label="표 후보" value={`${analysis.tableCount || 0}개`} />
-              <Metric label="확인 필요" value={`${analysis.issueCount || 0}건`} tone="amber" />
-            </div>
-          </div>
-        </div>
-
-        <div className="grid grid-cols-1 gap-3 p-5 md:grid-cols-2 xl:grid-cols-4">
-          <InfoCard icon="📄" title="무슨 문서인가요?" value={analysis.documentType} desc={analysis.purpose} />
-          <InfoCard icon="📊" title="무엇이 들어있나요?" value={tableTypeLabel(table.tableType || table.table_type)} desc={`${table.rows?.length || 0}개 행을 표로 만들 수 있습니다.`} />
-          <InfoCard icon="🧾" title="어떤 양식에 넣나요?" value="선택 산출 방식" desc="자유형 또는 등록 양식 기준으로 엑셀 생성" />
-          <InfoCard icon="⚠️" title="무엇을 확인하나요?" value={`${issues.length}건`} desc={issues[0]?.message || '현재 확인 필요 항목이 없습니다.'} warning={issues.length > 0} />
-        </div>
-      </div>
-
-      <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
-        {!!(analysis.fileProfiles || []).length && (
-          <div className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-card xl:col-span-2">
-            <h4 className="text-lg font-black text-slate-950">첨부 파일별 분석 결과</h4>
-            <div className="mt-4 grid grid-cols-1 gap-3 lg:grid-cols-2 xl:grid-cols-3">
-              {(analysis.fileProfiles || []).map((file) => (
-                <div key={`${file.index}-${file.fileName}`} className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
-                  <div className="flex items-center justify-between gap-2">
-                    <p className="truncate text-sm font-black text-slate-950">{file.fileName}</p>
-                    <Badge tone={file.role === 'COMPARE_TARGET' ? 'blue' : file.role === 'REFERENCE_PRICE' ? 'green' : 'slate'}>{file.roleLabel || file.role}</Badge>
-                  </div>
-                  <p className="mt-2 text-xs font-black text-brand-700">{file.documentType}</p>
-                  <p className="mt-1 text-xs leading-5 text-slate-600">{file.summary}</p>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
-        <div className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-card">
-          <h4 className="text-lg font-black text-slate-950">문서에서 읽은 핵심 데이터</h4>
-          <p className="mt-1 text-xs font-bold text-slate-500">첫 행 1개가 아니라 현재 표 전체 기준으로 요약합니다.</p>
-          <div className="mt-4 grid grid-cols-1 gap-2 sm:grid-cols-2">
-            {coreDataCards.map((item, index) => (
-              <div key={`${item.label}-${index}`} className="rounded-2xl border border-slate-200 bg-slate-50 px-3 py-3">
-                <p className="text-xs font-black text-slate-400">{item.label}</p>
-                <p className="mt-1 break-words text-sm font-black text-slate-900">{String(item.value || '-')}</p>
-              </div>
-            ))}
-            {!coreDataCards.length && <p className="col-span-2 text-sm font-bold text-slate-400">분석 후 핵심 데이터가 표시됩니다.</p>}
-          </div>
-        </div>
-        <div className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-card">
-          <h4 className="text-lg font-black text-slate-950">LLM 분석 적용 상태</h4>
-          {analysis.llmUsage && (
-            <div className="mt-4 grid grid-cols-1 gap-2 sm:grid-cols-2">
-              {[
-                ['의도분석', analysis.llmUsage.intentAnalysis],
-                ['표 추출', analysis.llmUsage.tableExtraction],
-                ['단가 계산', analysis.llmUsage.priceCalculation],
-                ['요약/검증', analysis.llmUsage.summaryAnalysis],
-                ['LLM 직접 표 생성', analysis.llmUsage.structureGeneration]
-              ].map(([label, item]) => (
-                <div key={label} className="rounded-2xl border border-brand-100 bg-brand-50 px-3 py-3">
-                  <p className="text-xs font-black text-brand-500">{label}</p>
-                  <p className="mt-1 break-words text-sm font-black text-slate-900">{item?.status || '-'}</p>
-                  <p className="mt-1 break-words text-[11px] font-bold text-slate-500">{item?.source || ''}</p>
-                </div>
-              ))}
-            </div>
-          )}
-          <div className="mt-4 grid grid-cols-1 gap-2 sm:grid-cols-2">
-            {(analysis.keyValues || []).filter((kv) => /LLM|의도|검색 키워드|모델/.test(String(kv.label || ''))).slice(0, 8).map((kv, index) => (
-              <div key={`${kv.label}-${index}`} className="rounded-2xl border border-slate-200 bg-slate-50 px-3 py-3">
-                <p className="text-xs font-black text-slate-500">{kv.label}</p>
-                <p className="mt-1 break-words text-sm font-black text-slate-900">{String(kv.value ?? '-')}</p>
-              </div>
-            ))}
-            {!analysis.llmUsage && !(analysis.keyValues || []).some((kv) => /LLM|의도|검색 키워드|모델/.test(String(kv.label || ''))) && (
-              <p className="col-span-full text-sm font-bold text-slate-400">LLM 적용 상태가 아직 표시되지 않았습니다. 분석 서버 응답의 keyValues를 확인하세요.</p>
-            )}
-          </div>
-        </div>
-        {isCompareTable && vendorSummaryCards.length > 0 && (
-          <div className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-card xl:col-span-2">
-            <div className="flex flex-col gap-2 lg:flex-row lg:items-end lg:justify-between">
-              <div>
-                <h4 className="text-lg font-black text-slate-950">업체별 비교 요약</h4>
-                <p className="mt-1 text-xs font-bold text-slate-500">현재 표에 실제 표시된 업체 컬럼만 기준으로 합계·평균·최저 횟수를 계산합니다.</p>
-              </div>
-              <Badge tone="blue">표 기준 자동 계산</Badge>
-            </div>
-            <div className="mt-4 grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
-              {vendorSummaryCards.map((item) => (
-                <div key={item.vendor} className="rounded-3xl border border-slate-200 bg-slate-50 p-4">
-                  <div className="flex items-start justify-between gap-2">
-                    <p className="break-words text-sm font-black text-slate-950">{item.vendor}</p>
-                    {item.lowestCount > 0 && <Badge tone="green">최저 {item.lowestCount}건</Badge>}
-                  </div>
-                  <div className="mt-3 grid grid-cols-2 gap-2">
-                    <div className="rounded-2xl bg-white px-3 py-2">
-                      <p className="text-[11px] font-black text-slate-400">합계 금액</p>
-                      <p className="mt-1 text-sm font-black text-slate-900">{item.totalAmount ? `${item.totalAmount.toLocaleString()}원` : '-'}</p>
-                    </div>
-                    <div className="rounded-2xl bg-white px-3 py-2">
-                      <p className="text-[11px] font-black text-slate-400">평균 단가</p>
-                      <p className="mt-1 text-sm font-black text-slate-900">{item.avgUnitPrice ? `${item.avgUnitPrice.toLocaleString()}원` : '-'}</p>
-                    </div>
-                  </div>
-                  <p className="mt-3 text-xs font-bold leading-5 text-slate-500">{item.desc}</p>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
-
-        {analysisTextCards.length > 0 && (
-          <div className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-card xl:col-span-2">
-            <h4 className="text-lg font-black text-slate-950">AI 분석 내용</h4>
-            <p className="mt-1 text-xs font-bold text-slate-500">LLM 요약·검토 의견은 설명용으로 표시하고, 표 추출과 금액 계산은 파서 결과를 기준으로 유지합니다.</p>
-            <div className="mt-4 grid grid-cols-1 gap-3 lg:grid-cols-2">
-              {analysisTextCards.map((item, index) => (
-                <div key={`${item.label}-${index}`} className="rounded-3xl border border-brand-100 bg-gradient-to-br from-brand-50 to-white p-4">
-                  <p className="text-xs font-black text-brand-600">{item.label}</p>
-                  <p className="mt-2 whitespace-pre-wrap text-sm font-bold leading-6 text-slate-700">{String(item.value)}</p>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
-
-        <div className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-card">
-          <h4 className="text-lg font-black text-slate-950">엑셀화 방향</h4>
-          <div className="mt-4 rounded-2xl border border-brand-100 bg-brand-50 p-4">
-            <p className="text-xs font-black text-brand-700">만들 결과</p>
-            <p className="mt-1 text-sm font-black text-slate-950">검토 가능한 표 기반 엑셀</p>
-            <p className="mt-1 text-xs leading-5 text-slate-600">엑셀 미리보기에서 먼저 수정하고 재검증한 뒤 엑셀로 다운로드합니다.</p>
-          </div>
-          <div className="mt-3 flex flex-wrap gap-2">
-            <button onClick={onMoveTable} className="rounded-2xl bg-gradient-to-r from-brand-500 to-brand-400 px-4 py-2.5 text-xs font-black text-white shadow-glow hover:from-brand-600 hover:to-brand-500">미리보기 편집</button>
-            <button onClick={onMoveExcel} className="rounded-2xl bg-brand-50 px-4 py-2.5 text-xs font-black text-brand-700">엑셀 미리보기</button>
-          </div>
-        </div>
-      </div>
-
-      {issues.length > 0 && (
-        <div className="rounded-[28px] border border-amber-100 bg-amber-50 p-5 shadow-card">
-          <h4 className="text-lg font-black text-amber-800">사용자 확인이 필요한 항목</h4>
-          <div className="mt-3 space-y-2">
-            {issues.map((issue, index) => <p key={index} className="text-sm font-bold leading-6 text-amber-700">• {issue.message}</p>)}
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-function formatPreviewDate() {
-  const parts = new Intl.DateTimeFormat('ko-KR', { timeZone: 'Asia/Seoul', year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(new Date()).reduce((acc, part) => ({ ...acc, [part.type]: part.value }), {});
-  return `${parts.year}.${parts.month}.${parts.day}`;
-}
-
-function compactText(value) {
-  return String(value || '').replace(/\s+/g, '').toLowerCase();
-}
-
-function toPreviewNumber(value) {
-  if (typeof value === 'number') return Number.isFinite(value) ? value : 0;
-  const num = Number(String(value ?? '').replace(/,/g, '').replace(/[^0-9.-]/g, ''));
-  return Number.isFinite(num) ? num : 0;
-}
-
-function formatMoney(value) {
-  if (value === '' || value == null) return '';
-  const num = toPreviewNumber(value);
-  if (!num) return String(value ?? '');
-  return num.toLocaleString();
-}
-
-function normalizePreviewVendorLabel(name) {
-  return String(name || '')
-    .replace(/\s+/g, ' ')
-    .replace(/\s*(단가|금액|견적가|견적단가)$/g, '')
-    .trim();
-}
-
-function comparableCompanyName(name) {
-  return String(name || '')
-    .replace(/주식회사|\(주\)|㈜|（주）/g, '')
-    .replace(/[\s._\-()（）\[\]{}·,]/g, '')
-    .toLowerCase();
-}
-
-function isIgnoredVendorLabel(label) {
-  const normalized = normalizePreviewVendorLabel(label);
-  return /^(기준|표준|일반|최저|최고|차이|대비|요청|계산|산출|공급|세액|금액|단가)$/i.test(normalized)
-    || /(기준|표준|일반|최저|최고|차이|대비|요청|계산|산출)\s*(단가|금액)?$/i.test(label || '');
-}
-
-function inferPreviewVendors(table) {
-  const columns = table.columns || [];
-  const rows = table.rows || [];
-  const metaVendors = Array.isArray(table.tableJson?.meta?.vendors) ? table.tableJson.meta.vendors : [];
-  const metaVendorByIndex = new Map();
-  metaVendors.forEach((vendor, index) => {
-    const actualIndex = Number.isFinite(Number(vendor?.index)) ? Number(vendor.index) : index;
-    const name = vendor?.name || vendor?.vendorName || vendor?.label || vendor;
-    if (name) metaVendorByIndex.set(actualIndex, vendor);
-  });
-  const map = new Map();
-  const put = (name, patch = {}) => {
-    const clean = normalizePreviewVendorLabel(name);
-    const key = comparableCompanyName(clean);
-    if (!clean || !key || isIgnoredVendorLabel(clean)) return null;
-    if (!map.has(key)) map.set(key, { name: clean, compareKey: key, ...patch });
-    else map.set(key, { ...map.get(key), ...patch, name: map.get(key).name || clean, compareKey: key });
-    return map.get(key);
-  };
-
-  metaVendors.forEach((vendor, index) => {
-    const name = vendor?.name || vendor?.vendorName || vendor?.label || vendor;
-    put(name, {
-      index,
-      unitPriceKey: vendor?.unitPriceKey || vendor?.priceKey,
-      amountKey: vendor?.amountKey,
-      specKey: vendor?.specKey,
-      quantityKey: vendor?.quantityKey
-    });
-  });
-
-  columns.forEach((col) => {
-    const key = String(col.key || '');
-    const label = String(col.label || key || '').trim();
-    if (!label) return;
-    const isVendorColumn = /(단가|금액|견적가|견적단가)$/i.test(label) && !isIgnoredVendorLabel(label);
-    if (isVendorColumn) {
-      const vendor = put(label);
-      if (!vendor) return;
-      if (/금액$/.test(label)) vendor.amountKey = key;
-      else vendor.unitPriceKey = key;
-    }
-
-    const keyMatch = key.match(/^(?:vendor|company|target)[_\-]?(\d+)[_\-]?(name|spec|quantity|qty|unit_price|price|amount)$/i);
-    if (keyMatch) {
-      const rawIdx = Number(keyMatch[1]);
-      // vendor_1_unit_price는 1부터, meta.vendors index는 0부터 저장된다.
-      const zeroIndex = rawIdx > 0 ? rawIdx - 1 : rawIdx;
-      const field = keyMatch[2].toLowerCase();
-      const metaVendor = metaVendorByIndex.get(zeroIndex) || metaVendorByIndex.get(rawIdx);
-      const rowName = String(metaVendor?.name || metaVendor?.vendorName || metaVendor?.label || '').trim()
-        || rows.find((row) => row?.[`vendor_${rawIdx}_name`] || row?.[`company_${rawIdx}_name`])?.[`vendor_${rawIdx}_name`]
-        || rows.find((row) => row?.[`company_${rawIdx}_name`])?.[`company_${rawIdx}_name`];
-      const labelName = normalizePreviewVendorLabel(label);
-      const fallbackName = !isIgnoredVendorLabel(labelName) && /(단가|금액|견적가|견적단가)$/i.test(label) ? labelName : '';
-      // 실제 회사명을 모르면 업체2/업체3 같은 가짜 업체명을 만들지 않는다.
-      const vendor = put(rowName || fallbackName, { index: zeroIndex });
-      if (!vendor) return;
-      if (field === 'name') vendor.nameKey = key;
-      if (field === 'spec') vendor.specKey = key;
-      if (field === 'quantity' || field === 'qty') vendor.quantityKey = key;
-      if (field === 'unit_price' || field === 'price') vendor.unitPriceKey = key;
-      if (field === 'amount') vendor.amountKey = key;
-    }
-  });
-
-  Array.from(map.values()).forEach((vendor) => {
-    const key = vendor.compareKey || comparableCompanyName(vendor.name);
-    const matchedPrice = columns.find((col) => comparableCompanyName(col.label || '').includes(key) && /(단가|견적|가격)/.test(String(col.label || '')));
-    if (matchedPrice && !vendor.unitPriceKey) vendor.unitPriceKey = matchedPrice.key;
-    const matchedAmount = columns.find((col) => comparableCompanyName(col.label || '').includes(key) && /금액/.test(String(col.label || '')));
-    if (matchedAmount && !vendor.amountKey) vendor.amountKey = matchedAmount.key;
-  });
-
-  rows.forEach((row) => {
-    if (!row || typeof row !== 'object') return;
-    const priceMap = row.vendor_prices || row.vendorPrices || row.vendor_unit_prices || row.vendorUnitPrices;
-    if (priceMap && typeof priceMap === 'object' && !Array.isArray(priceMap)) {
-      Object.entries(priceMap).forEach(([name, value]) => {
-        const vendor = put(name);
-        if (vendor && value !== undefined) vendor.inlinePrice = value;
-      });
-    }
-    const amountMap = row.vendor_amounts || row.vendorAmounts;
-    if (amountMap && typeof amountMap === 'object' && !Array.isArray(amountMap)) {
-      Object.entries(amountMap).forEach(([name, value]) => {
-        const vendor = put(name);
-        if (vendor && value !== undefined) vendor.inlineAmount = value;
-      });
-    }
-    const name = row.vendor_name || row.target_name;
-    if (name && (row.vendor_unit_price || row.unit_price || row.amount)) {
-      const vendor = put(name, { unitPriceKey: 'vendor_unit_price', amountKey: 'amount' });
-      if (vendor && !vendor.unitPriceKey && row.unit_price) vendor.unitPriceKey = 'unit_price';
-    }
-  });
-
-  return Array.from(map.values()).sort((a, b) => Number(a.index ?? 999) - Number(b.index ?? 999));
-}
-
-function getVendorPreviewValue(row, vendor, key) {
-  if (!row) return '';
-  const priceMap = row.vendor_prices || row.vendorPrices || row.vendor_unit_prices || row.vendorUnitPrices;
-  const amountMap = row.vendor_amounts || row.vendorAmounts;
-  if (key === 'spec') return row[vendor.specKey] || row.spec || '';
-  if (key === 'quantity') return row[vendor.quantityKey] || row.quantity || row.request_quantity || row.requested_quantity || '';
-  if (key === 'unit_price') {
-    if (vendor.unitPriceKey && row[vendor.unitPriceKey] !== undefined && row[vendor.unitPriceKey] !== '') return row[vendor.unitPriceKey];
-    if (priceMap && typeof priceMap === 'object') {
-      if (priceMap[vendor.name] !== undefined) return priceMap[vendor.name];
-      const matched = Object.entries(priceMap).find(([name]) => comparableCompanyName(name) === comparableCompanyName(vendor.name));
-      if (matched) return matched[1];
-      return vendor.inlinePrice ?? '';
-    }
-    const nameMatches = comparableCompanyName(row.vendor_name || row.target_name || '') === comparableCompanyName(vendor.name);
-    return nameMatches || !row.vendor_name ? (row.vendor_unit_price || row.unit_price || vendor.inlinePrice || '') : (vendor.inlinePrice || '');
-  }
-  if (key === 'amount') {
-    if (vendor.amountKey && row[vendor.amountKey] !== undefined && row[vendor.amountKey] !== '') return row[vendor.amountKey];
-    if (amountMap && typeof amountMap === 'object') {
-      if (amountMap[vendor.name] !== undefined) return amountMap[vendor.name];
-      const matched = Object.entries(amountMap).find(([name]) => comparableCompanyName(name) === comparableCompanyName(vendor.name));
-      if (matched) return matched[1];
-    }
-    const existing = row.amount && comparableCompanyName(row.vendor_name || row.target_name || '') === comparableCompanyName(vendor.name) ? row.amount : '';
-    if (existing) return existing;
-    const qty = toPreviewNumber(getVendorPreviewValue(row, vendor, 'quantity'));
-    const price = toPreviewNumber(getVendorPreviewValue(row, vendor, 'unit_price'));
-    return qty && price ? qty * price : '';
-  }
-  return row[key] || '';
-}
-
-function buildTemplateVendorSlots(vendors, layoutMode) {
-  const cleanVendors = vendors.filter((vendor) => vendor?.name);
-  const minSlots = layoutMode === 'COMPACT_VENDOR_GROUPS' ? Math.max(cleanVendors.length, 1) : Math.max(cleanVendors.length, 3);
-  const slots = [...cleanVendors];
-  while (slots.length < minSlots) slots.push({ name: slots.length === 0 ? 'A업체' : `${String.fromCharCode(65 + slots.length)}업체`, empty: true });
-  return slots;
-}
-
-function TemplateCell({ children, className = '', colSpan, rowSpan, align = 'center' }) {
-  return (
-    <td colSpan={colSpan} rowSpan={rowSpan} className={`border border-slate-700 px-2 py-2 align-middle ${align === 'left' ? 'text-left' : 'text-center'} ${className}`}>{children}</td>
-  );
-}
-
-function EditableTemplateCell({ value = '', onChange, className = '', colSpan, rowSpan, align = 'center', money = false, disabled = false, placeholder = '' }) {
-  const displayValue = money ? formatMoney(value) : String(value ?? '');
-  return (
-    <TemplateCell colSpan={colSpan} rowSpan={rowSpan} align={align} className={`p-0 ${className}`}>
-      <input
-        value={displayValue}
-        onChange={(event) => onChange?.(event.target.value)}
-        disabled={disabled || !onChange}
-        placeholder={placeholder}
-        className={`h-full min-h-[34px] w-full border-0 bg-transparent px-2 py-2 text-[11px] font-black outline-none focus:bg-brand-50 focus:ring-2 focus:ring-inset focus:ring-brand-400 ${align === 'left' ? 'text-left' : 'text-center'} disabled:cursor-default disabled:text-slate-900`}
-      />
-    </TemplateCell>
-  );
-}
-
-function PreviewEditToolbar({ table, addRow, addColumn, removeColumn, updateColumnLabel, saveTable, disabled, candidateFields = [], onCandidateAction, showColumnTools = true }) {
-  return (
-    <div className="mb-4 rounded-3xl border border-brand-100 bg-gradient-to-br from-brand-50 to-white p-3">
-      <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-        <div>
-          <p className="text-sm font-black text-slate-900">엑셀 미리보기 직접 편집</p>
-          <p className="mt-1 text-xs font-bold text-slate-500">{showColumnTools ? '아래 데이터 표를 기준으로 셀·행·컬럼을 직접 수정합니다. 등록 회사 양식도 수정용 데이터 표에서 컬럼을 추가할 수 있습니다.' : '아래 엑셀 미리보기 안에서 직접 수정합니다. 행삭제는 각 행의 ×, 컬럼삭제는 아래 컬럼 관리에서 처리합니다.'}</p>
-        </div>
-        <div className="flex flex-wrap gap-2">
-          <button type="button" onClick={addRow} disabled={disabled} className="rounded-2xl bg-white px-4 py-2 text-xs font-black text-slate-700 ring-1 ring-slate-200 hover:bg-slate-50 disabled:opacity-50">행 추가</button>
-          {showColumnTools && <button type="button" onClick={addColumn} disabled={disabled} className="rounded-2xl bg-white px-4 py-2 text-xs font-black text-slate-700 ring-1 ring-slate-200 hover:bg-slate-50 disabled:opacity-50">컬럼 추가</button>}
-          <button type="button" onClick={saveTable} disabled={disabled} className="rounded-2xl bg-gradient-to-r from-brand-500 to-brand-400 px-4 py-2 text-xs font-black text-white shadow-glow disabled:from-slate-300 disabled:to-slate-300">수정 저장</button>
-        </div>
-      </div>
-      {showColumnTools && (table?.columns || []).length > 0 && (
-        <div className="mt-3 rounded-2xl border border-slate-200 bg-white/80 px-3 py-3">
-          <p className="mb-2 text-xs font-black text-slate-800">컬럼 관리 · 이름 수정 / 컬럼 삭제</p>
-          <div className="flex flex-wrap gap-2">
-            {(table.columns || []).map((col) => (
-              <div key={col.key} className="flex items-center gap-1 rounded-xl border border-slate-200 bg-white px-2 py-1">
-                <input
-                  value={cleanTableColumnLabel(col.label || col.key)}
-                  onChange={(event) => updateColumnLabel?.(col.key, event.target.value)}
-                  disabled={disabled}
-                  className="w-[120px] rounded-lg px-2 py-1 text-[11px] font-black outline-none focus:bg-brand-50 focus:ring-2 focus:ring-brand-400"
-                />
-                <button type="button" onClick={() => removeColumn?.(col.key)} disabled={disabled} className="rounded-lg bg-rose-50 px-2 py-1 text-[11px] font-black text-rose-600 hover:bg-rose-100 disabled:opacity-40">컬럼삭제</button>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-      {candidateFields.length > 0 && (
-        <div className="mt-3 space-y-2 rounded-2xl border border-amber-100 bg-amber-50 px-3 py-3 text-xs font-bold text-amber-800">
-          <p className="font-black">신규 컬럼 후보</p>
-          {candidateFields.map((item) => (
-            <div key={item.id || item.suggestedFieldKey || item.originalLabel} className="flex flex-wrap items-center justify-between gap-2 rounded-xl bg-white/80 px-3 py-2">
-              <span>{item.originalLabel} → {item.suggestedFieldKey} / {item.suggestedDataType}</span>
-              <span className="flex flex-wrap gap-1">
-                <button type="button" onClick={() => onCandidateAction?.(item.id, 'ADD_STANDARD')} className="rounded-lg bg-emerald-50 px-2 py-1 text-[11px] font-black text-emerald-700">표준필드 추가</button>
-                <button type="button" onClick={() => onCandidateAction?.(item.id, 'USE_CUSTOM')} className="rounded-lg bg-brand-50 px-2 py-1 text-[11px] font-black text-brand-700">이번 문서만</button>
-                <button type="button" onClick={() => onCandidateAction?.(item.id, 'EXCLUDE')} className="rounded-lg bg-slate-100 px-2 py-1 text-[11px] font-black text-slate-500">제외</button>
-              </span>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function vendorEditKey(vendor = {}, fieldKey = '', vendorIndex = 0) {
-  const idx = Number.isFinite(Number(vendor.index)) ? Number(vendor.index) + 1 : vendorIndex + 1;
-  if (fieldKey === 'spec') return vendor.specKey || 'spec';
-  if (fieldKey === 'quantity') return vendor.quantityKey || 'quantity';
-  if (fieldKey === 'unit_price') return vendor.unitPriceKey || `vendor_${idx}_unit_price`;
-  if (fieldKey === 'amount') return vendor.amountKey || `vendor_${idx}_amount`;
-  return fieldKey;
-}
-
-function removeRowButton(removeRow, rowIndex, disabled) {
-  if (!removeRow) return null;
-  return (
-    <button
-      type="button"
-      onClick={(event) => { event.stopPropagation(); removeRow(rowIndex); }}
-      disabled={disabled}
-      className="ml-1 inline-flex h-5 w-5 items-center justify-center rounded-full bg-rose-50 text-[11px] font-black text-rose-600 ring-1 ring-rose-100 hover:bg-rose-100 disabled:opacity-40"
-      title="행 삭제"
-    >×</button>
-  );
-}
-
-function getTemplateDisplayName(selectedTemplate) {
-  return String(
-    selectedTemplate?.templateName
-    || selectedTemplate?.template_name
-    || selectedTemplate?.name
-    || selectedTemplate?.title
-    || ''
-  );
-}
-
-
-function isAiGeneratedTemplate(selectedTemplate) {
-  const mapping = selectedTemplate?.mapping || selectedTemplate?.mappingJson || {};
-  const code = String(selectedTemplate?.templateCode || selectedTemplate?.template_code || '').toUpperCase();
-  return Boolean(mapping?.aiGenerated) || code.startsWith('AI_');
-}
-
-function normalizeAiPreviewFieldKey(fieldKey = '') {
-  const key = String(fieldKey || '').trim();
-  if (key === 'vendor_unit_price') return 'unit_price';
-  if (key === 'vendor_amount') return 'amount';
-  return key;
-}
-
-function uniqueAiPreviewFields(items = [], excludeKeys = []) {
-  const exclude = new Set(excludeKeys.map((key) => String(key || '').trim()));
-  const seen = new Set();
-  const out = [];
-  (Array.isArray(items) ? items : []).forEach((item) => {
-    const key = normalizeAiPreviewFieldKey(item?.fieldKey || item?.field_key || item?.key);
-    if (!key || exclude.has(key) || seen.has(key)) return;
-    seen.add(key);
-    out.push({ fieldKey: key, label: item?.label || item?.field_label || item?.name || key });
-  });
-  return out;
-}
-
-function getAiPreviewLowest(row, vendors) {
-  let best = null;
-  vendors.filter((vendor) => !vendor.empty).forEach((vendor) => {
-    const price = toPreviewNumber(getVendorPreviewValue(row, vendor, 'unit_price'));
-    if (!price) return;
-    if (!best || price < best.price) best = { vendor: vendor.name, price };
-  });
-  return best || { vendor: '', price: '' };
-}
-
-function getAiPreviewCellValue(row, fieldKey, rowIndex, vendors) {
-  if (fieldKey === 'row_no' || fieldKey === 'no') return row?.row_no || row?.no || rowIndex + 1;
-  if (fieldKey === 'lowest_target' || fieldKey === 'lowest_vendor' || fieldKey === 'selected_vendor') {
-    const lowest = getAiPreviewLowest(row, vendors);
-    return row?.lowest_target || row?.lowest_vendor || row?.selected_vendor || lowest.vendor || '';
-  }
-  if (fieldKey === 'calculated_unit_price' || fieldKey === 'lowest_unit_price') {
-    const lowest = getAiPreviewLowest(row, vendors);
-    return row?.calculated_unit_price || row?.lowest_unit_price || lowest.price || '';
-  }
-  return row?.[fieldKey] ?? '';
-}
-
-function AiGeneratedTemplatePreview({ table, issues, selectedTemplate, writerName, updateCell, removeRow, disabled }) {
-  const design = selectedTemplate?.mapping || selectedTemplate?.mappingJson || {};
-  const rows = table.rows || [];
-  const vendors = inferPreviewVendors(table);
-  const visibleVendors = vendors.filter((vendor) => vendor?.name);
-  const hasRepeatGroup = Array.isArray(design.repeatGroups) && design.repeatGroups.length > 0;
-  const baseExclude = hasRepeatGroup ? ['unit_price', 'vendor_unit_price', 'amount', 'vendor_amount', 'total_amount'] : [];
-  let baseColumns = uniqueAiPreviewFields(design.baseColumns, baseExclude);
-  if (!baseColumns.length) {
-    baseColumns = uniqueAiPreviewFields((table.columns || []).map((col) => ({ fieldKey: col.key, label: col.label || col.key })), baseExclude);
-  }
-  if (!baseColumns.some((item) => item.fieldKey === 'row_no')) baseColumns = [{ fieldKey: 'row_no', label: 'NO' }, ...baseColumns];
-
-  const repeatColumns = hasRepeatGroup
-    ? uniqueAiPreviewFields(design.repeatGroups?.[0]?.columns || [{ fieldKey: 'unit_price', label: '단가' }, { fieldKey: 'amount', label: '금액' }])
-    : [];
-  const summaryColumns = uniqueAiPreviewFields(design.summaryColumns || []);
-  const outputColumns = [
-    ...baseColumns.map((item) => ({ ...item, kind: 'base' })),
-    ...visibleVendors.flatMap((vendor) => repeatColumns.map((item) => ({ ...item, kind: 'vendor', vendor, label: `${cleanTableColumnLabel(vendor.name)} ${item.label || item.fieldKey}` }))),
-    ...summaryColumns.map((item) => ({ ...item, kind: 'summary' })),
-  ];
-  const hasIssues = issues.length > 0;
-
-  return (
-    <div className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-card">
-      <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-        <div>
-          <h4 className="text-xl font-black text-slate-950">AI 생성 양식 미리보기</h4>
-          <p className="mt-1 text-sm text-slate-500">DB 표준필드 기반 생성 양식에 실제 데이터가 들어갈 위치를 미리 확인합니다.</p>
-        </div>
-        <div className="flex flex-wrap gap-2">
-          <Badge tone={hasIssues ? 'amber' : 'green'}>{hasIssues ? '확인 필요 행 포함' : '정상'}</Badge>
-          <Badge tone="slate">{getTemplateDisplayName(selectedTemplate) || 'AI 생성 양식'}</Badge>
-          <Badge tone="blue">업체 {visibleVendors.length || 0}개</Badge>
-        </div>
-      </div>
-
-      <div className="scroll-thin mt-5 max-h-[calc(100vh-420px)] min-h-[420px] overflow-auto rounded-3xl border border-slate-200 bg-white p-3">
-        <table className="w-max min-w-full border-collapse table-fixed text-center text-[11px] font-bold text-slate-900">
-          <colgroup>
-            {outputColumns.map((col, index) => <col key={`ai-col-${index}`} className={col.fieldKey === 'item_name' ? 'w-[180px]' : 'w-[110px]'} />)}
-          </colgroup>
-          <tbody>
-            <tr><TemplateCell colSpan={Math.max(outputColumns.length, 1)} className="py-4 text-xl font-black">{design.title || getTemplateDisplayName(selectedTemplate) || 'AI 추천양식'}</TemplateCell></tr>
-            <tr><TemplateCell colSpan={Math.max(outputColumns.length, 1)} className="h-4 border-slate-300 bg-white"></TemplateCell></tr>
-            <tr>
-              <TemplateCell className="bg-slate-200">견적일자</TemplateCell>
-              <TemplateCell>{formatPreviewDate()}</TemplateCell>
-              <TemplateCell className="bg-slate-200">작성자</TemplateCell>
-              <TemplateCell colSpan={Math.max(outputColumns.length - 3, 1)}>{writerName || '-'}</TemplateCell>
-            </tr>
-            <tr>
-              {outputColumns.map((col, index) => <TemplateCell key={`ai-head-${index}`} className="bg-slate-200">{cleanTableColumnLabel(col.label || col.fieldKey)}</TemplateCell>)}
-            </tr>
-            {rows.map((row, rowIndex) => (
-              <tr key={`ai-row-${rowIndex}`} className={issues.some((issue) => Number(issue.rowIndex) === rowIndex) ? 'bg-amber-50' : rowIndex % 2 ? 'bg-slate-50' : 'bg-white'}>
-                {outputColumns.map((col, colIndex) => {
-                  const value = col.kind === 'vendor'
-                    ? getVendorPreviewValue(row, col.vendor, col.fieldKey)
-                    : getAiPreviewCellValue(row, col.fieldKey, rowIndex, visibleVendors);
-                  const moneyLike = /(price|amount|cost|total|단가|금액)/i.test(String(col.fieldKey || col.label || ''));
-                  const editKey = col.kind === 'vendor' ? vendorEditKey(col.vendor, col.fieldKey, colIndex) : col.fieldKey;
-                  return (
-                    <EditableTemplateCell
-                      key={`ai-cell-${rowIndex}-${colIndex}`}
-                      value={value}
-                      money={moneyLike}
-                      align={col.fieldKey === 'item_name' || col.fieldKey === 'remark' ? 'left' : 'center'}
-                      disabled={disabled}
-                      onChange={(nextValue) => updateCell?.(rowIndex, editKey, nextValue)}
-                    />
-                  );
-                })}
-              </tr>
-            ))}
-            {!rows.length && (
-              <tr><TemplateCell colSpan={Math.max(outputColumns.length, 1)} className="h-24 text-slate-400">행 추가 후 바로 입력할 수 있습니다.</TemplateCell></tr>
-            )}
-          </tbody>
-        </table>
-      </div>
-    </div>
-  );
-}
-
-function isProductPriceSurveyTemplate(selectedTemplate) {
-  const raw = getTemplateDisplayName(selectedTemplate);
-  const normalized = compactText(raw).replace(/[()_\-·ㆍ\[\]{}]/g, '');
-  if (!normalized) return false;
-  const hasVendor = /(업체별|업체|회사별|거래처별|vendor|company|supplier)/i.test(normalized);
-  const hasPriceSurvey = /(제품가격|제품단가|가격조사|조사현황|가격현황|단가조사|productprice|pricesurvey|survey)/i.test(normalized);
-  return hasVendor && hasPriceSurvey;
-}
-
-
-function isComparisonEstimateTemplate(selectedTemplate) {
-  if (!selectedTemplate) return false;
-  if (isProductPriceSurveyTemplate(selectedTemplate)) return false;
-  const mapping = selectedTemplate.mapping || selectedTemplate.mappingJson || selectedTemplate.mapping_json || {};
-  const raw = [
-    getTemplateDisplayName(selectedTemplate),
-    selectedTemplate?.originalFileName,
-    selectedTemplate?.original_file_name,
-    selectedTemplate?.templateCode,
-    selectedTemplate?.template_code,
-    selectedTemplate?.templateType,
-    selectedTemplate?.template_type,
-    mapping?.layout,
-    mapping?.layoutType,
-    mapping?.templateType,
-  ].filter(Boolean).join(' ');
-  const normalized = compactText(raw).replace(/[()_\-·ㆍ\[\]{}]/g, '');
-  if (!normalized) return false;
-  return /(비교견적|견적비교|비교서|비교표|비교|견적서|견적|comparison|estimate|quote)/i.test(normalized);
-}
-
-function buildProductPriceVendorSlots(vendors, templateLayoutMode) {
-  const cleanVendors = vendors.filter((vendor) => vendor?.name);
-  const slotCount = templateLayoutMode === 'COMPACT_VENDOR_GROUPS'
-    ? Math.max(cleanVendors.length, 1)
-    : Math.max(5, cleanVendors.length || 0);
-  const slots = [...cleanVendors];
-  while (slots.length < slotCount) slots.push({ name: `업체 ${slots.length + 1}`, empty: true });
-  return slots;
-}
-
-function pickRowValue(row, keys, fallback = '') {
-  for (const key of keys) {
-    const value = row?.[key];
-    if (value !== undefined && value !== null && String(value).trim() !== '') return value;
-  }
-  return fallback;
-}
-
-function getProductPriceAverage(row, vendors) {
-  const explicit = pickRowValue(row, ['average_price', 'avg_price', 'average_unit_price', '평균가격', '평균단가'], '');
-  if (explicit !== '') return explicit;
-  const prices = vendors
-    .filter((vendor) => !vendor.empty)
-    .map((vendor) => toPreviewNumber(getVendorPreviewValue(row, vendor, 'unit_price')))
-    .filter((value) => value > 0);
-  if (!prices.length) return '';
-  return Math.round(prices.reduce((sum, value) => sum + value, 0) / prices.length);
-}
-
-function getSelectedVendorValue(row) {
-  return cleanTableColumnLabel(pickRowValue(row, [
-    'selected_vendor',
-    'selected_company',
-    'chosen_vendor',
-    'lowest_vendor',
-    'best_vendor',
-    'vendor_selection',
-    '업체선정',
-    '최저업체'
-  ], ''));
-}
-
-function ProductPriceSurveyTemplatePreview({ table, issues, selectedTemplate, templateLayoutMode = 'PRESERVE_TEMPLATE', updateCell, removeRow, disabled }) {
-  const vendors = inferPreviewVendors(table);
-  const visibleVendors = buildProductPriceVendorSlots(vendors, templateLayoutMode);
-  const rows = table.rows || [];
-  const rowAreaLength = 15;
-  const headerColSpan = 4 + visibleVendors.length + 3;
-  const hasIssues = issues.length > 0;
-  const hasDataVendorCount = vendors.length;
-
-  return (
-    <div className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-card">
-      <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-        <div>
-          <h4 className="text-xl font-black text-slate-950">등록 양식 미리보기</h4>
-          <p className="mt-1 text-sm text-slate-500">선택한 업체별 제품가격 조사현황표 양식 구조로 실제 입력 위치를 미리 확인합니다.</p>
-        </div>
-        <div className="flex flex-wrap gap-2">
-          <Badge tone={hasIssues ? 'amber' : 'green'}>{hasIssues ? '확인 필요 행 포함' : '정상'}</Badge>
-          <Badge tone="slate">{getTemplateDisplayName(selectedTemplate) || '업체별 제품가격 조사현황표'}</Badge>
-          <Badge tone="blue">업체 {hasDataVendorCount || 0}개 · {templateLayoutMode === 'COMPACT_VENDOR_GROUPS' ? '실제 업체만 표시' : '원본 5칸 유지'}</Badge>
-        </div>
-      </div>
-
-      <div className="scroll-thin mt-5 max-h-[calc(100vh-420px)] min-h-[420px] overflow-auto rounded-3xl border border-slate-200 bg-white p-3">
-        <table className="w-max min-w-full border-collapse table-fixed text-center text-[11px] font-bold text-slate-900">
-          <colgroup>
-            <col className="w-[58px]" />
-            <col className="w-[180px]" />
-            <col className="w-[100px]" />
-            <col className="w-[70px]" />
-            {visibleVendors.map((vendor, index) => <col key={`product-vendor-col-${index}`} className="w-[92px]" />)}
-            <col className="w-[100px]" />
-            <col className="w-[110px]" />
-            <col className="w-[120px]" />
-          </colgroup>
-          <tbody>
-            <tr><TemplateCell colSpan={headerColSpan} className="py-4 text-xl font-black">업체별 제품가격 조사현황표</TemplateCell></tr>
-            <tr><TemplateCell colSpan={headerColSpan} className="h-4 border-slate-300 bg-white"></TemplateCell></tr>
-            <tr>
-              <TemplateCell rowSpan={2} className="bg-emerald-100">번호</TemplateCell>
-              <TemplateCell rowSpan={2} className="bg-emerald-100">제품명</TemplateCell>
-              <TemplateCell rowSpan={2} className="bg-emerald-100">규격</TemplateCell>
-              <TemplateCell rowSpan={2} className="bg-emerald-100">단위</TemplateCell>
-              <TemplateCell colSpan={visibleVendors.length} className="bg-emerald-100">제품 단가 조사현황</TemplateCell>
-              <TemplateCell rowSpan={2} className="bg-emerald-100">평균가격</TemplateCell>
-              <TemplateCell rowSpan={2} className="bg-emerald-100">업체선정</TemplateCell>
-              <TemplateCell rowSpan={2} className="bg-emerald-100">비고</TemplateCell>
-            </tr>
-            <tr>
-              {visibleVendors.map((vendor, index) => (
-                <TemplateCell key={`product-vendor-head-${index}`} className={`${vendor.empty ? 'bg-emerald-50 text-slate-400' : 'bg-emerald-100'}`}>
-                  {vendor.empty ? `업체 ${index + 1}` : cleanTableColumnLabel(vendor.name)}
-                </TemplateCell>
-              ))}
-            </tr>
-            {rows.slice(0, rowAreaLength).map((row, rowIndex) => (
-              <tr key={`product-row-${rowIndex}`} className={issues.some((issue) => Number(issue.rowIndex) === rowIndex) ? 'bg-amber-50' : rowIndex % 2 ? 'bg-slate-50' : 'bg-white'}>
-                <TemplateCell>{row.row_no || row.no || rowIndex + 1}{removeRowButton(removeRow, rowIndex, disabled)}</TemplateCell>
-                <EditableTemplateCell align="left" className="break-keep" value={pickRowValue(row, ['product_name', 'item_name', 'work_item_name', '공종명칭', '제품명'])} onChange={(value) => updateCell?.(rowIndex, row.product_name !== undefined ? 'product_name' : 'item_name', value)} disabled={disabled} />
-                <EditableTemplateCell value={pickRowValue(row, ['spec', 'standard', 'size', '규격'])} onChange={(value) => updateCell?.(rowIndex, 'spec', value)} disabled={disabled} />
-                <EditableTemplateCell value={pickRowValue(row, ['unit', '단위'])} onChange={(value) => updateCell?.(rowIndex, 'unit', value)} disabled={disabled} />
-                {visibleVendors.map((vendor, vendorIndex) => (
-                  <EditableTemplateCell key={`product-value-${rowIndex}-${vendorIndex}`} value={vendor.empty ? '' : getVendorPreviewValue(row, vendor, 'unit_price')} money onChange={(value) => !vendor.empty && updateCell?.(rowIndex, vendorEditKey(vendor, 'unit_price', vendorIndex), value)} disabled={disabled || vendor.empty} />
-                ))}
-                <TemplateCell>{formatMoney(getProductPriceAverage(row, visibleVendors))}</TemplateCell>
-                <EditableTemplateCell value={getSelectedVendorValue(row)} onChange={(value) => updateCell?.(rowIndex, 'selected_vendor', value)} disabled={disabled} />
-                <EditableTemplateCell align="left" value={pickRowValue(row, ['remark', 'note', 'memo', '비고'])} onChange={(value) => updateCell?.(rowIndex, 'remark', value)} disabled={disabled} />
-              </tr>
-            ))}
-            {Array.from({ length: Math.max(0, rowAreaLength - rows.slice(0, rowAreaLength).length) }).map((_, idx) => (
-              <tr key={`product-empty-${idx}`} className={idx % 2 ? 'bg-slate-50' : 'bg-white'}>
-                <TemplateCell>{rows.length + idx + 1}</TemplateCell>
-                <TemplateCell></TemplateCell>
-                <TemplateCell></TemplateCell>
-                <TemplateCell></TemplateCell>
-                {visibleVendors.map((vendor, vendorIndex) => <TemplateCell key={`product-empty-${idx}-${vendorIndex}`}></TemplateCell>)}
-                <TemplateCell></TemplateCell>
-                <TemplateCell></TemplateCell>
-                <TemplateCell></TemplateCell>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    </div>
-  );
-}
-
-
-function ExcelTemplateOriginalGrid({ preview }) {
-  const columns = Array.isArray(preview?.columns) ? preview.columns : [];
-  const rows = Array.isArray(preview?.rows) ? preview.rows : [];
-  if (!columns.length || !rows.length) {
-    return <div className="rounded-2xl border border-dashed border-slate-300 bg-slate-50 px-4 py-12 text-center text-sm font-black text-slate-400">원본 엑셀 미리보기 데이터가 없습니다.</div>;
-  }
-  return (
-    <div className="rounded-[24px] border border-slate-200 bg-slate-100 p-3">
-      <div className="scroll-thin max-h-[54vh] overflow-auto rounded-2xl bg-white shadow-inner">
-        <div className="inline-block min-w-full p-2">
-          <table className="border-collapse bg-white text-xs">
-            <colgroup>
-              <col style={{ width: 46 }} />
-              {columns.map((col) => (
-                <col
-                  key={col.letter}
-                  style={{
-                    width: col.widthPx || 80,
-                    display: col.hidden ? 'none' : undefined
-                  }}
-                />
-              ))}
-            </colgroup>
-            <thead>
-              <tr>
-                <th className="sticky left-0 top-0 z-20 border border-slate-300 bg-slate-200 text-slate-500" style={{ height: 28 }} />
-                {columns.map((col) => (
-                  <th key={col.letter} className="sticky top-0 z-10 border border-slate-300 bg-slate-200 text-center font-black text-slate-600" style={{ height: 28, display: col.hidden ? 'none' : undefined }}>
-                    {col.letter}
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((row) => {
-                if (row.hidden) return null;
-                return (
-                  <tr key={row.rowNumber} style={{ height: row.heightPx || 28 }}>
-                    <th className="sticky left-0 z-10 border border-slate-300 bg-slate-200 px-2 text-center font-black text-slate-500">{row.rowNumber}</th>
-                    {(row.cells || []).map((cell) => {
-                      if (cell.isMergedHidden) return null;
-                      const style = cell.style || {};
-                      return (
-                        <td
-                          key={cell.address}
-                          rowSpan={cell.rowSpan && cell.rowSpan > 1 ? cell.rowSpan : undefined}
-                          colSpan={cell.colSpan && cell.colSpan > 1 ? cell.colSpan : undefined}
-                          title={`${cell.address}${cell.mergedRange ? ` (${cell.mergedRange})` : ''} ${cell.text || ''}`}
-                          className="overflow-hidden px-2 py-1 align-middle"
-                          style={{
-                            backgroundColor: style.backgroundColor || '#ffffff',
-                            color: style.color || '#0f172a',
-                            fontWeight: style.fontWeight || 500,
-                            fontStyle: style.italic ? 'italic' : 'normal',
-                            textDecoration: style.underline ? 'underline' : 'none',
-                            fontFamily: style.fontFamily || undefined,
-                            fontSize: `${Math.max(9, style.fontSize || 11)}px`,
-                            textAlign: style.textAlign || 'center',
-                            verticalAlign: style.verticalAlign || 'middle',
-                            borderTop: style.borderTop || '1px solid #e2e8f0',
-                            borderRight: style.borderRight || '1px solid #e2e8f0',
-                            borderBottom: style.borderBottom || '1px solid #e2e8f0',
-                            borderLeft: style.borderLeft || '1px solid #e2e8f0',
-                            whiteSpace: style.whiteSpace || 'nowrap',
-                            minWidth: 50,
-                            maxWidth: cell.colSpan && cell.colSpan > 1 ? 520 : 260
-                          }}
-                        >
-                          <span className={style.whiteSpace === 'normal' ? 'block break-words leading-snug' : 'block truncate'}>{cell.text}</span>
-                        </td>
-                      );
-                    })}
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
-      </div>
-      {Array.isArray(preview.mergedCells) && preview.mergedCells.length > 0 && (
-        <div className="mt-3 flex flex-wrap items-center gap-2 text-[11px] font-bold text-slate-500">
-          <span className="rounded-full bg-white px-2.5 py-1 ring-1 ring-slate-200">병합 셀 {preview.mergedCells.length}개 반영</span>
-          <span className="rounded-full bg-white px-2.5 py-1 ring-1 ring-slate-200">원본 행/열 높이·너비 반영</span>
-        </div>
-      )}
-    </div>
-  );
-}
-
-function RegisteredTemplateDataGrid({ table, issues = [], updateCell, removeRow, disabled }) {
-  const visibleColumns = getVisibleColumns(table.columns, table.rows);
-  return (
-    <div className="scroll-thin overflow-auto rounded-3xl border border-slate-200">
-      <table className="min-w-[920px] w-full border-collapse text-sm">
-        <thead className="sticky top-0 z-10 bg-slate-100 text-slate-600 shadow-sm">
-          <tr>
-            {visibleColumns.map((col) => (
-              <th key={col.key} className="border-b border-slate-200 px-3 py-3 text-left font-black align-top">
-                <span className="block min-w-[120px] truncate">{cleanTableColumnLabel(col.label || col.key)}</span>
-                <span className="mt-1 block truncate text-[10px] font-bold text-slate-400">{col.key}</span>
-              </th>
-            ))}
-            <th className="w-20 border-b border-slate-200 px-3 py-3">관리</th>
-          </tr>
-        </thead>
-        <tbody>
-          {(table.rows || []).map((row, rowIndex) => (
-            <tr key={rowIndex} className={issues.some((issue) => Number(issue.rowIndex) === rowIndex) ? 'bg-amber-50' : 'bg-white'}>
-              {visibleColumns.map((col) => (
-                <td key={col.key} className="border-b border-slate-100 p-1">
-                  <input value={row[col.key] ?? ''} onChange={(event) => updateCell?.(rowIndex, col.key, event.target.value)} disabled={disabled} className="w-full rounded-xl px-3 py-2 text-sm font-bold outline-none focus:bg-brand-50 focus:ring-2 focus:ring-brand-500 disabled:cursor-default disabled:text-slate-900" />
-                </td>
-              ))}
-              <td className="border-b border-slate-100 p-1"><button type="button" onClick={() => removeRow?.(rowIndex)} disabled={disabled} className="rounded-xl bg-rose-50 px-3 py-2 text-xs font-black text-rose-600 disabled:opacity-40">삭제</button></td>
-            </tr>
-          ))}
-          {(!table.rows || table.rows.length === 0) && <tr><td colSpan={visibleColumns.length + 1} className="px-4 py-12 text-center font-bold text-slate-400">행 추가 또는 파일 분석 후 수정할 수 있습니다.</td></tr>}
-        </tbody>
-      </table>
-    </div>
-  );
-}
-
-function GenericRegisteredTemplatePreview({ table, issues, selectedTemplate, templatePreview, templatePreviewLoading, templatePreviewError, updateCell, removeRow, disabled }) {
-  const hasIssues = issues.length > 0;
-  return (
-    <div className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-card">
-      <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-        <div>
-          <h4 className="text-xl font-black text-slate-950">등록 양식 미리보기</h4>
-          <p className="mt-1 text-sm text-slate-500">선택한 엑셀 원본 구조를 그대로 확인합니다. 비교견적서가 아닌 양식은 고정 비교표로 표시하지 않습니다.</p>
-        </div>
-        <div className="flex flex-wrap gap-2">
-          <Badge tone={hasIssues ? 'amber' : 'green'}>{hasIssues ? '확인 필요 행 포함' : '정상'}</Badge>
-          <Badge tone="slate">{getTemplateDisplayName(selectedTemplate) || '등록 양식'}</Badge>
-          <Badge tone="blue">일반 등록 양식</Badge>
-        </div>
-      </div>
-
-      <div className="mt-5">
-        {templatePreviewLoading && <div className="flex min-h-[360px] items-center justify-center rounded-[24px] border border-dashed border-slate-200 bg-slate-50 text-sm font-black text-slate-400">원본 엑셀 양식 미리보기를 불러오는 중입니다.</div>}
-        {!templatePreviewLoading && templatePreview && <ExcelTemplateOriginalGrid preview={templatePreview} />}
-        {!templatePreviewLoading && !templatePreview && (
-          <div className="rounded-[24px] border border-dashed border-slate-300 bg-slate-50 px-4 py-12 text-center">
-            <p className="text-sm font-black text-slate-600">원본 엑셀 미리보기를 표시할 수 없습니다.</p>
-            <p className="mt-1 text-xs font-bold text-slate-400">{templatePreviewError || '템플릿 파일 경로 또는 ai-server 미리보기 API를 확인하세요.'}</p>
-          </div>
-        )}
-      </div>
-
-      <div className="mt-5 rounded-3xl border border-slate-200 bg-slate-50 p-4">
-        <div className="mb-3 flex flex-col gap-1 lg:flex-row lg:items-end lg:justify-between">
-          <div>
-            <p className="text-sm font-black text-slate-900">추출 데이터 편집</p>
-            <p className="mt-1 text-xs font-bold text-slate-500">컬럼 구조는 원본 템플릿 매핑을 따릅니다. 여기서는 값과 행만 수정합니다.</p>
-          </div>
-          <Badge tone="slate">컬럼 변경 잠금</Badge>
-        </div>
-        <RegisteredTemplateDataGrid table={table} issues={issues} updateCell={updateCell} removeRow={removeRow} disabled={disabled} />
-      </div>
-    </div>
-  );
-}
-
-function CompanyTemplatePreview({ table, issues, selectedTemplate, writerName, templateLayoutMode = 'PRESERVE_TEMPLATE', templatePreview = null, templatePreviewLoading = false, templatePreviewError = '', updateCell, removeRow, disabled }) {
-  if (isAiGeneratedTemplate(selectedTemplate)) {
-    return <AiGeneratedTemplatePreview table={table} issues={issues} selectedTemplate={selectedTemplate} writerName={writerName} updateCell={updateCell} removeRow={removeRow} disabled={disabled} />;
-  }
-  if (isProductPriceSurveyTemplate(selectedTemplate)) {
-    return <ProductPriceSurveyTemplatePreview table={table} issues={issues} selectedTemplate={selectedTemplate} templateLayoutMode={templateLayoutMode} updateCell={updateCell} removeRow={removeRow} disabled={disabled} />;
-  }
-  if (!isComparisonEstimateTemplate(selectedTemplate)) {
-    return <GenericRegisteredTemplatePreview table={table} issues={issues} selectedTemplate={selectedTemplate} templatePreview={templatePreview} templatePreviewLoading={templatePreviewLoading} templatePreviewError={templatePreviewError} updateCell={updateCell} removeRow={removeRow} disabled={disabled} />;
-  }
-
-  const vendors = inferPreviewVendors(table);
-  const visibleVendors = buildTemplateVendorSlots(vendors, templateLayoutMode);
-  const rows = table.rows || [];
-  const headerColSpan = 2 + visibleVendors.length * 4;
-  const hasIssues = issues.length > 0;
-  const rowAreaLength = 16;
-  const headerLeftSpan = Math.max(2, headerColSpan - 8);
-  const hasDataVendorCount = vendors.length;
-
-  return (
-    <div className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-card">
-      <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-        <div>
-          <h4 className="text-xl font-black text-slate-950">등록 양식 미리보기</h4>
-          <p className="mt-1 text-sm text-slate-500">원본 비교견적서 양식 구조를 기준으로 실제 입력 위치를 미리 확인합니다.</p>
-        </div>
-        <div className="flex flex-wrap gap-2">
-          <Badge tone={hasIssues ? 'amber' : 'green'}>{hasIssues ? '확인 필요 행 포함' : '정상'}</Badge>
-          <Badge tone="slate">{selectedTemplate?.templateName || '등록 양식'}</Badge>
-          <Badge tone="blue">업체 {hasDataVendorCount || 0}개 · {templateLayoutMode === 'COMPACT_VENDOR_GROUPS' ? '빈칸 숨김' : '원본 양식 유지'}</Badge>
-        </div>
-      </div>
-
-      <div className="scroll-thin mt-5 max-h-[calc(100vh-420px)] min-h-[420px] overflow-auto rounded-3xl border border-slate-200 bg-white p-3">
-        <table className="w-max min-w-full border-collapse table-fixed text-center text-[11px] font-bold text-slate-900">
-          <colgroup>
-            <col className="w-[54px]" />
-            <col className="w-[180px]" />
-            {visibleVendors.flatMap((vendor) => [
-              <col key={`${vendor.name}-spec-col`} className="w-[70px]" />,
-              <col key={`${vendor.name}-qty-col`} className="w-[64px]" />,
-              <col key={`${vendor.name}-price-col`} className="w-[84px]" />,
-              <col key={`${vendor.name}-amount-col`} className="w-[92px]" />
-            ])}
-          </colgroup>
-          <tbody>
-            <tr><TemplateCell colSpan={headerColSpan} className="py-4 text-xl font-black">비교 견적서</TemplateCell></tr>
-            <tr><TemplateCell colSpan={headerColSpan} className="h-4 border-slate-300 bg-white"></TemplateCell></tr>
-            <tr>
-              <TemplateCell colSpan={headerLeftSpan} align="left" className="font-semibold">아래와 같이 비교 견적서를 제출합니다.</TemplateCell>
-              <TemplateCell colSpan={2} className="bg-slate-200">견적일자</TemplateCell>
-              <TemplateCell colSpan={2}>{formatPreviewDate()}</TemplateCell>
-              <TemplateCell colSpan={2} className="bg-slate-200">작성자</TemplateCell>
-              <TemplateCell colSpan={2}>{writerName || '-'}</TemplateCell>
-            </tr>
-            <tr>
-              <TemplateCell rowSpan={2} className="bg-slate-200">NO</TemplateCell>
-              <TemplateCell rowSpan={2} className="bg-slate-200">품목</TemplateCell>
-              {visibleVendors.map((vendor, index) => <TemplateCell key={`vendor-head-${index}`} colSpan={4} className={`${vendor.empty ? 'bg-slate-100 text-slate-400' : 'bg-slate-200'}`}>{vendor.empty ? '' : vendor.name}</TemplateCell>)}
-            </tr>
-            <tr>
-              {visibleVendors.flatMap((vendor, index) => ['규격', '수량', '단가', '금액'].map((label) => <TemplateCell key={`vendor-sub-${index}-${label}`} className="bg-slate-200">{label}</TemplateCell>))}
-            </tr>
-            {rows.slice(0, rowAreaLength).map((row, rowIndex) => (
-              <tr key={`row-${rowIndex}`} className={issues.some((issue) => Number(issue.rowIndex) === rowIndex) ? 'bg-amber-50' : 'bg-white'}>
-                <TemplateCell>{row.row_no || rowIndex + 1}{removeRowButton(removeRow, rowIndex, disabled)}</TemplateCell>
-                <EditableTemplateCell align="left" className="break-keep" value={row.item_name || row.work_item_name || ''} onChange={(value) => updateCell?.(rowIndex, row.work_item_name !== undefined && row.item_name === undefined ? 'work_item_name' : 'item_name', value)} disabled={disabled} />
-                {visibleVendors.flatMap((vendor, vendorIndex) => [
-                  <EditableTemplateCell key={`${rowIndex}-${vendorIndex}-spec`} value={vendor.empty ? '' : getVendorPreviewValue(row, vendor, 'spec')} onChange={(value) => !vendor.empty && updateCell?.(rowIndex, vendorEditKey(vendor, 'spec', vendorIndex), value)} disabled={disabled || vendor.empty} />,
-                  <EditableTemplateCell key={`${rowIndex}-${vendorIndex}-qty`} value={vendor.empty ? '' : getVendorPreviewValue(row, vendor, 'quantity')} onChange={(value) => !vendor.empty && updateCell?.(rowIndex, vendorEditKey(vendor, 'quantity', vendorIndex), value)} disabled={disabled || vendor.empty} />,
-                  <EditableTemplateCell key={`${rowIndex}-${vendorIndex}-price`} value={vendor.empty ? '' : getVendorPreviewValue(row, vendor, 'unit_price')} money onChange={(value) => !vendor.empty && updateCell?.(rowIndex, vendorEditKey(vendor, 'unit_price', vendorIndex), value)} disabled={disabled || vendor.empty} />,
-                  <EditableTemplateCell key={`${rowIndex}-${vendorIndex}-amount`} value={vendor.empty ? '' : getVendorPreviewValue(row, vendor, 'amount')} money onChange={(value) => !vendor.empty && updateCell?.(rowIndex, vendorEditKey(vendor, 'amount', vendorIndex), value)} disabled={disabled || vendor.empty} />
-                ])}
-              </tr>
-            ))}
-            {Array.from({ length: Math.max(0, rowAreaLength - rows.slice(0, rowAreaLength).length) }).map((_, idx) => (
-              <tr key={`empty-${idx}`}>
-                <TemplateCell>&nbsp;</TemplateCell>
-                <TemplateCell></TemplateCell>
-                {visibleVendors.flatMap((vendor, vendorIndex) => ['spec', 'qty', 'price', 'amount'].map((key) => <TemplateCell key={`empty-${idx}-${vendorIndex}-${key}`}></TemplateCell>))}
-              </tr>
-            ))}
-            <tr>
-              <TemplateCell colSpan={2} className="bg-slate-200 font-black">합계</TemplateCell>
-              {visibleVendors.flatMap((vendor, vendorIndex) => [
-                <TemplateCell key={`total-blank-${vendorIndex}`} colSpan={3}></TemplateCell>,
-                <TemplateCell key={`total-value-${vendorIndex}`} className="font-black">{vendor.empty ? '' : formatMoney(rows.reduce((sum, row) => sum + toPreviewNumber(getVendorPreviewValue(row, vendor, 'amount')), 0))}</TemplateCell>
-              ])}
-            </tr>
-            <tr>
-              <TemplateCell rowSpan={2} colSpan={2} className="bg-slate-200 font-black">기타사항</TemplateCell>
-              <TemplateCell colSpan={headerColSpan - 2} className="h-9 bg-emerald-50"></TemplateCell>
-            </tr>
-            <tr><TemplateCell colSpan={headerColSpan - 2} className="h-9 bg-emerald-50"></TemplateCell></tr>
-            <tr>
-              <TemplateCell colSpan={2} className="bg-slate-200 font-black">최종의견</TemplateCell>
-              <TemplateCell colSpan={headerColSpan - 2} className="h-12 bg-emerald-50"></TemplateCell>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-    </div>
-  );
-}
-
-
-function designBaseColumns(design = {}, table = {}) {
-  const raw = Array.isArray(design.baseColumns) && design.baseColumns.length
-    ? design.baseColumns
-    : (table.columns || []).map((col) => ({ fieldKey: col.key, label: col.label || col.key }));
-  const seen = new Set();
-  return raw.map((item) => ({ key: normalizeAiPreviewFieldKey(item.fieldKey || item.key), label: item.label || item.fieldLabel || item.key || item.fieldKey }))
-    .filter((item) => item.key && !seen.has(item.key) && seen.add(item.key));
-}
-
-
-function DesignCandidatePreview({ table, issues, design, writerName, updateCell, removeRow, disabled, updateColumnLabel, removeColumn }) {
-  const layout = String(design?.layout || '').toUpperCase();
-  const layoutType = String(design?.layoutType || design?.layout_type || '').toUpperCase();
-  const designId = String(design?.designId || '').toUpperCase();
-  if (layoutType === 'VENDOR_COMPARISON_REVIEW_FORM' || layout.includes('VENDOR_COMPARISON_REVIEW') || designId.includes('VENDOR_COMPARE_REVIEW')) {
-    return <DesignVendorComparisonReviewPreview table={table} issues={issues} design={design} writerName={writerName} updateCell={updateCell} removeRow={removeRow} disabled={disabled} />;
-  }
-  if (layoutType === 'REVIEW_OPINION_FORM' || layout.includes('REVIEW_OPINION') || designId.includes('REVIEW_OPINION')) {
-    return <DesignReviewOpinionPreview table={table} issues={issues} design={design} writerName={writerName} updateCell={updateCell} removeRow={removeRow} disabled={disabled} />;
-  }
-  if (layout.includes('DYNAMIC_VENDOR') || layoutType === 'VENDOR_COMPARISON_TABLE' || (layout.includes('VENDOR_COMPARE') && !layout.includes('REVIEW')) || (designId.includes('VENDOR_COMPARE') && !designId.includes('REVIEW'))) {
-    return <DesignVendorComparePreview table={table} issues={issues} design={design} writerName={writerName} updateCell={updateCell} removeRow={removeRow} disabled={disabled} />;
-  }
-  if (layout.includes('ESTIMATE') || designId.includes('ESTIMATE')) {
-    return <DesignEstimatePreview table={table} issues={issues} design={design} writerName={writerName} updateCell={updateCell} removeRow={removeRow} disabled={disabled} />;
-  }
-  if (layout.includes('PRICE')) {
-    return <DesignPriceTablePreview table={table} issues={issues} design={design} updateCell={updateCell} removeRow={removeRow} disabled={disabled} />;
-  }
-  if (layout.includes('MEETING')) {
-    return <DesignMeetingPreview table={table} issues={issues} design={design} writerName={writerName} updateCell={updateCell} removeRow={removeRow} disabled={disabled} />;
-  }
-  if (layout.includes('OFFICIAL')) {
-    return <DesignOfficialLetterPreview table={table} issues={issues} design={design} writerName={writerName} updateCell={updateCell} removeRow={removeRow} disabled={disabled} />;
-  }
-  if (layout.includes('REPORT') || layout.includes('CUSTOM_DOCUMENT_FORM') || layout.includes('DOCUMENT_FORM') || layoutType.includes('REPORT') || layout.includes('SECTION') || layout.includes('SUMMARY') || layout.includes('APPROVAL') || layout.includes('HEADER_TABLE')) {
-    return <DesignReportPreview table={table} issues={issues} design={design} writerName={writerName} updateCell={updateCell} removeRow={removeRow} disabled={disabled} updateColumnLabel={updateColumnLabel} removeColumn={removeColumn} />;
-  }
-  return (
-    <div className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-card">
-      <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-        <div>
-          <h4 className="text-xl font-black text-slate-950">{design?.name || '기본 표 양식'} 미리보기</h4>
-          <p className="mt-1 text-sm text-slate-500">선택한 디자인을 단순 엑셀 표 형태로 바로 편집합니다.</p>
-        </div>
-        <Badge tone={issues.length ? 'amber' : 'green'}>{issues.length ? '확인 필요 행 포함' : '정상'}</Badge>
-      </div>
-      <EditableGrid table={table} issues={issues} updateCell={updateCell} addRow={() => {}} removeRow={removeRow} addColumn={() => {}} removeColumn={removeColumn} updateColumnLabel={updateColumnLabel} saveTable={() => {}} disabled={disabled} compact={false} showToolbar={false} />
-    </div>
-  );
-}
-
-function getRowItemName(row = '') {
-  return row.item_name || row.work_item_name || row.product_name || row.material_name || row.title || row.agenda || '';
-}
-
-function DesignEstimatePreview({ table, issues, design, writerName, updateCell, removeRow, disabled }) {
-  const rows = table.rows || [];
-  const vendors = inferPreviewVendors(table).filter((vendor) => vendor?.name);
-  const primaryVendor = vendors[0] || { name: '견적업체', unitPriceKey: 'unit_price', amountKey: 'amount' };
-  const total = rows.reduce((sum, row) => sum + toPreviewNumber(getVendorPreviewValue(row, primaryVendor, 'amount') || row.amount), 0);
-  return (
-    <div className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-card">
-      <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-        <div>
-          <h4 className="text-xl font-black text-slate-950">견적서 양식 미리보기</h4>
-          <p className="mt-1 text-sm text-slate-500">견적서 전용 구조입니다. 공급자/수신처/견적 내역/합계가 표와 다르게 배치됩니다.</p>
-        </div>
-        <Badge tone="blue">AI 생성 양식 · 견적서</Badge>
-      </div>
-      <div className="scroll-thin mt-5 max-h-[calc(100vh-390px)] overflow-auto rounded-3xl border border-slate-200 bg-white p-3">
-        <table className="w-full min-w-[1000px] border-collapse text-center text-[12px] font-bold text-slate-900">
-          <tbody>
-            <tr><TemplateCell colSpan={8} className="py-5 text-3xl font-black tracking-[0.2em]">{design?.title || '견 적 서'}</TemplateCell></tr>
-            <tr>
-              <TemplateCell className="w-[120px] bg-slate-200">견적일자</TemplateCell><TemplateCell>{formatPreviewDate()}</TemplateCell>
-              <TemplateCell className="bg-slate-200">수신</TemplateCell><EditableTemplateCell colSpan={2} align="left" value={rows[0]?.recipient || ''} onChange={(v) => updateCell?.(0, 'recipient', v)} disabled={disabled} placeholder="수신처" />
-              <TemplateCell className="bg-slate-200">작성자</TemplateCell><TemplateCell colSpan={2}>{writerName || '-'}</TemplateCell>
-            </tr>
-            <tr>
-              <TemplateCell className="bg-slate-200">공급자</TemplateCell><EditableTemplateCell colSpan={3} align="left" value={primaryVendor.name || ''} onChange={(v) => updateCell?.(0, 'vendor_name', v)} disabled={disabled} />
-              <TemplateCell className="bg-slate-200">견적명</TemplateCell><EditableTemplateCell colSpan={3} align="left" value={rows[0]?.document_title || table.tableName || ''} onChange={(v) => updateCell?.(0, 'document_title', v)} disabled={disabled} />
-            </tr>
-            <tr>{['NO', '품명', '규격', '수량', '단위', '단가', '금액', '비고'].map((h) => <TemplateCell key={h} className="bg-slate-200">{h}</TemplateCell>)}</tr>
-            {rows.map((row, rowIndex) => (
-              <tr key={`estimate-${rowIndex}`} className={issues.some((issue) => Number(issue.rowIndex) === rowIndex) ? 'bg-amber-50' : 'bg-white'}>
-                <TemplateCell>{row.row_no || rowIndex + 1}{removeRowButton(removeRow, rowIndex, disabled)}</TemplateCell>
-                <EditableTemplateCell align="left" value={getRowItemName(row)} onChange={(v) => updateCell?.(rowIndex, 'item_name', v)} disabled={disabled} />
-                <EditableTemplateCell value={row.spec || ''} onChange={(v) => updateCell?.(rowIndex, 'spec', v)} disabled={disabled} />
-                <EditableTemplateCell value={row.quantity || ''} onChange={(v) => updateCell?.(rowIndex, 'quantity', v)} disabled={disabled} />
-                <EditableTemplateCell value={row.unit || ''} onChange={(v) => updateCell?.(rowIndex, 'unit', v)} disabled={disabled} />
-                <EditableTemplateCell money value={getVendorPreviewValue(row, primaryVendor, 'unit_price') || row.unit_price || ''} onChange={(v) => updateCell?.(rowIndex, vendorEditKey(primaryVendor, 'unit_price', 0), v)} disabled={disabled} />
-                <EditableTemplateCell money value={getVendorPreviewValue(row, primaryVendor, 'amount') || row.amount || ''} onChange={(v) => updateCell?.(rowIndex, vendorEditKey(primaryVendor, 'amount', 0), v)} disabled={disabled} />
-                <EditableTemplateCell align="left" value={row.remark || ''} onChange={(v) => updateCell?.(rowIndex, 'remark', v)} disabled={disabled} />
-              </tr>
-            ))}
-            <tr><TemplateCell colSpan={6} className="bg-slate-100 text-right font-black">합계</TemplateCell><TemplateCell className="font-black">{formatMoney(total)}</TemplateCell><TemplateCell></TemplateCell></tr>
-            <tr><TemplateCell colSpan={2} className="bg-slate-200">특기사항</TemplateCell><EditableTemplateCell colSpan={6} align="left" value={rows[0]?.special_note || ''} onChange={(v) => updateCell?.(0, 'special_note', v)} disabled={disabled} placeholder="견적 조건, 납기, 유효기간 등" /></tr>
-          </tbody>
-        </table>
-      </div>
-    </div>
-  );
-}
-
-function DesignPriceTablePreview({ table, issues, design, updateCell, removeRow, disabled }) {
-  const rows = table.rows || [];
-  return (
-    <div className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-card">
-      <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-        <div>
-          <h4 className="text-xl font-black text-slate-950">단가표 양식 미리보기</h4>
-          <p className="mt-1 text-sm text-slate-500">단가표 전용 구조입니다. 견적서처럼 수신/합계 중심이 아니라 공종·규격·단가 관리 중심입니다.</p>
-        </div>
-        <Badge tone="blue">AI 생성 양식 · 단가표</Badge>
-      </div>
-      <div className="scroll-thin mt-5 max-h-[calc(100vh-390px)] overflow-auto rounded-3xl border border-slate-200 bg-white p-3">
-        <table className="w-full min-w-[980px] border-collapse text-center text-[12px] font-bold text-slate-900">
-          <tbody>
-            <tr><TemplateCell colSpan={9} className="py-4 text-2xl font-black">{design?.title || '표준 단가표'}</TemplateCell></tr>
-            <tr><TemplateCell colSpan={2} className="bg-slate-200">기준일</TemplateCell><TemplateCell>{formatPreviewDate()}</TemplateCell><TemplateCell colSpan={2} className="bg-slate-200">적용범위</TemplateCell><TemplateCell colSpan={4}>공사/자재/장비 단가 관리</TemplateCell></tr>
-            <tr>{['NO', '공종코드', '공종명/품명', '규격', '단위', '수량', '기준단가', '금액', '비고'].map((h) => <TemplateCell key={h} className="bg-slate-200">{h}</TemplateCell>)}</tr>
-            {rows.map((row, rowIndex) => (
-              <tr key={`price-table-${rowIndex}`} className={issues.some((issue) => Number(issue.rowIndex) === rowIndex) ? 'bg-amber-50' : rowIndex % 2 ? 'bg-slate-50' : 'bg-white'}>
-                <TemplateCell>{row.row_no || rowIndex + 1}{removeRowButton(removeRow, rowIndex, disabled)}</TemplateCell>
-                <EditableTemplateCell value={row.construction_code || row.work_code || ''} onChange={(v) => updateCell?.(rowIndex, 'construction_code', v)} disabled={disabled} />
-                <EditableTemplateCell align="left" value={getRowItemName(row)} onChange={(v) => updateCell?.(rowIndex, 'item_name', v)} disabled={disabled} />
-                <EditableTemplateCell value={row.spec || ''} onChange={(v) => updateCell?.(rowIndex, 'spec', v)} disabled={disabled} />
-                <EditableTemplateCell value={row.unit || ''} onChange={(v) => updateCell?.(rowIndex, 'unit', v)} disabled={disabled} />
-                <EditableTemplateCell value={row.quantity || ''} onChange={(v) => updateCell?.(rowIndex, 'quantity', v)} disabled={disabled} />
-                <EditableTemplateCell money value={row.standard_unit_price || row.unit_price || row.vendor_unit_price || ''} onChange={(v) => updateCell?.(rowIndex, 'standard_unit_price', v)} disabled={disabled} />
-                <EditableTemplateCell money value={row.amount || ''} onChange={(v) => updateCell?.(rowIndex, 'amount', v)} disabled={disabled} />
-                <EditableTemplateCell align="left" value={row.remark || ''} onChange={(v) => updateCell?.(rowIndex, 'remark', v)} disabled={disabled} />
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    </div>
-  );
-}
-
-function DesignVendorComparePreview({ table, issues, design, writerName, updateCell, removeRow, disabled }) {
-  const vendors = inferPreviewVendors(table);
-  const visibleVendors = buildTemplateVendorSlots(vendors, 'COMPACT_VENDOR_GROUPS');
-  const rows = table.rows || [];
-  const headerColSpan = 5 + visibleVendors.length * 2 + 3;
-  return (
-    <div className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-card">
-      <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-        <div>
-          <h4 className="text-xl font-black text-slate-950">업체 비교형 미리보기</h4>
-          <p className="mt-1 text-sm text-slate-500">업체별 단가·금액을 가로 반복 컬럼으로 표시하고 바로 수정합니다.</p>
-        </div>
-        <Badge tone="blue">업체 {vendors.length || 0}개</Badge>
-      </div>
-      <div className="scroll-thin mt-5 max-h-[calc(100vh-390px)] min-h-[420px] overflow-auto rounded-3xl border border-slate-200 bg-white p-3">
-        <table className="w-max min-w-full border-collapse table-fixed text-center text-[11px] font-bold text-slate-900">
-          <tbody>
-            <tr><TemplateCell colSpan={headerColSpan} className="py-4 text-xl font-black">{design?.title || '업체별 단가 비교표'}</TemplateCell></tr>
-            <tr>
-              <TemplateCell colSpan={2} className="bg-slate-100">작성일</TemplateCell><TemplateCell>{formatPreviewDate()}</TemplateCell>
-              <TemplateCell colSpan={2} className="bg-slate-100">작성자</TemplateCell><TemplateCell colSpan={Math.max(headerColSpan - 5, 1)}>{writerName || '-'}</TemplateCell>
-            </tr>
-            <tr>
-              {['NO', '품명', '규격', '수량', '단위'].map((label) => <TemplateCell key={label} rowSpan={2} className="bg-slate-200">{label}</TemplateCell>)}
-              {visibleVendors.map((vendor, index) => <TemplateCell key={`dvh-${index}`} colSpan={2} className="bg-slate-200">{vendor.empty ? '' : cleanTableColumnLabel(vendor.name)}</TemplateCell>)}
-              {['최저 업체', '최저 단가', '비고'].map((label) => <TemplateCell key={label} rowSpan={2} className="bg-slate-200">{label}</TemplateCell>)}
-            </tr>
-            <tr>{visibleVendors.flatMap((vendor, index) => ['단가', '금액'].map((label) => <TemplateCell key={`dvs-${index}-${label}`} className="bg-slate-100">{label}</TemplateCell>))}</tr>
-            {rows.map((row, rowIndex) => {
-              const lowest = getAiPreviewLowest(row, visibleVendors.filter((v) => !v.empty));
-              return (
-                <tr key={`design-vendor-row-${rowIndex}`} className={issues.some((issue) => Number(issue.rowIndex) === rowIndex) ? 'bg-amber-50' : 'bg-white'}>
-                  <TemplateCell>{row.row_no || rowIndex + 1}{removeRowButton(removeRow, rowIndex, disabled)}</TemplateCell>
-                  <EditableTemplateCell align="left" value={getRowItemName(row)} onChange={(value) => updateCell?.(rowIndex, 'item_name', value)} disabled={disabled} />
-                  <EditableTemplateCell value={row.spec || ''} onChange={(value) => updateCell?.(rowIndex, 'spec', value)} disabled={disabled} />
-                  <EditableTemplateCell value={row.quantity || ''} onChange={(value) => updateCell?.(rowIndex, 'quantity', value)} disabled={disabled} />
-                  <EditableTemplateCell value={row.unit || ''} onChange={(value) => updateCell?.(rowIndex, 'unit', value)} disabled={disabled} />
-                  {visibleVendors.flatMap((vendor, vendorIndex) => [
-                    <EditableTemplateCell key={`dv-${rowIndex}-${vendorIndex}-p`} value={vendor.empty ? '' : getVendorPreviewValue(row, vendor, 'unit_price')} money onChange={(value) => !vendor.empty && updateCell?.(rowIndex, vendorEditKey(vendor, 'unit_price', vendorIndex), value)} disabled={disabled || vendor.empty} />,
-                    <EditableTemplateCell key={`dv-${rowIndex}-${vendorIndex}-a`} value={vendor.empty ? '' : getVendorPreviewValue(row, vendor, 'amount')} money onChange={(value) => !vendor.empty && updateCell?.(rowIndex, vendorEditKey(vendor, 'amount', vendorIndex), value)} disabled={disabled || vendor.empty} />
-                  ])}
-                  <EditableTemplateCell value={lowest.vendor} onChange={(value) => updateCell?.(rowIndex, 'lowest_target', value)} disabled={disabled} />
-                  <EditableTemplateCell value={lowest.price} money onChange={(value) => updateCell?.(rowIndex, 'calculated_unit_price', value)} disabled={disabled} />
-                  <EditableTemplateCell align="left" value={row.remark || ''} onChange={(value) => updateCell?.(rowIndex, 'remark', value)} disabled={disabled} />
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      </div>
-    </div>
-  );
-}
-
-function ReportSection({ number, title, value, onChange, disabled, placeholder = '' }) {
-  return (
-    <div className="rounded-2xl border border-slate-200 bg-white p-4">
-      <p className="text-sm font-black text-slate-900">{number}. {title}</p>
-      <textarea
-        value={value || ''}
-        onChange={(event) => onChange?.(event.target.value)}
-        disabled={disabled}
-        rows={4}
-        placeholder={placeholder}
-        className="mt-2 w-full resize-y rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm font-bold leading-6 text-slate-800 outline-none focus:bg-white focus:ring-2 focus:ring-brand-400 disabled:bg-white"
-      />
-    </div>
-  );
-}
-
-function DesignReportPreview({ table, issues, design, writerName, updateCell, removeRow, disabled, updateColumnLabel, removeColumn }) {
-  const rows = table.rows || [];
-  const first = rows[0] || {};
-  return (
-    <div className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-card">
-      <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-        <div>
-          <h4 className="text-xl font-black text-slate-950">보고서 양식 미리보기</h4>
-          <p className="mt-1 text-sm text-slate-500">회사 보고서형입니다. 표 제목만 바꾸는 방식이 아니라 보고 목적·검토내용·결론·조치계획 섹션으로 편집합니다.</p>
-        </div>
-        <Badge tone="blue">AI 생성 양식 · 보고서</Badge>
-      </div>
-
-      <div className="mt-5 rounded-[28px] border border-slate-300 bg-white p-6 shadow-sm">
-        <div className="grid grid-cols-1 gap-4 lg:grid-cols-[1fr_260px]">
-          <div>
-            <p className="text-xs font-black text-slate-500">보고서 제목</p>
-            <input
-              value={first.report_title || first.document_title || design?.title || '업무 보고서'}
-              onChange={(event) => updateCell?.(0, 'report_title', event.target.value)}
-              disabled={disabled}
-              className="mt-2 w-full rounded-xl border border-slate-200 px-4 py-3 text-2xl font-black text-slate-950 outline-none focus:ring-2 focus:ring-brand-400"
-            />
-          </div>
-          <div className="overflow-hidden rounded-2xl border border-slate-300 text-center text-xs font-black">
-            <div className="grid grid-cols-2 border-b border-slate-300"><div className="bg-slate-100 py-2">작성일</div><div className="py-2">{formatPreviewDate()}</div></div>
-            <div className="grid grid-cols-2 border-b border-slate-300"><div className="bg-slate-100 py-2">작성자</div><div className="py-2">{writerName || '-'}</div></div>
-            <div className="grid grid-cols-2"><div className="bg-slate-100 py-2">검토건수</div><div className="py-2">{rows.length}건</div></div>
-          </div>
-        </div>
-
-        <div className="mt-5 grid grid-cols-1 gap-3">
-          <ReportSection number="1" title="보고 목적" value={firstNonEmpty(sanitizeBusinessPurpose(first.report_purpose), sanitizeBusinessPurpose(first.purpose), inferBusinessPurposeFromRow(first))} onChange={(v) => updateCell?.(0, 'report_purpose', v)} disabled={disabled} placeholder="보고 목적을 입력하세요." />
-          <ReportSection number="2" title="주요 검토 내용" value={first.summary || first.content || ''} onChange={(v) => updateCell?.(0, 'summary', v)} disabled={disabled} placeholder="문서 분석 내용 또는 검토 내용을 입력하세요." />
-          <ReportSection number="3" title="검토 결과" value={first.issue_summary || first.review_result || first.review_opinion || ''} onChange={(v) => updateCell?.(0, 'issue_summary', v)} disabled={disabled} placeholder="검토 결과를 입력하세요." />
-          <ReportSection number="4" title="조치 계획" value={first.action_plan || ''} onChange={(v) => updateCell?.(0, 'action_plan', v)} disabled={disabled} placeholder="후속 조치 계획을 입력하세요." />
-        </div>
-
-        <div className="mt-5 rounded-2xl border border-slate-200 bg-slate-50 p-4">
-          <p className="text-sm font-black text-slate-900">보고서 하단 메모</p>
-          <textarea
-            value={first.footer_note || ''}
-            onChange={(event) => updateCell?.(0, 'footer_note', event.target.value)}
-            disabled={disabled}
-            rows={3}
-            placeholder="추가 참고사항이나 결재 요청 문구를 입력하세요. 불필요하면 비워두면 됩니다."
-            className="mt-2 w-full resize-y rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-bold leading-6 text-slate-800 outline-none focus:ring-2 focus:ring-brand-400 disabled:bg-white"
-          />
-        </div>
-      </div>
-    </div>
-  );
-}
-
-
-function DesignReviewOpinionPreview({ table, issues, design, writerName, updateCell, removeRow, disabled }) {
-  const rows = table.rows || [];
-  const first = rows[0] || {};
-  return (
-    <div className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-card">
-      <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-        <div>
-          <h4 className="text-xl font-black text-slate-950">검토 의견서 양식 미리보기</h4>
-          <p className="mt-1 text-sm text-slate-500">보고서와 다른 검토 의견서 전용 구조입니다. 확인사항, 이슈, 검토의견, 보완요청을 분리합니다.</p>
-        </div>
-        <Badge tone={issues.length ? 'amber' : 'blue'}>{issues.length ? '확인 필요 포함' : '검토 의견서'}</Badge>
-      </div>
-
-      <div className="mt-5 rounded-[28px] border border-slate-300 bg-white p-6 shadow-sm">
-        <input
-          value={first.report_title || first.document_title || design?.title || '검토 의견서'}
-          onChange={(event) => updateCell?.(0, 'report_title', event.target.value)}
-          disabled={disabled}
-          className="w-full rounded-xl border-0 border-b-2 border-slate-300 px-3 py-3 text-center text-3xl font-black tracking-[0.18em] outline-none focus:border-brand-400"
-        />
-        <div className="mt-5 grid grid-cols-1 overflow-hidden rounded-2xl border border-slate-300 text-sm font-bold md:grid-cols-4">
-          <div className="bg-slate-100 px-3 py-2 text-center font-black">작성일</div>
-          <div className="border-b border-slate-300 px-3 py-2 md:border-b-0 md:border-r">{formatPreviewDate()}</div>
-          <div className="bg-slate-100 px-3 py-2 text-center font-black">작성자</div>
-          <div className="px-3 py-2">{writerName || '-'}</div>
-          <div className="bg-slate-100 px-3 py-2 text-center font-black">문서구분</div>
-          <input value={first.document_type || first.documentType || '내부 검토'} onChange={(e) => updateCell?.(0, 'document_type', e.target.value)} disabled={disabled} className="border-b border-slate-300 px-3 py-2 outline-none focus:bg-brand-50 md:border-b-0 md:border-r" />
-          <div className="bg-slate-100 px-3 py-2 text-center font-black">검토상태</div>
-          <input value={first.status || '확인 필요'} onChange={(e) => updateCell?.(0, 'status', e.target.value)} disabled={disabled} className="px-3 py-2 outline-none focus:bg-brand-50" />
-        </div>
-
-        <div className="mt-5 grid grid-cols-1 gap-3">
-          <ReportSection number="1" title="검토 대상" value={first.document_title || first.report_title || ''} onChange={(v) => updateCell?.(0, 'document_title', v)} disabled={disabled} placeholder="원문 문서명 또는 검토 대상을 입력하세요." />
-          <ReportSection number="2" title="주요 확인사항" value={first.summary || first.content || ''} onChange={(v) => updateCell?.(0, 'summary', v)} disabled={disabled} placeholder="원문에서 확인된 주요 내용을 입력하세요." />
-          <ReportSection number="3" title="주요 이슈" value={first.issue_summary || first.review_result || ''} onChange={(v) => updateCell?.(0, 'issue_summary', v)} disabled={disabled} placeholder="보완 또는 확인이 필요한 이슈를 입력하세요." />
-          <ReportSection number="4" title="검토 의견" value={first.review_opinion || first.review_result || first.issue_summary || ''} onChange={(v) => updateCell?.(0, 'review_opinion', v)} disabled={disabled} placeholder="검토 의견을 입력하세요." />
-          <ReportSection number="5" title="보완/조치 요청" value={first.action_plan || ''} onChange={(v) => updateCell?.(0, 'action_plan', v)} disabled={disabled} placeholder="원문에 명시된 보완 또는 조치사항을 입력하세요." />
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function DesignVendorComparisonReviewPreview({ table, issues, design, writerName, updateCell, removeRow, disabled }) {
-  const rows = table.rows || [];
-  const first = rows[0] || {};
-  return (
-    <div className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-card">
-      <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-        <div>
-          <h4 className="text-xl font-black text-slate-950">업체별 단가 비교 검토보고서 미리보기</h4>
-          <p className="mt-1 text-sm text-slate-500">업체 비교표가 아니라 비교 검토보고서 전용 문서형 구조입니다. 비교 기준, 요약, 검토의견, 확인사항을 나눕니다.</p>
-        </div>
-        <Badge tone={issues.length ? 'amber' : 'blue'}>{issues.length ? '확인 필요 포함' : '비교 검토보고서'}</Badge>
-      </div>
-
-      <div className="mt-5 rounded-[28px] border border-slate-300 bg-white p-6 shadow-sm">
-        <div className="grid grid-cols-1 gap-4 lg:grid-cols-[1fr_260px]">
-          <div>
-            <p className="text-xs font-black text-slate-500">검토보고서 제목</p>
-            <input
-              value={first.report_title || first.document_title || design?.title || '업체별 단가 비교 검토보고서'}
-              onChange={(event) => updateCell?.(0, 'report_title', event.target.value)}
-              disabled={disabled}
-              className="mt-2 w-full rounded-xl border border-slate-200 px-4 py-3 text-2xl font-black text-slate-950 outline-none focus:ring-2 focus:ring-brand-400"
-            />
-          </div>
-          <div className="overflow-hidden rounded-2xl border border-slate-300 text-center text-xs font-black">
-            <div className="grid grid-cols-2 border-b border-slate-300"><div className="bg-slate-100 py-2">작성일</div><div className="py-2">{formatPreviewDate()}</div></div>
-            <div className="grid grid-cols-2 border-b border-slate-300"><div className="bg-slate-100 py-2">작성자</div><div className="py-2">{writerName || '-'}</div></div>
-            <div className="grid grid-cols-2"><div className="bg-slate-100 py-2">확인행</div><div className="py-2">{rows.length}건</div></div>
-          </div>
-        </div>
-
-        <div className="mt-5 grid grid-cols-1 gap-3">
-          <ReportSection number="1" title="검토 목적" value={firstNonEmpty(sanitizeBusinessPurpose(first.report_purpose), sanitizeBusinessPurpose(first.purpose), inferBusinessPurposeFromRow(first))} onChange={(v) => updateCell?.(0, 'report_purpose', v)} disabled={disabled} placeholder="원문에 명시된 검토 목적을 입력하세요." />
-          <ReportSection number="2" title="비교/검토 기준" value={first.comparison_basis || first.criteria || first.summary || ''} onChange={(v) => updateCell?.(0, 'comparison_basis', v)} disabled={disabled} placeholder="단가, 금액, 업체, 검토 기준을 입력하세요." />
-          <ReportSection number="3" title="주요 비교 내용" value={first.summary || first.content || ''} onChange={(v) => updateCell?.(0, 'summary', v)} disabled={disabled} placeholder="원문 기준 비교 내용을 입력하세요." />
-          <ReportSection number="4" title="검토 결과/의견" value={first.issue_summary || first.review_result || first.review_opinion || ''} onChange={(v) => updateCell?.(0, 'issue_summary', v)} disabled={disabled} placeholder="비교 검토 결과를 입력하세요." />
-          <ReportSection number="5" title="확인 및 조치사항" value={first.action_plan || ''} onChange={(v) => updateCell?.(0, 'action_plan', v)} disabled={disabled} placeholder="원문에 명시된 확인 또는 조치사항을 입력하세요." />
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function DesignMeetingPreview({ table, issues, design, writerName, updateCell, removeRow, disabled }) {
-  const rows = table.rows || [];
-  const first = rows[0] || {};
-  return (
-    <div className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-card">
-      <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-        <div>
-          <h4 className="text-xl font-black text-slate-950">회의록 양식 미리보기</h4>
-          <p className="mt-1 text-sm text-slate-500">회의록 전용 양식입니다. 회의 개요, 참석자, 안건, 결정사항, 조치사항을 분리해서 편집합니다.</p>
-        </div>
-        <Badge tone="blue">AI 생성 양식 · 회의록</Badge>
-      </div>
-
-      <div className="mt-5 rounded-[28px] border border-slate-300 bg-white p-6 shadow-sm">
-        <input
-          value={first.meeting_title || first.document_title || design?.title || '회의록'}
-          onChange={(event) => updateCell?.(0, 'meeting_title', event.target.value)}
-          disabled={disabled}
-          className="w-full rounded-xl border-0 border-b-2 border-slate-300 px-3 py-3 text-center text-3xl font-black tracking-[0.25em] outline-none focus:border-brand-400"
-        />
-        <div className="mt-5 grid grid-cols-1 overflow-hidden rounded-2xl border border-slate-300 text-sm font-bold md:grid-cols-4">
-          <div className="bg-slate-100 px-3 py-2 text-center font-black">회의일시</div>
-          <input value={first.meeting_date || formatPreviewDate()} onChange={(e) => updateCell?.(0, 'meeting_date', e.target.value)} disabled={disabled} className="border-b border-slate-300 px-3 py-2 outline-none focus:bg-brand-50 md:border-b-0 md:border-r" />
-          <div className="bg-slate-100 px-3 py-2 text-center font-black">회의장소</div>
-          <input value={first.meeting_place || ''} onChange={(e) => updateCell?.(0, 'meeting_place', e.target.value)} disabled={disabled} className="px-3 py-2 outline-none focus:bg-brand-50" />
-          <div className="bg-slate-100 px-3 py-2 text-center font-black">작성자</div>
-          <div className="border-b border-slate-300 px-3 py-2 md:border-b-0 md:border-r">{writerName || '-'}</div>
-          <div className="bg-slate-100 px-3 py-2 text-center font-black">참석자</div>
-          <input value={first.attendees || ''} onChange={(e) => updateCell?.(0, 'attendees', e.target.value)} disabled={disabled} className="px-3 py-2 outline-none focus:bg-brand-50" placeholder="참석자 입력" />
-        </div>
-
-        <div className="mt-5 grid grid-cols-1 gap-4 xl:grid-cols-2">
-          <div className="rounded-2xl border border-slate-200 p-4">
-            <p className="text-sm font-black text-slate-900">1. 회의 안건</p>
-            <textarea value={first.agenda || getRowItemName(first)} onChange={(e) => updateCell?.(0, 'agenda', e.target.value)} disabled={disabled} rows={5} className="mt-2 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm font-bold leading-6 outline-none focus:bg-white focus:ring-2 focus:ring-brand-400" />
-          </div>
-          <div className="rounded-2xl border border-slate-200 p-4">
-            <p className="text-sm font-black text-slate-900">2. 주요 논의 내용</p>
-            <textarea value={first.discussion || first.content || ''} onChange={(e) => updateCell?.(0, 'discussion', e.target.value)} disabled={disabled} rows={5} className="mt-2 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm font-bold leading-6 outline-none focus:bg-white focus:ring-2 focus:ring-brand-400" />
-          </div>
-          <div className="rounded-2xl border border-slate-200 p-4">
-            <p className="text-sm font-black text-slate-900">3. 결정 사항</p>
-            <textarea value={first.decision || ''} onChange={(e) => updateCell?.(0, 'decision', e.target.value)} disabled={disabled} rows={4} className="mt-2 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm font-bold leading-6 outline-none focus:bg-white focus:ring-2 focus:ring-brand-400" />
-          </div>
-          <div className="rounded-2xl border border-slate-200 p-4">
-            <p className="text-sm font-black text-slate-900">4. 비고</p>
-            <textarea value={first.remark || ''} onChange={(e) => updateCell?.(0, 'remark', e.target.value)} disabled={disabled} rows={4} className="mt-2 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm font-bold leading-6 outline-none focus:bg-white focus:ring-2 focus:ring-brand-400" />
-          </div>
-        </div>
-
-        <div className="mt-5 rounded-2xl border border-slate-200 p-4">
-          <p className="text-sm font-black text-slate-900">5. 조치 사항</p>
-          <div className="mt-3 overflow-auto rounded-xl border border-slate-200">
-            <table className="w-full min-w-[760px] border-collapse text-sm font-bold">
-              <thead className="bg-slate-100"><tr>{['관리', '조치내용', '담당자', '기한', '상태'].map((h) => <th key={h} className="border border-slate-200 px-3 py-2">{h}</th>)}</tr></thead>
-              <tbody>
-                {rows.map((row, rowIndex) => (
-                  <tr key={`meeting-action-${rowIndex}`}>
-                    <td className="border border-slate-200 px-2 py-2 text-center">{rowIndex + 1}{removeRowButton(removeRow, rowIndex, disabled)}</td>
-                    <td className="border border-slate-200 p-1"><input value={row.action_item || row.decision || getRowItemName(row)} onChange={(e) => updateCell?.(rowIndex, 'action_item', e.target.value)} disabled={disabled} className="w-full rounded-lg px-2 py-2 outline-none focus:bg-brand-50" /></td>
-                    <td className="border border-slate-200 p-1"><input value={row.owner || row.manager || ''} onChange={(e) => updateCell?.(rowIndex, 'owner', e.target.value)} disabled={disabled} className="w-full rounded-lg px-2 py-2 outline-none focus:bg-brand-50" /></td>
-                    <td className="border border-slate-200 p-1"><input value={row.due_date || ''} onChange={(e) => updateCell?.(rowIndex, 'due_date', e.target.value)} disabled={disabled} className="w-full rounded-lg px-2 py-2 outline-none focus:bg-brand-50" /></td>
-                    <td className="border border-slate-200 p-1"><input value={row.status || row.remark || ''} onChange={(e) => updateCell?.(rowIndex, 'status', e.target.value)} disabled={disabled} className="w-full rounded-lg px-2 py-2 outline-none focus:bg-brand-50" /></td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function DesignOfficialLetterPreview({ table, issues, design, writerName, updateCell, removeRow, disabled }) {
-  const rows = table.rows || [];
-  const first = rows[0] || {};
-  return (
-    <div className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-card">
-      <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-        <div>
-          <h4 className="text-xl font-black text-slate-950">공문 양식 미리보기</h4>
-          <p className="mt-1 text-sm text-slate-500">공문 전용 양식입니다. 수신/참조/제목/본문/붙임/발신 영역으로 편집합니다.</p>
-        </div>
-        <Badge tone="blue">AI 생성 양식 · 공문</Badge>
-      </div>
-
-      <div className="mt-5 rounded-[28px] border border-slate-300 bg-white p-8 shadow-sm">
-        <input
-          value={first.letter_title || design?.title || '공 문'}
-          onChange={(event) => updateCell?.(0, 'letter_title', event.target.value)}
-          disabled={disabled}
-          className="w-full rounded-xl border-0 border-b-2 border-slate-300 px-3 py-4 text-center text-4xl font-black tracking-[0.45em] outline-none focus:border-brand-400"
-        />
-        <div className="mt-6 grid grid-cols-1 gap-2 text-sm font-bold">
-          <div className="grid grid-cols-[120px_1fr_120px_1fr] overflow-hidden rounded-xl border border-slate-300">
-            <div className="bg-slate-100 px-3 py-2 text-center font-black">문서번호</div>
-            <input value={first.document_no || ''} onChange={(e) => updateCell?.(0, 'document_no', e.target.value)} disabled={disabled} className="border-r border-slate-300 px-3 py-2 outline-none focus:bg-brand-50" />
-            <div className="bg-slate-100 px-3 py-2 text-center font-black">시행일자</div>
-            <div className="px-3 py-2">{formatPreviewDate()}</div>
-          </div>
-          <div className="grid grid-cols-[120px_1fr] overflow-hidden rounded-xl border border-slate-300"><div className="bg-slate-100 px-3 py-2 text-center font-black">수신</div><input value={first.recipient || ''} onChange={(e) => updateCell?.(0, 'recipient', e.target.value)} disabled={disabled} className="px-3 py-2 outline-none focus:bg-brand-50" /></div>
-          <div className="grid grid-cols-[120px_1fr] overflow-hidden rounded-xl border border-slate-300"><div className="bg-slate-100 px-3 py-2 text-center font-black">참조</div><input value={first.reference || ''} onChange={(e) => updateCell?.(0, 'reference', e.target.value)} disabled={disabled} className="px-3 py-2 outline-none focus:bg-brand-50" /></div>
-          <div className="grid grid-cols-[120px_1fr] overflow-hidden rounded-xl border border-slate-300"><div className="bg-slate-100 px-3 py-2 text-center font-black">제목</div><input value={first.document_title || first.title || table.tableName || ''} onChange={(e) => updateCell?.(0, 'document_title', e.target.value)} disabled={disabled} className="px-3 py-2 font-black outline-none focus:bg-brand-50" /></div>
-        </div>
-
-        <div className="mt-6 rounded-2xl border border-slate-200 p-5">
-          <p className="text-sm font-black text-slate-900">본문</p>
-          <textarea value={first.body || first.content || first.summary || ''} onChange={(e) => updateCell?.(0, 'body', e.target.value)} disabled={disabled} rows={10} className="mt-3 w-full resize-y rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm font-bold leading-7 outline-none focus:bg-white focus:ring-2 focus:ring-brand-400" placeholder="공문 본문을 입력하세요." />
-        </div>
-
-        <div className="mt-4 grid grid-cols-[120px_1fr] overflow-hidden rounded-xl border border-slate-300 text-sm font-bold"><div className="bg-slate-100 px-3 py-2 text-center font-black">붙임</div><input value={first.attachment_note || ''} onChange={(e) => updateCell?.(0, 'attachment_note', e.target.value)} disabled={disabled} className="px-3 py-2 outline-none focus:bg-brand-50" /></div>
-
-        <div className="mt-8 text-right text-sm font-black leading-8">
-          <input value={first.sender || '공사팀'} onChange={(e) => updateCell?.(0, 'sender', e.target.value)} disabled={disabled} className="w-full rounded-xl border border-slate-200 px-3 py-2 text-right outline-none focus:ring-2 focus:ring-brand-400" />
-          <p className="mt-2 text-slate-500">작성자: {writerName || '-'}</p>
-        </div>
-
-        {rows.slice(1).length > 0 && (
-          <div className="mt-5 rounded-2xl border border-slate-200 bg-slate-50 p-4">
-            <p className="text-sm font-black text-slate-900">참고 항목</p>
-            <div className="mt-2 space-y-2">
-              {rows.slice(1).map((row, rowIndex) => (
-                <div key={`official-extra-${rowIndex}`} className="flex items-center gap-2 rounded-xl bg-white px-3 py-2 text-sm font-bold ring-1 ring-slate-200">
-                  <span className="w-16 text-slate-500">참고 {rowIndex + 1}{removeRowButton(removeRow, rowIndex + 1, disabled)}</span>
-                  <input value={row.content || getRowItemName(row) || ''} onChange={(e) => updateCell?.(rowIndex + 1, 'content', e.target.value)} disabled={disabled} className="min-w-0 flex-1 rounded-lg px-2 py-2 outline-none focus:bg-brand-50" />
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function DesignSummaryPreview({ table, issues, design, updateCell, removeRow, disabled, updateColumnLabel, removeColumn }) {
-  return <DesignReportPreview table={table} issues={issues} design={design} updateCell={updateCell} removeRow={removeRow} disabled={disabled} updateColumnLabel={updateColumnLabel} removeColumn={removeColumn} />;
-}
-
-function EditableGrid({ table, issues = [], updateCell, addRow, removeRow, addColumn, removeColumn, updateColumnLabel, saveTable, disabled, compact = false, showToolbar = true }) {
-  const visibleColumns = getVisibleColumns(table.columns, table.rows);
-  return (
-    <div className="mt-5">
-      {showToolbar && (
-        <div className="mb-3 flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
-          <div className="flex flex-wrap items-center gap-2">
-            <button type="button" onClick={addRow} disabled={disabled} className="rounded-2xl bg-slate-100 px-4 py-2.5 text-xs font-black text-slate-700 hover:bg-slate-200 disabled:opacity-50">행 추가</button>
-            <button type="button" onClick={addColumn} disabled={disabled} className="rounded-2xl bg-slate-100 px-4 py-2.5 text-xs font-black text-slate-700 hover:bg-slate-200 disabled:opacity-50">컬럼 추가</button>
-          </div>
-          <button disabled={disabled} onClick={saveTable} className="rounded-2xl bg-gradient-to-r from-brand-500 to-brand-400 px-4 py-2.5 text-xs font-black text-white shadow-glow hover:from-brand-600 hover:to-brand-500 disabled:from-slate-300 disabled:to-slate-300">
-            수정 저장
-          </button>
-        </div>
-      )}
-      <div className={`scroll-thin overflow-auto rounded-3xl border border-slate-200 ${compact ? 'max-h-[360px]' : 'max-h-[calc(100vh-420px)] min-h-[260px]'}`}>
-        <table className="min-w-[980px] w-full border-collapse text-sm">
-          <thead className="sticky top-0 z-10 bg-slate-100 text-slate-600 shadow-sm">
-            <tr>
-              {visibleColumns.map((col) => (
-                <th key={col.key} className="border-b border-slate-200 px-2 py-2 text-left font-black align-top">
-                  <div className="flex min-w-[130px] items-center gap-1">
-                    <input
-                      value={cleanTableColumnLabel(col.label || col.key)}
-                      onChange={(e) => updateColumnLabel?.(col.key, e.target.value)}
-                      disabled={disabled}
-                      className="min-w-0 flex-1 rounded-lg bg-white px-2 py-1 text-xs font-black outline-none ring-1 ring-slate-200 focus:ring-brand-400 disabled:opacity-70"
-                    />
-                    <button type="button" onClick={() => removeColumn?.(col.key)} disabled={disabled} className="rounded-lg bg-rose-50 px-2 py-1 text-[11px] font-black text-rose-600 disabled:opacity-40">×</button>
-                  </div>
-                  <p className="mt-1 truncate text-[10px] font-bold text-slate-400">{col.key}</p>
-                </th>
-              ))}
-              <th className="w-20 border-b border-slate-200 px-3 py-3">관리</th>
-            </tr>
-          </thead>
-          <tbody>
-            {(table.rows || []).map((row, rowIndex) => (
-              <tr key={rowIndex} className={issues.some((issue) => Number(issue.rowIndex) === rowIndex) ? 'bg-amber-50' : 'bg-white'}>
-                {visibleColumns.map((col) => (
-                  <td key={col.key} className="border-b border-slate-100 p-1">
-                    <input value={row[col.key] ?? ''} onChange={(e) => updateCell(rowIndex, col.key, e.target.value)} disabled={disabled} className="w-full rounded-xl px-3 py-2 text-sm font-bold outline-none focus:bg-brand-50 focus:ring-2 focus:ring-brand-500 disabled:opacity-70" />
-                  </td>
-                ))}
-                <td className="border-b border-slate-100 p-1"><button onClick={() => removeRow(rowIndex)} disabled={disabled} className="rounded-xl bg-rose-50 px-3 py-2 text-xs font-black text-rose-600 disabled:opacity-40">삭제</button></td>
-              </tr>
-            ))}
-            {(!table.rows || table.rows.length === 0) && <tr><td colSpan={visibleColumns.length + 1} className="px-4 py-12 text-center font-bold text-slate-400">행 추가 또는 파일 분석 후 수정할 수 있습니다.</td></tr>}
-          </tbody>
-        </table>
-      </div>
-    </div>
-  );
-}
-
-
-function DirectTableEditPanel({ table, issues = [], updateCell, addRow, removeRow, addColumn, removeColumn, updateColumnLabel, saveTable, disabled, outputMode }) {
-  const isCompanyTemplateMode = outputMode === 'COMPANY_TEMPLATE';
-  return (
-    <div className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-card">
-      <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-        <div>
-          <h4 className="text-xl font-black text-slate-950">데이터 표 직접 편집</h4>
-          <p className="mt-1 text-sm text-slate-500">
-            컬럼 관리와 같은 기준의 원본 데이터 표입니다. {isCompanyTemplateMode ? '아래 회사 양식 미리보기에는 매핑된 필드가 적용됩니다.' : 'AI 추천양식도 이 표에서 셀·행·컬럼을 수정할 수 있습니다.'}
-          </p>
-        </div>
-        <div className="flex flex-wrap gap-2">
-          <Badge tone={issues.length ? 'amber' : 'green'}>{issues.length ? `확인 필요 ${issues.length}건` : '정상'}</Badge>
-          {isCompanyTemplateMode && <Badge tone="blue">자사 양식 적용 전 데이터</Badge>}
-        </div>
-      </div>
-      <EditableGrid
-        table={table}
-        issues={issues}
-        updateCell={updateCell}
-        addRow={addRow}
-        removeRow={removeRow}
-        addColumn={addColumn}
-        removeColumn={removeColumn}
-        updateColumnLabel={updateColumnLabel}
-        saveTable={saveTable}
-        disabled={disabled}
-        compact={false}
-        showToolbar={false}
-      />
-    </div>
-  );
-}
-
-function ExcelPreview({ table, issues = [], outputMode, selectedTemplate, selectedDesign, writerName, templateLayoutMode, templatePreview = null, templatePreviewLoading = false, templatePreviewError = '', updateCell, addRow, removeRow, addColumn, removeColumn, updateColumnLabel, saveTable, disabled, candidateFields = [], onCandidateAction, generatedExcelPreview = null, analysis = {} }) {
-  const isRegisteredTemplate = outputMode === 'COMPANY_TEMPLATE' && selectedTemplate;
-  const activeDesign = !isRegisteredTemplate ? selectedDesign : null;
-  const tableType = String(table?.tableType || table?.table_type || '');
-  const hasRows = (table?.rows || []).length > 0;
-  const docType = String(analysis?.documentType || analysis?.document_type || '').toLowerCase();
-
-  // 데이터가 있으면 문서 유형에 맞는 적절한 미리보기 자동 표시
-  const renderFallbackPreview = () => {
-    if (!hasRows) return null;
-
-    // 업체별 단가 비교
-    if (isMultiVendorCompareTableType(tableType) || isTextVendorComparisonReportType(tableType)) {
-      return (
-        <DesignVendorComparePreview
-          table={table} issues={issues}
-          design={{ layout: 'AI_GENERATED_DYNAMIC_VENDOR_TABLE', name: '업체별 단가 비교표' }}
-          writerName={writerName} updateCell={updateCell} removeRow={removeRow} disabled={disabled}
-        />
-      );
-    }
-
-    // 표준시장단가
-    if (isStandardMarketTableType(tableType)) {
-      return <DesignPriceTablePreview table={table} issues={issues} design={{ layout: 'PRICE_TABLE' }} updateCell={updateCell} removeRow={removeRow} disabled={disabled} />;
-    }
-
-    // 보고서 계열 (업무보고서, 검토보고서, 작업일보 등)
-    const isReportType = /(보고|보고서|리포트|report|일보|점검|감리|현황|검토)/i.test(docType) || tableType.includes('REPORT');
-    const isMeetingType = /(회의|meeting|안건|minutes)/i.test(docType) || tableType.includes('MEETING');
-    const isOfficialType = /(공문|official|letter|시행)/i.test(docType) || tableType.includes('OFFICIAL');
-
-    if (isMeetingType) {
-      return <DesignMeetingPreview table={table} issues={issues} design={{ layout: 'MEETING_MINUTES', name: '회의록' }} writerName={writerName} updateCell={updateCell} removeRow={removeRow} disabled={disabled} />;
-    }
-    if (isOfficialType) {
-      return <DesignOfficialLetterPreview table={table} issues={issues} design={{ layout: 'OFFICIAL_LETTER', name: '공문' }} writerName={writerName} updateCell={updateCell} removeRow={removeRow} disabled={disabled} />;
-    }
-    if (isReportType) {
-      return <DesignReportPreview table={table} issues={issues} design={{ layout: 'CUSTOM_DOCUMENT_FORM', name: '보고서' }} writerName={writerName} updateCell={updateCell} removeRow={removeRow} disabled={disabled} updateColumnLabel={updateColumnLabel} removeColumn={removeColumn} />;
-    }
-
-    // 일반 표 - 데이터가 있으면 EditableGrid로 표시
-    return (
-      <div className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-card">
-        <div className="mb-3 flex items-center justify-between">
-          <h4 className="text-xl font-black text-slate-950">추출 결과 미리보기</h4>
-          <div className="flex items-center gap-2">
-            <Badge tone="blue">{(table.rows || []).length}행</Badge>
-            <span className="text-xs text-slate-400">채팅에서 "보고서 형식으로" 등 입력하면 양식 변경</span>
-          </div>
-        </div>
-        <EditableGrid table={table} issues={issues} updateCell={updateCell} addRow={() => {}} removeRow={removeRow} addColumn={() => {}} removeColumn={removeColumn} updateColumnLabel={updateColumnLabel} saveTable={saveTable} disabled={disabled} compact={false} showToolbar={false} />
-      </div>
-    );
-  };
-
-  // 실제 Excel 파일 미리보기 데이터가 유효한지 확인 (행과 컬럼이 모두 있어야 함)
-  const hasValidExcelPreview = Array.isArray(generatedExcelPreview?.rows) && generatedExcelPreview.rows.length > 0
-    && Array.isArray(generatedExcelPreview?.columns) && generatedExcelPreview.columns.length > 0;
-
-  return (
-    <div className="space-y-4">
-      <PreviewEditToolbar table={table} addRow={addRow} addColumn={addColumn} removeColumn={removeColumn} updateColumnLabel={updateColumnLabel} saveTable={saveTable} disabled={disabled} candidateFields={candidateFields} onCandidateAction={onCandidateAction} showColumnTools={true} />
-
-      {/* 실제 Excel 미리보기 (색상/스타일 포함) */}
-      {hasValidExcelPreview && (
-        <div className="rounded-[28px] border border-slate-200 bg-white shadow-card overflow-hidden">
-          <div className="flex items-center justify-between px-5 pt-4 pb-2">
-            <div>
-              <h4 className="text-lg font-black text-slate-950">엑셀 미리보기</h4>
-              <p className="text-xs text-slate-400">실제 생성된 엑셀 파일입니다. 아래 표에서 데이터를 수정한 뒤 "엑셀 만들기"를 누르면 반영됩니다.</p>
-            </div>
-          </div>
-          <ExcelTemplateOriginalGrid preview={generatedExcelPreview} />
-        </div>
-      )}
-
-      {/* 편집 가능한 데이터 표 - 항상 표시 (색상 미리보기와 함께) */}
-      {hasRows && (
-        <div className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-card">
-          <div className="mb-3 flex items-center justify-between">
-            <div>
-              <h4 className="text-lg font-black text-slate-950">데이터 편집</h4>
-              <p className="text-xs text-slate-400">셀을 직접 수정하고 "엑셀 만들기"를 누르면 위 미리보기가 업데이트됩니다.</p>
-            </div>
-            <Badge tone="blue">{(table.rows || []).length}행</Badge>
-          </div>
-          <EditableGrid table={table} issues={issues} updateCell={updateCell} addRow={addRow} removeRow={removeRow} addColumn={addColumn} removeColumn={removeColumn} updateColumnLabel={updateColumnLabel} saveTable={saveTable} disabled={disabled} compact={false} showToolbar={false} />
-        </div>
-      )}
-
-      {/* 색상 미리보기도 없고 데이터도 없을 때만 기존 방식 */}
-      {!hasValidExcelPreview && !hasRows && (isRegisteredTemplate ? (
-        <CompanyTemplatePreview table={table} issues={issues} selectedTemplate={selectedTemplate} writerName={writerName} templateLayoutMode={templateLayoutMode} templatePreview={templatePreview} templatePreviewLoading={templatePreviewLoading} templatePreviewError={templatePreviewError} updateCell={updateCell} removeRow={removeRow} disabled={disabled} />
-      ) : activeDesign ? (
-        <DesignCandidatePreview table={table} issues={issues} design={activeDesign} writerName={writerName} updateCell={updateCell} removeRow={removeRow} disabled={disabled} updateColumnLabel={updateColumnLabel} removeColumn={removeColumn} />
-      ) : null)}
-    </div>
-  );
-}
-
-
-function TableEditor({ table, updateCell, addRow, removeRow, addColumn, removeColumn, updateColumnLabel, saveTable, disabled, candidateFields = [], onCandidateAction }) {
-  return (
-    <div className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-card">
-      <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-        <div>
-          <h4 className="text-xl font-black text-slate-950">엑셀 미리보기 수정</h4>
-          <p className="mt-1 text-sm text-slate-500">셀·행·컬럼을 수정한 뒤 저장 또는 재검증을 실행하세요. 신규 컬럼은 후보 필드로 저장됩니다.</p>
-        </div>
-        <Badge tone="green">수정 후 재검증 권장</Badge>
-      </div>
-      {(table?.columns || []).length > 0 && (
-        <div className="mt-3 rounded-2xl border border-slate-200 bg-white/80 px-3 py-3">
-          <p className="mb-2 text-xs font-black text-slate-800">컬럼 관리 · 이름 수정 / 컬럼 삭제</p>
-          <div className="flex flex-wrap gap-2">
-            {(table.columns || []).map((col) => (
-              <div key={col.key} className="flex items-center gap-1 rounded-xl border border-slate-200 bg-white px-2 py-1">
-                <input
-                  value={cleanTableColumnLabel(col.label || col.key)}
-                  onChange={(event) => updateColumnLabel?.(col.key, event.target.value)}
-                  disabled={disabled}
-                  className="w-[120px] rounded-lg px-2 py-1 text-[11px] font-black outline-none focus:bg-brand-50 focus:ring-2 focus:ring-brand-400"
-                />
-                <button type="button" onClick={() => removeColumn?.(col.key)} disabled={disabled} className="rounded-lg bg-rose-50 px-2 py-1 text-[11px] font-black text-rose-600 hover:bg-rose-100 disabled:opacity-40">컬럼삭제</button>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-      {candidateFields.length > 0 && (
-        <div className="mt-4 space-y-2 rounded-2xl border border-amber-100 bg-amber-50 px-4 py-3 text-xs font-bold leading-5 text-amber-800">
-          <p className="font-black">신규 컬럼 후보</p>
-          {candidateFields.map((item) => (
-            <div key={item.id || item.suggestedFieldKey} className="flex flex-wrap items-center justify-between gap-2 rounded-xl bg-white/70 px-3 py-2">
-              <span>{item.originalLabel} → {item.suggestedFieldKey} / {item.suggestedDataType}</span>
-              <span className="flex flex-wrap gap-1">
-                <button type="button" onClick={() => onCandidateAction?.(item.id, 'ADD_STANDARD')} className="rounded-lg bg-emerald-50 px-2 py-1 text-[11px] font-black text-emerald-700">표준필드 추가</button>
-                <button type="button" onClick={() => onCandidateAction?.(item.id, 'USE_CUSTOM')} className="rounded-lg bg-brand-50 px-2 py-1 text-[11px] font-black text-brand-700">이번 문서만</button>
-                <button type="button" onClick={() => onCandidateAction?.(item.id, 'EXCLUDE')} className="rounded-lg bg-slate-100 px-2 py-1 text-[11px] font-black text-slate-500">제외</button>
-              </span>
-            </div>
-          ))}
-        </div>
-      )}
-      <EditableGrid table={table} issues={[]} updateCell={updateCell} addRow={addRow} removeRow={removeRow} addColumn={addColumn} removeColumn={removeColumn} updateColumnLabel={updateColumnLabel} saveTable={saveTable} disabled={disabled} />
-    </div>
-  );
-}
-
-function SourceView({ files, sourceText }) {
-  const normalizedFiles = files || [];
-  return (
-    <div className="grid grid-cols-1 gap-4 xl:grid-cols-[320px_minmax(0,1fr)]">
-      <div className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-card">
-        <h4 className="text-lg font-black text-slate-950">첨부 파일</h4>
-        <div className="mt-4 space-y-2">
-          {normalizedFiles.map((file, index) => (
-            <div key={file.id || index} className="rounded-2xl bg-slate-50 px-4 py-3 text-sm font-bold text-slate-700">
-              <p className="truncate font-black">{file.originalName || file.name}</p>
-              <p className="mt-1 text-xs text-slate-400">{file.pageCount ? `${Number(file.pageCount).toLocaleString()}페이지` : '페이지 수 미확인'} · 텍스트/OCR 보조</p>
-              {file.parseMetrics?.text?.engine && <p className="mt-1 text-xs text-slate-400">엔진: {file.parseMetrics.text.engine}</p>}
-            </div>
-          ))}
-          {!normalizedFiles.length && <p className="text-sm font-bold text-slate-400">첨부 파일 없음</p>}
-        </div>
-
-        <div className="mt-5 rounded-3xl border border-brand-100 bg-brand-50 p-4">
-          <p className="text-xs font-black text-brand-700">파싱 상태</p>
-          <p className="mt-2 text-sm font-bold leading-6 text-slate-700">
-            전체 텍스트는 아래 영역에 표시됩니다. LLM 입력은 설정된 글자 수만큼만 잘라서 사용하지만, 원본 파싱 텍스트 저장은 전체 기준입니다.
-          </p>
-        </div>
-      </div>
-      <div className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-card">
-        <h4 className="text-lg font-black text-slate-950">파싱 텍스트</h4>
-        <pre className="scroll-thin mt-4 max-h-[620px] overflow-auto whitespace-pre-wrap rounded-3xl border border-slate-200 bg-slate-50 p-4 text-xs leading-6 text-slate-700">{sourceText || '분석 후 원본 텍스트가 표시됩니다.'}</pre>
-      </div>
-    </div>
-  );
-}
-
-function Select({ label, value, onChange, options, disabled, highlight }) {
-  return <label className="block"><span className="mb-1 block text-xs font-black text-slate-400">{label}</span><select disabled={disabled} value={value} onChange={(e) => onChange(e.target.value)} className={`w-full rounded-2xl px-4 py-3 text-sm font-black outline-none ${highlight ? 'border-2 border-brand-500 bg-brand-50 text-brand-700' : 'border border-slate-200 bg-white text-slate-800 focus:border-brand-500'} disabled:bg-slate-100 disabled:text-slate-400`}>{options.map((opt) => <option key={opt.value} value={opt.value}>{opt.label}</option>)}</select></label>;
-}
-function Input({ label, value, onChange }) { return <label className="block"><span className="mb-1 block text-xs font-black text-slate-400">{label}</span><input value={value} onChange={(e) => onChange(e.target.value)} className="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm font-bold text-slate-800 outline-none focus:border-brand-500" /></label>; }
-function ActionButton({ label, tone, onClick, disabled }) { return <button onClick={onClick} disabled={disabled} className={`mt-5 rounded-2xl px-4 py-3 text-sm font-black disabled:bg-slate-200 disabled:text-slate-400 ${tone === 'blue' ? 'bg-gradient-to-r from-brand-500 to-brand-400 text-white shadow-glow hover:from-brand-600 hover:to-brand-500' : 'border border-amber-100 bg-amber-50 text-amber-700 hover:bg-amber-100'}`}>{label}</button>; }
-function TabButton({ active, onClick, children }) { return <button onClick={onClick} className={`rounded-2xl px-4 py-2.5 text-sm font-black ${active ? 'bg-gradient-to-r from-brand-500 to-brand-400 text-white shadow-glow' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}>{children}</button>; }
-function Badge({ tone, children }) { const cls = tone === 'blue' ? 'bg-brand-50 text-brand-700 border-brand-100' : tone === 'green' ? 'bg-emerald-50 text-emerald-700 border-emerald-100' : tone === 'amber' ? 'bg-amber-50 text-amber-700 border-amber-100' : 'bg-slate-100 text-slate-500 border-slate-200'; return <span className={`inline-flex rounded-full border px-3 py-1.5 text-xs font-black ${cls}`}>{children}</span>; }
-function Metric({ label, value, tone }) { const color = tone === 'blue' ? 'text-brand-700' : tone === 'amber' ? 'text-amber-700' : 'text-slate-950'; return <div className="rounded-3xl border border-slate-200 bg-white p-4 text-center"><p className="text-xs font-black text-slate-400">{label}</p><p className={`mt-2 text-2xl font-black ${color}`}>{value}</p></div>; }
-function InfoCard({ icon, title, value, desc, warning }) { return <div className={`rounded-3xl border p-4 ${warning ? 'border-amber-100 bg-amber-50' : 'border-slate-200 bg-slate-50'}`}><div className="flex h-10 w-10 items-center justify-center rounded-2xl bg-white text-lg">{icon}</div><p className={`mt-3 text-xs font-black ${warning ? 'text-amber-600' : 'text-slate-400'}`}>{title}</p><p className={`mt-1 text-base font-black ${warning ? 'text-amber-800' : 'text-slate-950'}`}>{value}</p><p className={`mt-1 text-sm leading-5 ${warning ? 'text-amber-700' : 'text-slate-500'}`}>{desc}</p></div>; }

@@ -8,7 +8,7 @@ const { parseJson } = require('../utils/mapper');
 const { analyzeDocuments, validateTable, defaultColumns, columnsForTableType, pruneEmptyColumns, chatWithDocuments } = require('../services/analysisService');
 const { createExcelFile, createMappedTemplateExcel } = require('../services/excelService');
 const { saveRecommendationHistory, createAiGeneratedTemplateForJob } = require('../services/templateRecommendationService');
-const { Counter, CandidateField, StandardField, TableEditLog } = require('../models');
+const { Counter, CandidateField, StandardField, TableEditLog, DocumentJob, GeneratedExcel, ReviewIssue, DocumentChatSession } = require('../models');
 const { verifyToken } = require('../utils/jwt');
 
 
@@ -206,6 +206,7 @@ async function loadJob(jobId, user) {
         reportDraft: rawAnalysis.reportDraft || rawAnalysis.drafts?.report || null,
         meetingDraft: rawAnalysis.meetingDraft || rawAnalysis.drafts?.meeting || null,
         officialLetterDraft: rawAnalysis.officialLetterDraft || rawAnalysis.drafts?.officialLetter || null,
+        narrativeReport: rawAnalysis.narrativeReport || null,
         llmModel: analysis.llm_model,
         promptVersion: analysis.prompt_version,
         raw: rawAnalysis
@@ -1918,7 +1919,7 @@ async function generateExcelForJob({ job, tableId, fileName, outputMode = null, 
       templateLayoutMode: templateLayoutMode || 'COMPACT_VENDOR_GROUPS'
     });
   } else {
-    excel = await createExcelFile({ jobId: job.id, fileName, columns: table.columns, rows: table.rows, job: { ...job, tables: [table] }, authorName, mappingJson: design || {}, designId });
+    excel = await createExcelFile({ jobId: job.id, fileName, columns: table.columns, rows: table.rows, job: { ...job, tables: [table] }, authorName, mappingJson: design || {}, designId, analysis: job.analysis || {} });
   }
 
   const [result] = await pool.query(
@@ -2070,7 +2071,7 @@ const generateExcelPreviewOnly = asyncHandler(async (req, res) => {
     }
   }
   if (!excelFile) {
-    excelFile = await createExcelFile({ jobId: job.id, fileName: 'preview_temp.xlsx', columns: table.columns, rows: table.rows, job: { ...job, tables: [table] }, authorName, mappingJson: design || {} });
+    excelFile = await createExcelFile({ jobId: job.id, fileName: 'preview_temp.xlsx', columns: table.columns, rows: table.rows, job: { ...job, tables: [table] }, authorName, mappingJson: design || {}, analysis: job.analysis || {} });
   }
 
   const { getExcelPreview } = require('../services/aiServerService');
@@ -2201,6 +2202,18 @@ AI 검토: ${cleanLlmAnswer}`;
   res.json({ chat: safeResult, job: job ? await loadJob(job.id, req.user) : null, session: await loadChatSession(sessionId, req.user) });
 });
 
+const getDashboardStats = asyncHandler(async (req, res) => {
+  const userId = req.user?.id;
+  const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
+  const [todayJobs, totalExcels, pendingIssues, recentJobs] = await Promise.all([
+    DocumentJob.countDocuments({ user_id: userId, created_at: { $gte: todayStart } }),
+    GeneratedExcel.countDocuments({ }),
+    ReviewIssue.countDocuments({ resolved_yn: 'N' }),
+    DocumentJob.find({ user_id: userId }).sort({ created_at: -1 }).limit(5).lean(),
+  ]);
+  res.json({ todayJobs, totalExcels, pendingIssues, recentJobs });
+});
+
 module.exports = {
   createJob,
   listJobs,
@@ -2219,5 +2232,6 @@ module.exports = {
   getChatSession,
   deleteChatSession,
   aiChat,
-  resumeQueuedDocumentJobs
+  resumeQueuedDocumentJobs,
+  getDashboardStats,
 };
