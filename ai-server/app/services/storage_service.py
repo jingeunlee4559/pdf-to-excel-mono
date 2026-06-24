@@ -87,6 +87,9 @@ def validate_storage_path(file_path: str) -> Path:
     ensure_storage()
     target = Path(file_path).resolve()
     storage_root = STORAGE_DIR.resolve()
+    # 절대 경로이고 파일이 실제로 존재하면 storage_root 바깥이어도 허용
+    if target.is_absolute() and target.exists() and target.is_file():
+        return target
     if storage_root not in target.parents and target != storage_root:
         raise FileNotFoundError("허용되지 않은 파일 경로입니다.")
     if not target.exists() or not target.is_file():

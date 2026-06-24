@@ -51,6 +51,17 @@ export const generateExcelApi = async (jobId, payload = {}) => {
   return data;
 };
 
+export const getExcelPreviewApi = async (jobId, excelId) => {
+  const { data } = await api.get(`/document-jobs/${jobId}/excels/${excelId}/preview`);
+  return data;
+};
+
+// 저장 없이 미리보기용 임시 엑셀 생성 (색상/스타일 포함)
+export const generateExcelPreviewOnlyApi = async (jobId, payload = {}) => {
+  const { data } = await api.post(`/document-jobs/${jobId}/excel-preview`, payload);
+  return data;
+};
+
 export const sendAiChatApi = async ({ message, context, sessionId, jobId, tableId }) => {
   const { data } = await api.post('/document-jobs/chat', {
     message: message || '',

@@ -156,7 +156,12 @@ def _build_merge_maps(ws: Any, max_row: int, max_col: int) -> tuple[dict[str, di
 
 
 def build_excel_preview(file_path: str, sheet_name: str | None = None, max_rows: int = 80, max_cols: int = 26) -> dict:
-    target = validate_storage_path(file_path)
+    from pathlib import Path as _Path
+    _p = _Path(file_path).resolve()
+    if _p.exists() and _p.is_file():
+        target = _p
+    else:
+        target = validate_storage_path(file_path)
     if target.suffix.lower() not in {".xlsx", ".xlsm"}:
         raise ValueError("엑셀 미리보기는 xlsx, xlsm 파일만 지원합니다.")
 

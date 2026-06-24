@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { createAiTemplateApi, createChatSessionApi, createDocumentJobApi, deleteChatSessionApi, excelDownloadUrl, generateExcelApi, getChatSessionApi, getDocumentJobApi, listChatSessionsApi, listDownloadsApi, revalidateJobApi, sendAiChatApi, updateCandidateFieldApi, updateTableApi } from '../../api/documentApi.js';
+import { createAiTemplateApi, createChatSessionApi, createDocumentJobApi, deleteChatSessionApi, excelDownloadUrl, generateExcelApi, getExcelPreviewApi, generateExcelPreviewOnlyApi, getChatSessionApi, getDocumentJobApi, listChatSessionsApi, listDownloadsApi, revalidateJobApi, sendAiChatApi, updateCandidateFieldApi, updateTableApi } from '../../api/documentApi.js';
 import { getTemplatePreviewApi, listTemplatesApi } from '../../api/templateApi.js';
 import { useAuth } from '../../context/AuthContext.jsx';
 
@@ -371,6 +371,7 @@ export default function DocumentWorkspacePage() {
   const [aiTemplateDesignCandidates, setAiTemplateDesignCandidates] = useState([]);
   const [candidateFields, setCandidateFields] = useState([]);
   const [selectedDesignId, setSelectedDesignId] = useState('');
+  const [chatFormatDesign, setChatFormatDesign] = useState(null); // 채팅에서 선택한 임시 양식
   const [aiTemplateCreating, setAiTemplateCreating] = useState(false);
   const [tab, setTab] = useState('analysis');
   const [outputMode, setOutputMode] = useState('FREE_FORM');
@@ -391,6 +392,7 @@ export default function DocumentWorkspacePage() {
   const [issues, setIssues] = useState([]);
   const [sourceText, setSourceText] = useState('');
   const [generatedExcel, setGeneratedExcel] = useState(null);
+  const [generatedExcelPreview, setGeneratedExcelPreview] = useState(null);
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState('');
   const [chatMessages, setChatMessages] = useState([welcomeMessage()]);
@@ -434,10 +436,12 @@ export default function DocumentWorkspacePage() {
   const registeredTemplates = useMemo(() => (templates || []).filter(isUserRegisteredCompanyTemplate), [templates]);
   const aiDesignOptions = useMemo(() => mergeAiDesignOptions(aiTemplateDesignCandidates, templates, { analysis, table, userRequest }), [aiTemplateDesignCandidates, templates, analysis, table, userRequest]);
   const selectedTemplate = useMemo(() => registeredTemplates.find((item) => String(item.id) === String(templateId)), [registeredTemplates, templateId]);
-  const selectedDesign = useMemo(() => {
+  const selectedDesignBase = useMemo(() => {
     if (!selectedDesignId) return null;
     return aiDesignOptions.find((item) => String(item.designId || '') === String(selectedDesignId || '')) || null;
   }, [aiDesignOptions, selectedDesignId]);
+  // 채팅에서 선택한 임시 양식이 있으면 우선 적용
+  const selectedDesign = chatFormatDesign || selectedDesignBase;
 
   useEffect(() => {
     let cancelled = false;
@@ -469,7 +473,9 @@ export default function DocumentWorkspacePage() {
   useEffect(() => {
     if (outputMode !== 'FREE_FORM') return;
     if (templateId) setTemplateId('');
-    if (aiDesignOptions.length && !aiDesignOptions.some((item) => String(item.designId || '') === String(selectedDesignId || ''))) {
+    // selectedDesignId가 비어있으면 자동 선택하지 않음 (새 채팅, 사용자가 직접 초기화한 경우)
+    // selectedDesignId가 있지만 현재 옵션 목록에 없을 때만 첫 번째 옵션으로 보정
+    if (selectedDesignId && aiDesignOptions.length && !aiDesignOptions.some((item) => String(item.designId || '') === String(selectedDesignId || ''))) {
       setSelectedDesignId(aiDesignOptions[0].designId);
     }
   }, [outputMode, aiDesignOptions, selectedDesignId, templateId]);
@@ -483,6 +489,7 @@ export default function DocumentWorkspacePage() {
 
   const changeOutputMode = (value) => {
     setOutputMode(value);
+    setChatFormatDesign(null); // 사용자가 직접 모드 변경 시 채팅 임시 양식 초기화
     if (value === 'COMPANY_TEMPLATE') {
       setSelectedDesignId('');
       const nextTemplateId = templateId && registeredTemplates.some((item) => String(item.id) === String(templateId))
@@ -554,6 +561,9 @@ export default function DocumentWorkspacePage() {
       setChatMessages(normalizeServerMessages(session.messages || []));
       setJob(null);
       setAiTemplateRecommendations([]);
+      setAiTemplateDesignCandidates([]);
+      setSelectedDesignId('');
+      setChatFormatDesign(null);
       setTables([]);
       setSelectedTableIndex(0);
       setAnalysis(emptyAnalysis);
@@ -562,6 +572,7 @@ export default function DocumentWorkspacePage() {
       setAnalyzedFiles([]);
       setSourceText('');
       setGeneratedExcel(null);
+      setGeneratedExcelPreview(null);
       setPendingFiles([]);
       await refreshChatSessions();
     } catch (err) {
@@ -630,8 +641,31 @@ export default function DocumentWorkspacePage() {
           bindJobResult(nextJob);
           updateProcessingState(nextJob.id, nextJob.status, nextJob.title);
           if (completeStatuses.has(String(nextJob.status || '').toUpperCase())) {
-            setMessage(nextJob.status === 'FAILED' ? (nextJob.errorMessage || '문서 분석이 실패했습니다.') : '백그라운드 문서 분석이 완료되었습니다. 결과와 채팅이 자동 반영되었습니다.');
-            if (nextJob.tables?.length) setTab((current) => (current === 'analysis' ? 'excel' : current));
+            setMessage(nextJob.status === 'FAILED' ? (nextJob.errorMessage || '문서 분석이 실패했습니다.') : '백그라운드 문서 분석이 완료되었습니다.');
+            if (nextJob.tables?.length && nextJob.status !== 'FAILED') {
+              setTab((current) => (current === 'analysis' ? 'excel' : current));
+              const rowCount = nextJob.tables?.[0]?.rows?.length || 0;
+              // 분석 완료 시 자동으로 Excel 생성 → 색상 미리보기 즉시 표시
+              try {
+                const autoResult = await generateExcelApi(nextJob.id, {
+                  outputMode: 'FREE_FORM',
+                  tableId: nextJob.tables?.[0]?.id || null,
+                });
+                if (autoResult?.excel) setGeneratedExcel(autoResult.excel);
+                const preview = autoResult?.excel?.preview || autoResult?.preview;
+                if (preview && Array.isArray(preview.rows) && preview.rows.length > 0
+                    && Array.isArray(preview.columns) && preview.columns.length > 0) {
+                  setGeneratedExcelPreview(preview);
+                }
+                await refreshDownloads();
+              } catch (_) { /* 자동 생성 실패 시 조용히 무시 */ }
+              appendChat({
+                role: 'assistant',
+                content: `분석 완료: ${rowCount}행 추출됐습니다. 아래에서 데이터를 수정하거나, 다른 양식을 원하면 "보고서 형식으로" 등 입력 후 "엑셀 만들기"를 누르세요.`,
+                showPreview: true,
+                quickReplies: ['보고서 형식으로 만들어줘', '비교표로 만들어줘', '이 문서 뭐야?'],
+              });
+            }
           }
         }
         if (sessionId) {
@@ -852,6 +886,22 @@ export default function DocumentWorkspacePage() {
       };
     }
 
+    if (/(보고서|회의록|공문|업무보고|검토보고|일보|점검표|비교표|비교견적서|업체별\s*비교|단가비교표)/i.test(text)) {
+      const formatMap = {
+        '회의록': 'MEETING_MINUTES', '공문': 'OFFICIAL_LETTER',
+        '비교표': 'ESTIMATE_COMPARISON', '비교견적서': 'ESTIMATE_COMPARISON', '단가비교표': 'ESTIMATE_COMPARISON',
+      };
+      const targetFormat = Object.entries(formatMap).find(([k]) => text.includes(k))?.[1] || 'REPORT';
+      const labelMap = { REPORT: '보고서', MEETING_MINUTES: '회의록', OFFICIAL_LETTER: '공문' };
+      return {
+        answer: `${labelMap[targetFormat] || '보고서'} 형식으로 엑셀을 생성합니다.`,
+        action: 'GENERATE_EXCEL',
+        targetFormat,
+        recommendedTab: 'excel',
+        quickReplies: ['다운로드', '비교표로 만들어줘', '다른 형식은?']
+      };
+    }
+
     if (/(문서|뭐야|무슨|내용|요약|파일별|각각|유형)/i.test(text)) {
       const fileProfileText = (analysis.fileProfiles || []).length
         ? '\n' + (analysis.fileProfiles || []).map((file) => `- ${file.fileName}: ${file.documentType} / ${file.roleLabel || file.role} / ${file.summary}`).join('\n')
@@ -978,6 +1028,63 @@ export default function DocumentWorkspacePage() {
         meta: chat.llmFallback ? 'fallback' : chat.model
       });
       if (chat.recommendedTab) setTab(chat.recommendedTab);
+
+      // 채팅에서 GENERATE_EXCEL 액션: Gemini가 요청에 맞는 양식 직접 설계 → 미리보기 반영 → 엑셀 생성
+      if (chat.action === 'GENERATE_EXCEL' && job?.id) {
+        const FORMAT_LABEL_MAP = {
+          REPORT: '보고서', MEETING_MINUTES: '회의록', OFFICIAL_LETTER: '공문', ESTIMATE_COMPARISON: '비교견적서',
+        };
+        const targetLabel = FORMAT_LABEL_MAP[chat.targetFormat] || '보고서';
+        // 사용자가 채팅에 입력한 원문을 Gemini에 전달해 맞춤 설계
+        const userRequestForDesign = `${text} (${targetLabel} 형식으로 작성)`;
+        setAiTemplateCreating(true);
+        try {
+          await saveTable();
+          // Step 1: Gemini가 문서+요청 기반으로 양식 설계
+          const designResult = await createAiTemplateApi(job.id, {
+            tableId: table?.id || null,
+            forceGeminiDesign: true,
+            userRequestOverride: userRequestForDesign,
+          });
+          const nextDesign = designResult.design;
+          // Step 2: 미리보기 업데이트 (AI 설계 결과로)
+          if (nextDesign?.designId) {
+            setAiTemplateDesignCandidates((prev) => {
+              const exists = (prev || []).some((item) => String(item.designId || '') === String(nextDesign.designId || ''));
+              return exists ? prev : [nextDesign, ...(prev || [])];
+            });
+            setSelectedDesignId(nextDesign.designId);
+            setChatFormatDesign(null); // 실제 design이 생겼으므로 임시 override 해제
+          }
+          setOutputMode('FREE_FORM');
+          if (designResult.job) bindJobResult(designResult.job);
+          // Step 3: 설계된 양식으로 엑셀 생성
+          const excelResult = await generateExcelApi(job.id, {
+            fileName,
+            outputMode: 'FREE_FORM',
+            tableId: table?.id || null,
+            chatSessionId: activeSessionId || null,
+            design: nextDesign || null,
+            designId: nextDesign?.designId || null,
+          });
+          setGeneratedExcel(excelResult.excel);
+          await refreshDownloads();
+          setTab('excel');
+          appendChat({
+            role: 'assistant',
+            content: `Gemini가 "${targetLabel}" 양식을 새로 설계하고 엑셀을 생성했습니다. 미리보기와 다운로드 버튼에서 확인하세요.`,
+            quickReplies: ['다운로드', '다른 형식으로 바꿔줘', '비교표로 만들어줘'],
+          });
+        } catch (excelErr) {
+          appendChat({
+            role: 'assistant',
+            content: `엑셀 생성 중 오류가 발생했습니다: ${excelErr.response?.data?.message || excelErr.message}`,
+            quickReplies: ['다시 시도', '이 문서 뭐야?'],
+          });
+        } finally {
+          setAiTemplateCreating(false);
+        }
+      }
     } catch (err) {
       const fallback = answerFromCurrentContext(text);
       appendChat({
@@ -986,6 +1093,37 @@ export default function DocumentWorkspacePage() {
         quickReplies: fallback?.quickReplies || ['이 문서 뭐야?', '확인 필요한 부분만 보여줘'],
       });
       if (fallback?.recommendedTab) setTab(fallback.recommendedTab);
+      // 로컬 fallback에서도 GENERATE_EXCEL: Gemini 맞춤 설계
+      if (fallback?.action === 'GENERATE_EXCEL' && job?.id) {
+        const FORMAT_LABEL_MAP = { REPORT: '보고서', MEETING_MINUTES: '회의록', OFFICIAL_LETTER: '공문' };
+        const targetLabel = FORMAT_LABEL_MAP[fallback.targetFormat] || '보고서';
+        const userRequestForDesign = `${text} (${targetLabel} 형식)`;
+        setAiTemplateCreating(true);
+        try {
+          await saveTable();
+          const designResult = await createAiTemplateApi(job.id, { tableId: table?.id || null, forceGeminiDesign: true, userRequestOverride: userRequestForDesign });
+          const nextDesign = designResult.design;
+          if (nextDesign?.designId) {
+            setAiTemplateDesignCandidates((prev) => {
+              const exists = (prev || []).some((item) => String(item.designId || '') === String(nextDesign.designId || ''));
+              return exists ? prev : [nextDesign, ...(prev || [])];
+            });
+            setSelectedDesignId(nextDesign.designId);
+            setChatFormatDesign(null);
+          }
+          setOutputMode('FREE_FORM');
+          if (designResult.job) bindJobResult(designResult.job);
+          const excelResult = await generateExcelApi(job.id, { fileName, outputMode: 'FREE_FORM', tableId: table?.id || null, chatSessionId: activeSessionId || null, design: nextDesign || null, designId: nextDesign?.designId || null });
+          setGeneratedExcel(excelResult.excel);
+          await refreshDownloads();
+          setTab('excel');
+          appendChat({ role: 'assistant', content: `Gemini가 "${targetLabel}" 양식을 새로 설계하고 엑셀을 생성했습니다.`, quickReplies: ['다운로드', '다른 형식으로 바꿔줘'] });
+        } catch (excelErr) {
+          appendChat({ role: 'assistant', content: `엑셀 생성 중 오류: ${excelErr.response?.data?.message || excelErr.message}`, quickReplies: ['다시 시도'] });
+        } finally {
+          setAiTemplateCreating(false);
+        }
+      }
     } finally {
       setLoading(false);
     }
@@ -1175,7 +1313,14 @@ export default function DocumentWorkspacePage() {
       });
       setGeneratedExcel(result.excel);
       await refreshDownloads();
-      setMessage('엑셀 파일이 생성되었습니다. 다운로드 버튼을 누르세요. 다운로드 목록에도 표시됩니다.');
+      setMessage('엑셀 파일이 생성되었습니다. 다운로드 버튼을 누르세요.');
+      // 엑셀 생성 응답에 미리보기 데이터가 포함되면 바로 표시
+      const preview = result.excel?.preview || result.preview;
+      if (preview && Array.isArray(preview.rows) && preview.rows.length > 0
+          && Array.isArray(preview.columns) && preview.columns.length > 0) {
+        setGeneratedExcelPreview(preview);
+        setTab('excel');
+      }
     } catch (err) {
       setMessage(err.response?.data?.message || '엑셀 생성 중 오류가 발생했습니다.');
     } finally {
@@ -1258,7 +1403,7 @@ export default function DocumentWorkspacePage() {
             designCandidates={aiDesignOptions}
             candidateFields={candidateFields}
             selectedDesignId={selectedDesignId}
-            onSelectDesign={(id) => { setSelectedDesignId(id); setTemplateId(''); setOutputMode('FREE_FORM'); setTab('excel'); }}
+            onSelectDesign={(id) => { setSelectedDesignId(id); setChatFormatDesign(null); setTemplateId(''); setOutputMode('FREE_FORM'); setTab('excel'); }}
             onChangeOutputMode={changeOutputMode}
             onCreateAiTemplate={createAiTemplateFromDbFields}
             creating={aiTemplateCreating}
@@ -1315,7 +1460,7 @@ export default function DocumentWorkspacePage() {
           <div className="scroll-thin min-h-0 flex-1 overflow-y-auto p-5">
             <TableSelector tables={tables} selectedIndex={selectedTableIndex} onSelect={selectTableByIndex} />
             {tab === 'analysis' && <AnalysisView analysis={analysis} issues={issues} table={table} onMoveTable={() => setTab('excel')} onMoveExcel={() => setTab('excel')} />}
-            {tab === 'excel' && <ExcelPreview table={table} issues={issues} outputMode={outputMode} selectedTemplate={selectedTemplate} selectedDesign={selectedDesign} writerName={writerName} templateLayoutMode={templateLayoutMode} templatePreview={templatePreview} templatePreviewLoading={templatePreviewLoading} templatePreviewError={templatePreviewError} updateCell={updateCell} addRow={addRow} removeRow={removeRow} addColumn={addColumn} removeColumn={removeColumn} updateColumnLabel={updateColumnLabel} saveTable={saveTable} disabled={loading} candidateFields={candidateFields} onCandidateAction={handleCandidateFieldAction} />}
+            {tab === 'excel' && <ExcelPreview table={table} issues={issues} outputMode={outputMode} selectedTemplate={selectedTemplate} selectedDesign={selectedDesign} writerName={writerName} templateLayoutMode={templateLayoutMode} templatePreview={templatePreview} templatePreviewLoading={templatePreviewLoading} templatePreviewError={templatePreviewError} updateCell={updateCell} addRow={addRow} removeRow={removeRow} addColumn={addColumn} removeColumn={removeColumn} updateColumnLabel={updateColumnLabel} saveTable={saveTable} disabled={loading} candidateFields={candidateFields} onCandidateAction={handleCandidateFieldAction} generatedExcelPreview={generatedExcelPreview} analysis={analysis} />}
             {tab === 'source' && <SourceView files={analyzedFiles} sourceText={sourceText} />}
           </div>
         </section>
@@ -1708,7 +1853,7 @@ function ChatAssistantPanel({
         </div>
 
         {(chatMessages || []).map((msg) => (
-          <ChatBubble key={msg.id} message={msg} onQuickSend={onSend} disabled={loading} />
+          <ChatBubble key={msg.id} message={msg} onQuickSend={onSend} disabled={loading} onPreview={() => setTab('excel')} />
         ))}
 
         {hasFiles && (
@@ -1911,7 +2056,7 @@ function PendingFilesBubble({ files, onRemove, onClear, onOpenList, disabled }) 
   );
 }
 
-function ChatBubble({ message, onQuickSend, disabled }) {
+function ChatBubble({ message, onQuickSend, disabled, onPreview }) {
   const isUser = message.role === 'user';
   if (isUser) {
     return (
@@ -1930,14 +2075,30 @@ function ChatBubble({ message, onQuickSend, disabled }) {
     );
   }
 
+  const showPreviewButton = message.action === 'SHOW_PREVIEW' || message.showPreview;
+
   return (
     <div className="flex items-start gap-3">
       <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-2xl bg-brand-50 text-xs font-black text-brand-700">AI</div>
       <div className="max-w-[88%] rounded-[24px] rounded-tl-md border border-slate-200 bg-white px-4 py-3 shadow-card">
         <p className="whitespace-pre-wrap text-sm font-bold leading-6 text-slate-700">{message.content}</p>
+        {/* 엑셀 생성 완료 버튼 */}
         {message.generatedExcel && (
+          <div className="mt-3 flex flex-wrap gap-2">
+            <button type="button" onClick={onPreview} className="inline-flex items-center gap-1 rounded-2xl bg-brand-50 px-3 py-2 text-xs font-black text-brand-700 hover:bg-brand-100">
+              📊 엑셀 미리보기
+            </button>
+            <a href={excelDownloadUrl(message.generatedExcel.jobId, message.generatedExcel.id)} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 rounded-2xl bg-gradient-to-r from-emerald-500 to-brand-500 px-3 py-2 text-xs font-black text-white">
+              ⬇ 다운로드
+            </a>
+          </div>
+        )}
+        {/* 분석 완료 후 미리보기 버튼 */}
+        {showPreviewButton && !message.generatedExcel && (
           <div className="mt-3">
-            <a href={excelDownloadUrl(message.generatedExcel.jobId, message.generatedExcel.id)} target="_blank" rel="noreferrer" className="inline-flex rounded-2xl bg-gradient-to-r from-emerald-500 to-brand-500 px-3 py-2 text-xs font-black text-white">엑셀 다운로드</a>
+            <button type="button" onClick={onPreview} className="inline-flex items-center gap-1 rounded-2xl bg-brand-50 px-3 py-2 text-xs font-black text-brand-700 hover:bg-brand-100">
+              📊 엑셀 미리보기 열기
+            </button>
           </div>
         )}
         {Array.isArray(message.quickReplies) && message.quickReplies.length > 0 && (
@@ -3215,7 +3376,7 @@ function DesignCandidatePreview({ table, issues, design, writerName, updateCell,
   if (layout.includes('OFFICIAL')) {
     return <DesignOfficialLetterPreview table={table} issues={issues} design={design} writerName={writerName} updateCell={updateCell} removeRow={removeRow} disabled={disabled} />;
   }
-  if (layout.includes('REPORT') || layoutType.includes('REPORT') || layout.includes('SECTION') || layout.includes('SUMMARY') || layout.includes('APPROVAL') || layout.includes('HEADER_TABLE')) {
+  if (layout.includes('REPORT') || layout.includes('CUSTOM_DOCUMENT_FORM') || layout.includes('DOCUMENT_FORM') || layoutType.includes('REPORT') || layout.includes('SECTION') || layout.includes('SUMMARY') || layout.includes('APPROVAL') || layout.includes('HEADER_TABLE')) {
     return <DesignReportPreview table={table} issues={issues} design={design} writerName={writerName} updateCell={updateCell} removeRow={removeRow} disabled={disabled} updateColumnLabel={updateColumnLabel} removeColumn={removeColumn} />;
   }
   return (
@@ -3763,17 +3924,104 @@ function DirectTableEditPanel({ table, issues = [], updateCell, addRow, removeRo
   );
 }
 
-function ExcelPreview({ table, issues = [], outputMode, selectedTemplate, selectedDesign, writerName, templateLayoutMode, templatePreview = null, templatePreviewLoading = false, templatePreviewError = '', updateCell, addRow, removeRow, addColumn, removeColumn, updateColumnLabel, saveTable, disabled, candidateFields = [], onCandidateAction }) {
+function ExcelPreview({ table, issues = [], outputMode, selectedTemplate, selectedDesign, writerName, templateLayoutMode, templatePreview = null, templatePreviewLoading = false, templatePreviewError = '', updateCell, addRow, removeRow, addColumn, removeColumn, updateColumnLabel, saveTable, disabled, candidateFields = [], onCandidateAction, generatedExcelPreview = null, analysis = {} }) {
   const isRegisteredTemplate = outputMode === 'COMPANY_TEMPLATE' && selectedTemplate;
   const activeDesign = !isRegisteredTemplate ? selectedDesign : null;
+  const tableType = String(table?.tableType || table?.table_type || '');
+  const hasRows = (table?.rows || []).length > 0;
+  const docType = String(analysis?.documentType || analysis?.document_type || '').toLowerCase();
+
+  // 데이터가 있으면 문서 유형에 맞는 적절한 미리보기 자동 표시
+  const renderFallbackPreview = () => {
+    if (!hasRows) return null;
+
+    // 업체별 단가 비교
+    if (isMultiVendorCompareTableType(tableType) || isTextVendorComparisonReportType(tableType)) {
+      return (
+        <DesignVendorComparePreview
+          table={table} issues={issues}
+          design={{ layout: 'AI_GENERATED_DYNAMIC_VENDOR_TABLE', name: '업체별 단가 비교표' }}
+          writerName={writerName} updateCell={updateCell} removeRow={removeRow} disabled={disabled}
+        />
+      );
+    }
+
+    // 표준시장단가
+    if (isStandardMarketTableType(tableType)) {
+      return <DesignPriceTablePreview table={table} issues={issues} design={{ layout: 'PRICE_TABLE' }} updateCell={updateCell} removeRow={removeRow} disabled={disabled} />;
+    }
+
+    // 보고서 계열 (업무보고서, 검토보고서, 작업일보 등)
+    const isReportType = /(보고|보고서|리포트|report|일보|점검|감리|현황|검토)/i.test(docType) || tableType.includes('REPORT');
+    const isMeetingType = /(회의|meeting|안건|minutes)/i.test(docType) || tableType.includes('MEETING');
+    const isOfficialType = /(공문|official|letter|시행)/i.test(docType) || tableType.includes('OFFICIAL');
+
+    if (isMeetingType) {
+      return <DesignMeetingPreview table={table} issues={issues} design={{ layout: 'MEETING_MINUTES', name: '회의록' }} writerName={writerName} updateCell={updateCell} removeRow={removeRow} disabled={disabled} />;
+    }
+    if (isOfficialType) {
+      return <DesignOfficialLetterPreview table={table} issues={issues} design={{ layout: 'OFFICIAL_LETTER', name: '공문' }} writerName={writerName} updateCell={updateCell} removeRow={removeRow} disabled={disabled} />;
+    }
+    if (isReportType) {
+      return <DesignReportPreview table={table} issues={issues} design={{ layout: 'CUSTOM_DOCUMENT_FORM', name: '보고서' }} writerName={writerName} updateCell={updateCell} removeRow={removeRow} disabled={disabled} updateColumnLabel={updateColumnLabel} removeColumn={removeColumn} />;
+    }
+
+    // 일반 표 - 데이터가 있으면 EditableGrid로 표시
+    return (
+      <div className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-card">
+        <div className="mb-3 flex items-center justify-between">
+          <h4 className="text-xl font-black text-slate-950">추출 결과 미리보기</h4>
+          <div className="flex items-center gap-2">
+            <Badge tone="blue">{(table.rows || []).length}행</Badge>
+            <span className="text-xs text-slate-400">채팅에서 "보고서 형식으로" 등 입력하면 양식 변경</span>
+          </div>
+        </div>
+        <EditableGrid table={table} issues={issues} updateCell={updateCell} addRow={() => {}} removeRow={removeRow} addColumn={() => {}} removeColumn={removeColumn} updateColumnLabel={updateColumnLabel} saveTable={saveTable} disabled={disabled} compact={false} showToolbar={false} />
+      </div>
+    );
+  };
+
+  // 실제 Excel 파일 미리보기 데이터가 유효한지 확인 (행과 컬럼이 모두 있어야 함)
+  const hasValidExcelPreview = Array.isArray(generatedExcelPreview?.rows) && generatedExcelPreview.rows.length > 0
+    && Array.isArray(generatedExcelPreview?.columns) && generatedExcelPreview.columns.length > 0;
+
   return (
     <div className="space-y-4">
       <PreviewEditToolbar table={table} addRow={addRow} addColumn={addColumn} removeColumn={removeColumn} updateColumnLabel={updateColumnLabel} saveTable={saveTable} disabled={disabled} candidateFields={candidateFields} onCandidateAction={onCandidateAction} showColumnTools={true} />
-      {isRegisteredTemplate ? (
+
+      {/* 실제 Excel 미리보기 (색상/스타일 포함) */}
+      {hasValidExcelPreview && (
+        <div className="rounded-[28px] border border-slate-200 bg-white shadow-card overflow-hidden">
+          <div className="flex items-center justify-between px-5 pt-4 pb-2">
+            <div>
+              <h4 className="text-lg font-black text-slate-950">엑셀 미리보기</h4>
+              <p className="text-xs text-slate-400">실제 생성된 엑셀 파일입니다. 아래 표에서 데이터를 수정한 뒤 "엑셀 만들기"를 누르면 반영됩니다.</p>
+            </div>
+          </div>
+          <ExcelTemplateOriginalGrid preview={generatedExcelPreview} />
+        </div>
+      )}
+
+      {/* 편집 가능한 데이터 표 - 항상 표시 (색상 미리보기와 함께) */}
+      {hasRows && (
+        <div className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-card">
+          <div className="mb-3 flex items-center justify-between">
+            <div>
+              <h4 className="text-lg font-black text-slate-950">데이터 편집</h4>
+              <p className="text-xs text-slate-400">셀을 직접 수정하고 "엑셀 만들기"를 누르면 위 미리보기가 업데이트됩니다.</p>
+            </div>
+            <Badge tone="blue">{(table.rows || []).length}행</Badge>
+          </div>
+          <EditableGrid table={table} issues={issues} updateCell={updateCell} addRow={addRow} removeRow={removeRow} addColumn={addColumn} removeColumn={removeColumn} updateColumnLabel={updateColumnLabel} saveTable={saveTable} disabled={disabled} compact={false} showToolbar={false} />
+        </div>
+      )}
+
+      {/* 색상 미리보기도 없고 데이터도 없을 때만 기존 방식 */}
+      {!hasValidExcelPreview && !hasRows && (isRegisteredTemplate ? (
         <CompanyTemplatePreview table={table} issues={issues} selectedTemplate={selectedTemplate} writerName={writerName} templateLayoutMode={templateLayoutMode} templatePreview={templatePreview} templatePreviewLoading={templatePreviewLoading} templatePreviewError={templatePreviewError} updateCell={updateCell} removeRow={removeRow} disabled={disabled} />
       ) : activeDesign ? (
         <DesignCandidatePreview table={table} issues={issues} design={activeDesign} writerName={writerName} updateCell={updateCell} removeRow={removeRow} disabled={disabled} updateColumnLabel={updateColumnLabel} removeColumn={removeColumn} />
-      ) : null}
+      ) : null)}
     </div>
   );
 }

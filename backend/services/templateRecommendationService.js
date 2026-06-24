@@ -399,12 +399,13 @@ function sanitizeDesign(rawDesign = {}, { standardFields = [], job = {}, table =
   };
 }
 
-async function makeTemplateDesignWithLlm({ job = {}, table = {}, standardFields = [] }) {
+async function makeTemplateDesignWithLlm({ job = {}, table = {}, standardFields = [], userRequestOverride = null }) {
   const mode = String(process.env.AI_TEMPLATE_DESIGN_MODE || 'auto').toLowerCase();
   if (mode === 'rule' || mode === 'off' || mode === 'false') return fallbackTemplateDesign({ job, table, standardFields });
   try {
+    const effectiveRequest = userRequestOverride || job.userRequest || job.user_request || '';
     const result = await designTemplateWithAiServer({
-      userRequest: job.userRequest || job.user_request || '',
+      userRequest: effectiveRequest,
       analysis: job.analysis || {},
       columns: (table.columns || []).slice(0, 80),
       rows: (table.rows || []).slice(0, 20),
@@ -446,14 +447,16 @@ function makeAiTemplateCode(templateName = 'AI_TEMPLATE') {
   return `AI_${compact || 'TEMPLATE'}_${Date.now()}`.slice(0, 96);
 }
 
-async function createAiGeneratedTemplateForJob({ job = {}, tableId = null, user = {}, designOverride = null }) {
+async function createAiGeneratedTemplateForJob({ job = {}, tableId = null, user = {}, designOverride = null, userRequestOverride = null }) {
   if (!job?.id) throw new Error('분석 작업 정보가 없습니다.');
   const table = tableId ? (job.tables || []).find((item) => Number(item.id) === Number(tableId)) : (job.tables || [])[0];
   if (!table) throw new Error('양식 생성에 사용할 표 데이터가 없습니다.');
   const standardFields = await StandardField.find({ active_yn: 'Y' }).sort({ sort_order: 1, id: 1 }).lean();
   if (!standardFields.length) throw new Error('DB 표준필드가 없습니다. seed를 먼저 실행하세요.');
 
-  const llmDesign = designOverride && typeof designOverride === 'object' ? designOverride : await makeTemplateDesignWithLlm({ job, table, standardFields });
+  const llmDesign = designOverride && typeof designOverride === 'object'
+    ? designOverride
+    : await makeTemplateDesignWithLlm({ job, table, standardFields, userRequestOverride });
   const design = sanitizeDesign(llmDesign, { standardFields, job, table });
   const generatedFile = await createTemplateSkeletonFile(design);
   const templateCode = makeAiTemplateCode(design.templateName);

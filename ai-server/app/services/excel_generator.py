@@ -32,13 +32,17 @@ BASE_DIR = Path(__file__).resolve().parents[2]
 RESULT_DIR = BASE_DIR / "storage" / "results"
 TEMPLATE_DIR = BASE_DIR / "storage" / "templates" / "ai_generated"
 
-THIN = Side(style="thin", color="3B4A5A")
+THIN = Side(style="thin", color="B0BEC5")
+MEDIUM = Side(style="medium", color="607D8B")
 BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
-HEADER_FILL = PatternFill("solid", fgColor="DDE6F1")
-LIGHT_FILL = PatternFill("solid", fgColor="EEF7FF")
-TITLE_FILL = PatternFill("solid", fgColor="FFFFFF")
-GREEN_FILL = PatternFill("solid", fgColor="E9F8EF")
-AMBER_FILL = PatternFill("solid", fgColor="FFF4D6")
+OUTER_BORDER = Border(left=MEDIUM, right=MEDIUM, top=MEDIUM, bottom=MEDIUM)
+HEADER_FILL = PatternFill("solid", fgColor="2C3E50")   # 진한 남색
+HEADER_FILL2 = PatternFill("solid", fgColor="34495E")  # 업체 헤더 구분색
+LIGHT_FILL = PatternFill("solid", fgColor="EBF5FB")    # 연한 파랑
+TITLE_FILL = PatternFill("solid", fgColor="1A252F")    # 제목 배경 (진한 네이비)
+GREEN_FILL = PatternFill("solid", fgColor="D5F5E3")
+AMBER_FILL = PatternFill("solid", fgColor="FEF9E7")
+ALT_ROW_FILL = PatternFill("solid", fgColor="F8FBFF")  # 짝수행 연한 줄무늬
 
 DOCUMENT_TYPE_LABELS = {
     "ESTIMATE": "견적서",
@@ -148,10 +152,17 @@ def to_number(value: Any) -> float:
         return 0.0
 
 
+_DARK_FILLS = {HEADER_FILL, HEADER_FILL2, TITLE_FILL}
+
+def _font_color_for(fill: Optional[PatternFill]) -> str:
+    return "FFFFFF" if fill in _DARK_FILLS else "1A252F"
+
+
 def write_cell(ws: Worksheet, row: int, col: int, value: Any, *, bold: bool = False, fill: Optional[PatternFill] = None,
                align: str = "center", border: bool = True, wrap: bool = True) -> None:
     cell = ws.cell(row=row, column=col, value=value)
-    cell.font = Font(bold=bold, size=11)
+    color = _font_color_for(fill)
+    cell.font = Font(bold=bold, size=11, color=color)
     cell.alignment = Alignment(horizontal=align, vertical="center", wrap_text=wrap)
     if fill:
         cell.fill = fill
@@ -163,7 +174,8 @@ def merge_write(ws: Worksheet, start_row: int, start_col: int, end_row: int, end
                 *, bold: bool = False, fill: Optional[PatternFill] = None, size: int = 11) -> None:
     ws.merge_cells(start_row=start_row, start_column=start_col, end_row=end_row, end_column=end_col)
     cell = ws.cell(start_row, start_col, value)
-    cell.font = Font(bold=bold, size=size)
+    color = _font_color_for(fill)
+    cell.font = Font(bold=bold, size=size, color=color)
     cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
     if fill:
         cell.fill = fill
@@ -193,7 +205,11 @@ def get_row_value(row: Dict[str, Any], key: str, index: int = 0) -> Any:
     for alias in aliases.get(key, [key]):
         if alias in row and row.get(alias) not in (None, ""):
             return row.get(alias)
-    return row.get(key, "")
+    # Gemini가 만든 임의 키: 직접 조회 후 없으면 한글 라벨로도 시도
+    val = row.get(key)
+    if val not in (None, ""):
+        return val
+    return ""
 
 
 
@@ -271,25 +287,139 @@ def document_only_text(value: Any) -> str:
     text = str(value or "").strip()
     if not text or looks_like_user_prompt_or_meta(text):
         return ""
+    # PDF 페이지 마커 제거
+    text = re.sub(r"\[page\s*\d+\s*/\s*\d+(?:\s*OCR)?\]", "", text, flags=re.I)
+    text = re.sub(r"텍스트\s*전용\s*샘플\s*\d*", "", text).strip()
     lines = [line.strip() for line in re.split(r"\r?\n", text) if line.strip()]
     clean_lines = [line for line in lines if not looks_like_user_prompt_or_meta(line)]
     return "\n".join(clean_lines)
+
+
+def _strip_page_markers(text: str) -> str:
+    """PDF 페이지 마커와 샘플 문서 표시를 제거한다."""
+    text = re.sub(r"\[page\s*\d+\s*/\s*\d+(?:\s*OCR)?\]", "", text, flags=re.I)
+    text = re.sub(r"텍스트\s*전용\s*샘플\s*\d*", "", text, flags=re.I)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _build_review_content(analysis: Dict[str, Any], rows: List[Dict[str, Any]]) -> str:
+    """분석 결과에서 실제 검토 의견을 구성한다."""
+    parts = []
+    doc_type = str(analysis.get("documentType") or "").strip()
+    summary = _strip_page_markers(str(analysis.get("summary") or ""))
+    purpose = _strip_page_markers(str(analysis.get("purpose") or ""))
+    key_values = analysis.get("keyValues") or []
+
+    # 업체별 단가 비교 문서
+    if rows and any(r.get("lowest_vendor") or r.get("standard_unit_price") for r in rows[:5]):
+        prices = [(r.get("item_name", ""), r.get("lowest_vendor", ""), r.get("lowest_unit_price") or r.get("calculated_unit_price", "")) for r in rows[:5] if r.get("item_name")]
+        if prices:
+            parts.append("□ 단가 검토 결과")
+            for item, vendor, price in prices[:5]:
+                if item and vendor:
+                    price_str = f"{int(to_number(price)):,}원" if price and to_number(price) else "확인 필요"
+                    parts.append(f"  - {item}: 최저 {vendor} ({price_str})")
+
+    # 표준시장단가와의 비교
+    std_rows = [r for r in rows if to_number(r.get("standard_unit_price")) and to_number(r.get("lowest_unit_price") or r.get("calculated_unit_price"))]
+    if std_rows:
+        diffs = []
+        for r in std_rows[:3]:
+            std = to_number(r.get("standard_unit_price"))
+            low = to_number(r.get("lowest_unit_price") or r.get("calculated_unit_price"))
+            if std and low:
+                rate = (low - std) / std * 100
+                diffs.append(rate)
+        if diffs:
+            avg_diff = sum(diffs) / len(diffs)
+            direction = "낮은" if avg_diff < 0 else "높은"
+            parts.append(f"\n□ 표준단가 대비 분석\n  평균 {abs(avg_diff):.1f}% {direction} 수준으로 검토됨")
+
+    # 핵심 키값 활용
+    for kv in key_values[:4]:
+        label = str(kv.get("label") or "")
+        value = str(kv.get("value") or "")
+        if label and value and not re.search(r"page|OCR|LLM|샘플", label, re.I):
+            parts.append(f"  · {label}: {value}")
+
+    # 결론
+    if "견적" in doc_type or "비교" in doc_type or rows:
+        parts.append("\n□ 종합 의견\n  업체별 단가 차이를 확인하고, 최저 견적 기준으로 계약 검토를 진행하기 바람.")
+    elif purpose:
+        parts.append(f"\n□ 검토 의견\n  {purpose}")
+
+    return "\n".join(parts) if parts else ""
 
 
 def build_report_first_row(payload: Dict[str, Any], rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     first = rows[0] if rows else {}
     analysis = get_payload_analysis(payload)
     report = get_payload_drafts(payload).get("report") if isinstance(get_payload_drafts(payload).get("report"), dict) else {}
+    job = payload.get("job") or {}
+
+    # 제목: 분석된 문서 제목 우선
+    doc_title = first_text(
+        document_only_text(first.get("report_title")),
+        document_only_text(first.get("document_title")),
+        document_only_text(report.get("report_title")),
+        document_only_text(analysis.get("documentType")),
+    )
+    report_title = doc_title or "업무 보고서"
+
+    # 목적: 분석 purpose 우선
+    purpose = first_text(
+        document_only_text(first.get("report_purpose")),
+        document_only_text(analysis.get("purpose")),
+        document_only_text(report.get("purpose")),
+    )
+    if not purpose or len(purpose) < 10:
+        doc_type = str(analysis.get("documentType") or "")
+        if "견적" in doc_type or "비교" in doc_type:
+            purpose = "첨부 문서의 업체별 견적 단가를 검토하고, 비교 결과를 보고합니다."
+        else:
+            purpose = "첨부 문서의 주요 내용을 검토하여 업무 보고서 형식으로 정리합니다."
+
+    # 주요 내용: 페이지 마커 제거 후 실제 내용 추출
+    raw_summary = first_text(
+        document_only_text(first.get("summary")),
+        document_only_text(first.get("content")),
+        document_only_text(report.get("summary")),
+        document_only_text(analysis.get("summary")),
+    )
+    summary = _strip_page_markers(raw_summary)
+
+    # 핵심 키값 (문서번호, 작성일자, 검토대상 등)
+    key_values = analysis.get("keyValues") or []
+    kv_lines = []
+    for kv in key_values[:8]:
+        label = str(kv.get("label") or "").strip()
+        value = str(kv.get("value") or "").strip()
+        if label and value and not re.search(r"page|OCR|LLM|샘플|파싱", label, re.I):
+            kv_lines.append(f"  · {label}: {value}")
+    if kv_lines:
+        summary = ("□ 문서 기본 정보\n" + "\n".join(kv_lines) + "\n\n" + summary).strip()
+
+    # 검토 의견: 단순 "정상" 대신 실질적인 내용으로
     issue_value = first_text(first.get("issue_summary"), first.get("review_result"), first.get("review_opinion"))
     if ignore_plain_status(issue_value):
         issue_value = first_text(report.get("issue_summary"), report.get("review_result"), report.get("review_opinion"))
+    review_content = document_only_text(issue_value)
+    if ignore_plain_status(review_content) or not review_content:
+        review_content = _build_review_content(analysis, rows)
+
+    # 후속 조치
+    action = first_text(document_only_text(first.get("action_plan")), document_only_text(report.get("action_plan")))
+    if not action or len(action) < 5:
+        action = "수량 및 단가 최종 확인 후 발주 진행 예정" if rows else "문서 내용 확인 후 후속 조치 예정"
+
     return {
         **first,
-        "report_title": first_text(document_only_text(first.get("report_title")), document_only_text(first.get("document_title")), document_only_text(report.get("report_title")), document_only_text(report.get("title")), "업무 보고서"),
-        "report_purpose": first_text(document_only_text(first.get("report_purpose")), document_only_text(first.get("purpose")), document_only_text(report.get("report_purpose")), document_only_text(report.get("purpose")), document_only_text(analysis.get("purpose")), "첨부 문서의 주요 내용을 업무 보고서 형식으로 정리합니다."),
-        "summary": first_text(document_only_text(first.get("summary")), document_only_text(first.get("content")), document_only_text(report.get("summary")), document_only_text(analysis.get("summary"))),
-        "issue_summary": first_text(document_only_text(issue_value)),
-        "action_plan": first_text(document_only_text(first.get("action_plan")), document_only_text(report.get("action_plan"))),
+        "report_title": report_title,
+        "report_purpose": purpose,
+        "summary": summary,
+        "issue_summary": review_content,
+        "action_plan": action,
         "footer_note": first_text(document_only_text(first.get("footer_note")), document_only_text(report.get("footer_note"))),
     }
 
@@ -521,8 +651,9 @@ def normalize_columns(columns: List[Dict[str, Any]], rows: List[Dict[str, Any]],
         out = []
         for item in as_list(mapping_json.get("baseColumns")):
             key = normalize_key(item.get("fieldKey") or item.get("key"))
+            label = item.get("label") or item.get("fieldLabel") or label_for(key)
             if key:
-                out.append({"key": key, "label": label_for(key, item.get("label"))})
+                out.append({"key": key, "label": label})
         if not any(c["key"] in ("row_no", "no") for c in out):
             out.insert(0, {"key": "row_no", "label": "NO"})
         return out
@@ -559,14 +690,15 @@ def normalize_columns(columns: List[Dict[str, Any]], rows: List[Dict[str, Any]],
 
 
 def write_title_area(ws: Worksheet, title: str, total_cols: int, subtitle: str = "") -> None:
-    ws.row_dimensions[1].height = 30
+    ws.row_dimensions[1].height = 34
     merge_write(ws, 1, 1, 1, total_cols, title, bold=True, size=16, fill=TITLE_FILL)
     if subtitle:
-        merge_write(ws, 2, 1, 2, total_cols, subtitle, bold=False, size=10, fill=LIGHT_FILL)
+        ws.row_dimensions[2].height = 16
+        merge_write(ws, 2, 1, 2, total_cols, subtitle, bold=False, size=9, fill=LIGHT_FILL)
     write_cell(ws, 3, 1, "작성일", bold=True, fill=HEADER_FILL)
-    write_cell(ws, 3, 2, today_text())
+    write_cell(ws, 3, 2, today_text(), fill=LIGHT_FILL)
     write_cell(ws, 3, 3, "작성자", bold=True, fill=HEADER_FILL)
-    write_cell(ws, 3, 4, "")
+    write_cell(ws, 3, 4, "", fill=LIGHT_FILL)
 
 
 def write_table(ws: Worksheet, columns: List[Dict[str, str]], rows: List[Dict[str, Any]], start_row: int = 5) -> None:
@@ -614,49 +746,171 @@ def create_estimate_comparison_workbook(payload: Dict[str, Any]) -> Tuple[Workbo
     vendors = infer_vendors(columns, rows, table_json)
     if not vendors:
         vendors = [{"name": "업체1", "index": 0}, {"name": "업체2", "index": 1}]
+
+    # 표준시장단가 포함 여부 판단
+    has_std = any(to_number(row.get("standard_unit_price")) > 0 for row in rows)
+
     base_cols = [
-        {"key": "row_no", "label": "NO"}, {"key": "item_name", "label": "품명"},
-        {"key": "spec", "label": "규격"}, {"key": "quantity", "label": "수량"}, {"key": "unit", "label": "단위"},
+        {"key": "row_no", "label": "NO"},
+        {"key": "construction_code", "label": "공종코드"},
+        {"key": "item_name", "label": "품목명"},
+        {"key": "spec", "label": "규격"},
+        {"key": "quantity", "label": "수량"},
+        {"key": "unit", "label": "단위"},
     ]
-    total_cols = len(base_cols) + len(vendors) * 2 + 3
+    # 공종코드 없으면 제거
+    if not any(row.get("construction_code") for row in rows):
+        base_cols = [c for c in base_cols if c["key"] != "construction_code"]
+
+    summary_cols = 3  # 최저업체, 최저단가, 비고
+    std_extra = 1 if has_std else 0
+    total_cols = len(base_cols) + std_extra + len(vendors) * 2 + summary_cols
+
     wb = Workbook()
     ws = wb.active
-    ws.title = "비교견적서"
-    write_title_area(ws, "비교 견적서", total_cols, "업체별 단가와 금액을 비교합니다.")
-    header_row = 5
+    ws.title = "업체별단가비교"
+
+    # ── 타이틀 ──────────────────────────────────────
+    doc_title = str((job.get("analysis") or {}).get("documentType") or "업체별 단가 비교표")
+    ws.row_dimensions[1].height = 36
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=total_cols)
+    title_cell = ws.cell(1, 1, doc_title)
+    title_cell.font = Font(bold=True, size=16, color="FFFFFF")
+    title_cell.fill = TITLE_FILL
+    title_cell.alignment = Alignment(horizontal="center", vertical="center")
+    title_cell.border = BORDER
+
+    # ── 메타 정보 행 ─────────────────────────────────
+    ws.row_dimensions[2].height = 20
+    meta_pairs = [("작성일", today_text()), ("작성자", payload.get("author_name") or "")]
+    for idx, (lbl, val) in enumerate(meta_pairs):
+        col = idx * 3 + 1
+        write_cell(ws, 2, col, lbl, bold=True, fill=HEADER_FILL)
+        merge_write(ws, 2, col + 1, 2, col + 2, val, fill=LIGHT_FILL)
+    # 나머지 메타 셀 채우기
+    for c in range(len(meta_pairs) * 3 + 1, total_cols + 1):
+        write_cell(ws, 2, c, "", fill=LIGHT_FILL)
+
+    # ── 헤더 (2단) ──────────────────────────────────
+    header_row = 3
+    ws.row_dimensions[header_row].height = 22
+    ws.row_dimensions[header_row + 1].height = 20
+
     for idx, col in enumerate(base_cols, start=1):
         merge_write(ws, header_row, idx, header_row + 1, idx, col["label"], bold=True, fill=HEADER_FILL)
+
     col_cursor = len(base_cols) + 1
-    for vendor in vendors:
-        merge_write(ws, header_row, col_cursor, header_row, col_cursor + 1, vendor.get("name") or "업체", bold=True, fill=HEADER_FILL)
+
+    if has_std:
+        merge_write(ws, header_row, col_cursor, header_row + 1, col_cursor, "표준단가", bold=True, fill=HEADER_FILL2)
+        col_cursor += 1
+
+    # 업체별 2칸 (단가/금액)
+    vendor_fill_cycle = [HEADER_FILL, HEADER_FILL2]
+    for v_idx, vendor in enumerate(vendors):
+        vname = vendor.get("name") or f"업체{v_idx + 1}"
+        vfill = vendor_fill_cycle[v_idx % 2]
+        merge_write(ws, header_row, col_cursor, header_row, col_cursor + 1, vname, bold=True, fill=vfill)
         write_cell(ws, header_row + 1, col_cursor, "단가", bold=True, fill=LIGHT_FILL)
         write_cell(ws, header_row + 1, col_cursor + 1, "금액", bold=True, fill=LIGHT_FILL)
         col_cursor += 2
-    for label in ["최저 업체", "최저 단가", "비고"]:
-        merge_write(ws, header_row, col_cursor, header_row + 1, col_cursor, label, bold=True, fill=HEADER_FILL)
+
+    for lbl in ["최저 업체", "최저 단가", "비고"]:
+        merge_write(ws, header_row, col_cursor, header_row + 1, col_cursor, lbl, bold=True, fill=HEADER_FILL)
         col_cursor += 1
 
+    # ── 데이터 행 ────────────────────────────────────
+    data_start = header_row + 2
     for row_offset, row in enumerate(rows):
-        r_idx = header_row + 2 + row_offset
+        r_idx = data_start + row_offset
+        row_fill = ALT_ROW_FILL if row_offset % 2 == 1 else None
+        ws.row_dimensions[r_idx].height = 18
+
         for c_idx, col in enumerate(base_cols, start=1):
             val = get_row_value(row, col["key"], row_offset)
-            write_cell(ws, r_idx, c_idx, val, align="left" if col["key"] == "item_name" else "center")
+            cell = ws.cell(r_idx, c_idx, val)
+            cell.border = BORDER
+            cell.alignment = Alignment(horizontal="left" if col["key"] in ("item_name", "spec") else "center", vertical="center")
+            cell.font = Font(size=10)
+            if row_fill:
+                cell.fill = row_fill
+
         c = len(base_cols) + 1
+
+        if has_std:
+            std_val = row.get("standard_unit_price") or ""
+            cell = ws.cell(r_idx, c, int(to_number(std_val)) if std_val and to_number(std_val) else std_val)
+            cell.border = BORDER
+            cell.number_format = "#,##0"
+            cell.alignment = Alignment(horizontal="right", vertical="center")
+            cell.font = Font(size=10)
+            if row_fill:
+                cell.fill = row_fill
+            c += 1
+
         best_name, best_price = lowest_vendor(row, vendors)
-        for vendor in vendors:
+        for v_idx, vendor in enumerate(vendors):
             price = get_vendor_value(row, vendor, "unit_price")
             amount = get_vendor_value(row, vendor, "amount")
-            write_cell(ws, r_idx, c, int(to_number(price)) if price not in (None, "") and to_number(price) else price)
-            ws.cell(r_idx, c).number_format = "#,##0"
-            write_cell(ws, r_idx, c + 1, int(to_number(amount)) if amount not in (None, "") and to_number(amount) else amount)
-            ws.cell(r_idx, c + 1).number_format = "#,##0"
+            price_num = to_number(price) if price not in (None, "", "원문 미기재") else 0
+            amount_num = to_number(amount) if amount not in (None, "", "원문 미기재") else 0
+
+            is_lowest = best_name and comparable_company(vendor.get("name")) == comparable_company(best_name)
+            cell_fill = GREEN_FILL if is_lowest and price_num else (row_fill or None)
+
+            for val, col_offset, fmt in [(price_num or price, 0, "#,##0"), (amount_num or amount, 1, "#,##0")]:
+                cell = ws.cell(r_idx, c + col_offset, int(to_number(val)) if val not in (None, "", "원문 미기재") and to_number(val) else val)
+                cell.border = BORDER
+                cell.number_format = fmt
+                cell.alignment = Alignment(horizontal="right" if to_number(val) else "center", vertical="center")
+                cell.font = Font(size=10, bold=is_lowest and col_offset == 0)
+                if cell_fill:
+                    cell.fill = cell_fill
             c += 2
-        write_cell(ws, r_idx, c, best_name)
-        write_cell(ws, r_idx, c + 1, best_price)
-        ws.cell(r_idx, c + 1).number_format = "#,##0"
-        write_cell(ws, r_idx, c + 2, get_row_value(row, "remark"), align="left")
-    ws.freeze_panes = ws.cell(header_row + 2, 1)
-    set_widths(ws, total_cols, 13)
+
+        # 최저업체/최저단가/비고
+        lowest_cell = ws.cell(r_idx, c, best_name)
+        lowest_cell.border = BORDER
+        lowest_cell.alignment = Alignment(horizontal="center", vertical="center")
+        lowest_cell.font = Font(size=10, bold=True, color="1A7A4A")
+        if row_fill:
+            lowest_cell.fill = row_fill
+
+        price_cell = ws.cell(r_idx, c + 1, int(best_price) if best_price else "")
+        price_cell.border = BORDER
+        price_cell.number_format = "#,##0"
+        price_cell.alignment = Alignment(horizontal="right", vertical="center")
+        price_cell.font = Font(size=10, bold=True, color="1A7A4A")
+        if row_fill:
+            price_cell.fill = row_fill
+
+        remark_val = get_row_value(row, "remark")
+        remark_cell = ws.cell(r_idx, c + 2, remark_val)
+        remark_cell.border = BORDER
+        remark_cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+        remark_cell.font = Font(size=9, color="666666")
+        if row_fill:
+            remark_cell.fill = row_fill
+
+    # 자동 필터 및 고정
+    ws.auto_filter.ref = f"A{header_row + 1}:{get_column_letter(total_cols)}{data_start + len(rows) - 1}"
+    ws.freeze_panes = ws.cell(data_start, 1)
+
+    # 열 너비 최적화
+    ws.column_dimensions["A"].width = 6   # NO
+    col_letter_map = {col["key"]: get_column_letter(idx + 1) for idx, col in enumerate(base_cols)}
+    if "construction_code" in col_letter_map:
+        ws.column_dimensions[col_letter_map["construction_code"]].width = 16
+    if "item_name" in col_letter_map:
+        ws.column_dimensions[col_letter_map["item_name"]].width = 28
+    if "spec" in col_letter_map:
+        ws.column_dimensions[col_letter_map["spec"]].width = 18
+    for c_i in range(len(base_cols) + std_extra + 1, total_cols - summary_cols + 1):
+        ws.column_dimensions[get_column_letter(c_i)].width = 13
+    ws.column_dimensions[get_column_letter(total_cols - 2)].width = 16  # 최저업체
+    ws.column_dimensions[get_column_letter(total_cols - 1)].width = 13  # 최저단가
+    ws.column_dimensions[get_column_letter(total_cols)].width = 20       # 비고
+
     return wb, {"template_kind": "ESTIMATE_COMPARISON", "vendor_count": len(vendors)}
 
 
@@ -894,29 +1148,70 @@ def create_report_workbook(payload: Dict[str, Any], doc_type: str) -> Tuple[Work
     # BUSINESS REPORT / GENERAL REPORT
     first = build_report_first_row(payload, rows)
     total_cols = 8
-    title = first.get("report_title") or first.get("document_title") or "업무 보고서"
-    merge_write(ws, 1, 1, 1, total_cols, title, bold=True, size=18, fill=TITLE_FILL)
-    write_cell(ws, 3, 1, "작성일", bold=True, fill=HEADER_FILL)
-    write_cell(ws, 3, 2, today_text())
-    write_cell(ws, 3, 3, "작성자", bold=True, fill=HEADER_FILL)
-    write_cell(ws, 3, 4, payload.get("author_name") or "")
-    write_cell(ws, 3, 5, "문서구분", bold=True, fill=HEADER_FILL)
-    merge_write(ws, 3, 6, 3, 8, "보고서")
-    sections = [
-        ("1. 보고 목적", first.get("report_purpose") or first.get("purpose") or ""),
-        ("2. 주요 검토 내용", first.get("summary") or first.get("content") or ""),
-        ("3. 주요 이슈 및 확인사항", first.get("issue_summary") or first.get("review_result") or first.get("review_opinion") or ""),
-        ("4. 후속 조치 및 관리계획", first.get("action_plan") or ""),
+
+    # ── 제목 + 결재란 ───────────────────────────────
+    rpt_title = first.get("report_title") or "업무 보고서"
+    ws.row_dimensions[1].height = 40
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=5)
+    title_cell = ws.cell(1, 1, rpt_title)
+    title_cell.font = Font(bold=True, size=18, color="FFFFFF")
+    title_cell.fill = TITLE_FILL
+    title_cell.alignment = Alignment(horizontal="center", vertical="center")
+    title_cell.border = BORDER
+    for c in range(1, 6):
+        ws.cell(1, c).border = BORDER
+
+    # 결재란 (우측)
+    for c_idx, lbl in enumerate(["담당", "검토", "승인"], start=6):
+        ws.row_dimensions[1].height = 40
+        write_cell(ws, 1, c_idx, lbl, bold=True, fill=HEADER_FILL)
+        ws.row_dimensions[2].height = 36
+        write_cell(ws, 2, c_idx, "")  # 서명 공란
+
+    # ── 문서 기본 정보 ──────────────────────────────
+    ws.row_dimensions[3].height = 22
+    ws.row_dimensions[4].height = 22
+    meta_info = [
+        ("작성일", today_text()), ("작성자", payload.get("author_name") or ""),
+        ("공사명", ""), ("현장명", ""),
     ]
-    r = 5
-    for title, body in sections:
-        merge_write(ws, r, 1, r, total_cols, title, bold=True, fill=HEADER_FILL)
-        merge_write(ws, r + 1, 1, r + 3, total_cols, body or "")
-        r += 5
+    for i, (lbl, val) in enumerate(meta_info):
+        row = 3 + (i // 2)
+        col = 1 + (i % 2) * 4
+        write_cell(ws, row, col, lbl, bold=True, fill=HEADER_FILL)
+        merge_write(ws, row, col + 1, row, col + 3, val, fill=LIGHT_FILL)
+
+    # ── 보고 섹션 ───────────────────────────────────
+    section_defs = [
+        ("1. 보고 목적", first.get("report_purpose") or "", 3),
+        ("2. 주요 검토 내용", first.get("summary") or "", 8),
+        ("3. 검토 의견 및 확인사항", first.get("issue_summary") or "", 6),
+        ("4. 후속 조치 및 관리계획", first.get("action_plan") or "", 3),
+    ]
+    r = 6
+    for sec_title, body, height in section_defs:
+        # 섹션 제목
+        ws.row_dimensions[r].height = 22
+        merge_write(ws, r, 1, r, total_cols, sec_title, bold=True, fill=HEADER_FILL)
+        r += 1
+        # 섹션 본문
+        for h in range(height):
+            ws.row_dimensions[r + h].height = 20
+        merge_write(ws, r, 1, r + height - 1, total_cols, body or "")
+        # 본문 셀에 좌측 정렬 + 줄바꿈 설정
+        cell = ws.cell(r, 1)
+        cell.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+        cell.font = Font(size=10)
+        r += height + 1  # 빈 구분 행 1개
+
+    # ── 하단 비고 ────────────────────────────────────
     merge_write(ws, r, 1, r, total_cols, "5. 참고 사항", bold=True, fill=HEADER_FILL)
-    merge_write(ws, r + 1, 1, r + 3, total_cols, first.get("footer_note") or "")
+    ws.row_dimensions[r + 1].height = 20
+    merge_write(ws, r + 1, 1, r + 2, total_cols, first.get("footer_note") or "")
+
     set_widths(ws, total_cols, 16)
-    ws.column_dimensions["B"].width = 26
+    ws.column_dimensions["A"].width = 14
+    ws.column_dimensions["B"].width = 20
     return wb, {"template_kind": doc_type}
 
 def copy_cell_style(src, dst) -> None:

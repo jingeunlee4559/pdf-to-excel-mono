@@ -10,6 +10,8 @@ const {
   updateCandidateField,
   generateExcel,
   downloadExcel,
+  previewExcel,
+  generateExcelPreviewOnly,
   listDownloads,
   listChatSessions,
   createChatSession,
@@ -35,6 +37,8 @@ router.post('/:id/revalidate', authenticate, revalidateJob);
 router.post('/:id/ai-template', authenticate, createAiTemplate);
 router.post('/:id/candidate-fields/:fieldId', authenticate, updateCandidateField);
 router.post('/:id/excels', authenticate, generateExcel);
+router.post('/:id/excel-preview', authenticate, generateExcelPreviewOnly);
+router.get('/:id/excels/:excelId/preview', authenticate, previewExcel);
 router.get('/:id/excels/:excelId/download', downloadExcel);
 
 module.exports = router;

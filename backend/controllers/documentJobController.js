@@ -1927,7 +1927,20 @@ async function generateExcelForJob({ job, tableId, fileName, outputMode = null, 
     [job.id, effectiveTemplateId, sourceSessionId || null, sourceMessageId || null, excel.fileName, excel.filePath]
   );
   await pool.query('UPDATE document_jobs SET status = ? WHERE id = ?', ['GENERATED', job.id]);
-  return { id: result.insertId, fileName: excel.fileName, jobId: job.id, outputMode: effectiveOutputMode, templateApplied: Boolean(effectiveTemplateId) };
+  // 생성 직후 미리보기(색상/스타일 포함)도 같이 반환
+  let excelPreview = null;
+  try {
+    const { getExcelPreview } = require('../services/aiServerService');
+    const previewResult = await getExcelPreview({ filePath: excel.filePath, maxRows: 80, maxCols: 26 });
+    // ai-server는 { preview: { rows, columns, ... } } 중첩 구조로 반환
+    const previewData = previewResult?.preview || previewResult;
+    if (previewData && Array.isArray(previewData.rows) && previewData.rows.length > 0) {
+      excelPreview = previewData;
+    }
+  } catch (err) {
+    console.warn('[EXCEL_PREVIEW] 미리보기 로드 실패:', err.message);
+  }
+  return { id: result.insertId, fileName: excel.fileName, jobId: job.id, outputMode: effectiveOutputMode, templateApplied: Boolean(effectiveTemplateId), preview: excelPreview };
 }
 
 
@@ -1939,6 +1952,7 @@ const createAiTemplate = asyncHandler(async (req, res) => {
     tableId: req.body.tableId || req.body.table_id || null,
     user: req.user,
     designOverride: req.body.forceGeminiDesign ? null : (req.body.design || req.body.designJson || null),
+    userRequestOverride: req.body.userRequestOverride || null,
   });
   const refreshedJob = await loadJob(job.id, req.user);
   res.status(201).json({
@@ -1973,8 +1987,10 @@ const updateCandidateField = asyncHandler(async (req, res) => {
     }
     candidate.status = 'ADDED_STANDARD';
     candidate.matched_standard_field = candidate.suggested_field_key;
+    candidate.active_yn = 'N'; // 처리 완료 → 목록에서 제거
   } else if (action === 'USE_CUSTOM') {
     candidate.status = 'CUSTOM_ONLY';
+    candidate.active_yn = 'N'; // 처리 완료 → 목록에서 제거
   } else if (action === 'EXCLUDE') {
     candidate.status = 'EXCLUDED';
     candidate.active_yn = 'N';
@@ -2018,6 +2034,48 @@ const downloadExcel = asyncHandler(async (req, res) => {
   if (!excel || !fs.existsSync(excel.file_path)) return res.status(404).json({ message: '엑셀 파일을 찾을 수 없습니다.' });
   await pool.query("UPDATE generated_excels SET downloaded_yn = 'Y', downloaded_at = NOW() WHERE id = ?", [excel.id]);
   res.download(excel.file_path, excel.file_name);
+});
+
+const previewExcel = asyncHandler(async (req, res) => {
+  const job = await loadJob(req.params.id, req.user);
+  if (!job) return res.status(404).json({ message: '작업을 찾을 수 없습니다.' });
+  const [[excel]] = await pool.query('SELECT * FROM generated_excels WHERE id = ? AND job_id = ?', [req.params.excelId, req.params.id]);
+  if (!excel || !excel.file_path) return res.status(404).json({ message: '엑셀 파일 정보가 없습니다.' });
+  const { getExcelPreview } = require('../services/aiServerService');
+  const previewResult = await getExcelPreview({ filePath: excel.file_path, maxRows: 80, maxCols: 26 });
+  const preview = previewResult?.preview || previewResult;
+  res.json({ preview });
+});
+
+// 저장 없이 미리보기용 임시 엑셀만 생성해서 셀 스타일/색상 포함 반환
+const generateExcelPreviewOnly = asyncHandler(async (req, res) => {
+  const job = await loadJob(req.params.id, req.user);
+  if (!job) return res.status(404).json({ message: '작업을 찾을 수 없습니다.' });
+  if (!job.tables?.length) return res.status(400).json({ message: '표 데이터가 없습니다.' });
+
+  const outputMode = normalizeExcelOutputMode(req.body.outputMode || req.body.output_mode, 'FREE_FORM');
+  const tableId = req.body.tableId || req.body.table_id;
+  const table = tableId ? job.tables.find((t) => Number(t.id) === Number(tableId)) : job.tables[0];
+  if (!table) return res.status(400).json({ message: '표 데이터가 없습니다.' });
+
+  const design = outputMode === 'FREE_FORM' ? (req.body.design || null) : null;
+  const authorName = req.user.userName || req.user.loginId || '';
+
+  let excelFile;
+  if (outputMode === 'COMPANY_TEMPLATE') {
+    const templateId = normalizeTemplateId(req.body.templateId || req.body.template_id);
+    if (templateId) {
+      const { template, mappings, mappingJson } = await loadTemplateWithMappings(templateId);
+      excelFile = await createMappedTemplateExcel({ jobId: job.id, fileName: 'preview_temp.xlsx', template, mappings, mappingJson, columns: table.columns, rows: table.rows, job: { ...job, tables: [table] }, authorName, templateLayoutMode: req.body.templateLayoutMode || 'COMPACT_VENDOR_GROUPS' });
+    }
+  }
+  if (!excelFile) {
+    excelFile = await createExcelFile({ jobId: job.id, fileName: 'preview_temp.xlsx', columns: table.columns, rows: table.rows, job: { ...job, tables: [table] }, authorName, mappingJson: design || {} });
+  }
+
+  const { getExcelPreview } = require('../services/aiServerService');
+  const preview = await getExcelPreview({ filePath: excelFile.filePath, maxRows: 80, maxCols: 26 });
+  res.json({ preview });
 });
 
 const listDownloads = asyncHandler(async (req, res) => {
@@ -2153,6 +2211,8 @@ module.exports = {
   updateCandidateField,
   generateExcel,
   downloadExcel,
+  previewExcel,
+  generateExcelPreviewOnly,
   listDownloads,
   listChatSessions,
   createChatSession,

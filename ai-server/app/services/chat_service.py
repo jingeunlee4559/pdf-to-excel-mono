@@ -42,6 +42,12 @@ def _detect_intent(message: str) -> str:
         return "SELF_INTRO"
     if re.search(r"^(안녕|하이|hello|hi|반가워|ㅎㅇ)\b|안녕하세요", text, re.I):
         return "GREETING"
+    # 양식 변경 요청은 단가비교·표 요청보다 먼저 판별한다
+    if re.search(r"보고서\s*(형식|형태|양식|로|으로)?|회의록|공문|업무보고|검토보고|일보|점검표", text, re.I):
+        return "FORMAT_REQUEST"
+    # "비교표로", "비교견적서로" 같은 명시적 양식 요청도 FORMAT_REQUEST
+    if re.search(r"비교표\s*(로|으로|형식|양식)|비교견적서|단가비교표|업체별\s*비교", text, re.I):
+        return "FORMAT_REQUEST"
     if re.search(r"단가|비교|최저|가격|견적", text, re.I):
         return "PRICE_COMPARE"
     if re.search(r"이\s*문서|문서\s*(뭐|무슨|요약|내용)|뭐야|무슨\s*문서|내용|요약", text, re.I):
@@ -53,6 +59,21 @@ def _detect_intent(message: str) -> str:
     if re.search(r"엑셀|xlsx|양식|산출", text, re.I):
         return "EXCEL_CREATE"
     return "GENERAL"
+
+
+def _detect_target_format(message: str) -> str:
+    text = (message or "").strip()
+    if re.search(r"회의록", text, re.I):
+        return "MEETING_MINUTES"
+    if re.search(r"공문", text, re.I):
+        return "OFFICIAL_LETTER"
+    if re.search(r"비교표|비교견적서|업체별\s*비교|단가비교표", text, re.I):
+        return "ESTIMATE_COMPARISON"
+    if re.search(r"보고서|업무보고|검토보고", text, re.I):
+        return "REPORT"
+    if re.search(r"일보|작업일보|점검표", text, re.I):
+        return "REPORT"
+    return "REPORT"
 
 
 def _fallback_answer(message: str, context: Optional[Dict[str, Any]] = None, llm_error: str = "") -> Dict[str, Any]:
@@ -71,6 +92,26 @@ def _fallback_answer(message: str, context: Optional[Dict[str, Any]] = None, llm
         "llmError": llm_error,
         "model": "rule-chat-fallback" if llm_error else "rule-chat",
     }
+
+    if intent == "FORMAT_REQUEST":
+        target_format = _detect_target_format(msg)
+        format_labels = {
+            "REPORT": "보고서",
+            "MEETING_MINUTES": "회의록",
+            "OFFICIAL_LETTER": "공문",
+            "ESTIMATE_COMPARISON": "비교견적서",
+        }
+        label = format_labels.get(target_format, "보고서")
+        return {
+            **base,
+            "answer": f"{label} 형식으로 엑셀을 생성합니다.",
+            "intent": "FORMAT_REQUEST",
+            "needsFile": not has_document,
+            "action": "GENERATE_EXCEL" if has_document else "REQUEST_FILE",
+            "targetFormat": target_format,
+            "recommendedTab": "excel",
+            "quickReplies": ["다운로드", "다른 형식은?", "비교표로 만들어줘"],
+        }
 
     if intent in {"GREETING", "SELF_INTRO"}:
         answer = (
@@ -231,13 +272,18 @@ def _build_chat_prompt(message: str, context: Optional[Dict[str, Any]]) -> str:
 
 [반환 JSON 스키마]
 {{
-  "answer": "사용자에게 보여줄 답변",
-  "intent": "GREETING|SELF_INTRO|DOCUMENT_QA|PRICE_COMPARE|ISSUE_CHECK|TABLE_CREATE|EXCEL_CREATE|GENERAL",
+  "answer": "사용자에게 보여줄 답변 (엑셀 생성을 실제로 했다는 거짓 표현 금지 - 실제로 생성하는 건 프론트엔드가 한다)",
+  "intent": "GREETING|SELF_INTRO|DOCUMENT_QA|PRICE_COMPARE|ISSUE_CHECK|TABLE_CREATE|EXCEL_CREATE|FORMAT_REQUEST|GENERAL",
   "needsFile": false,
-  "action": "NONE|REQUEST_FILE|SHOW_ANALYSIS|SHOW_TABLE|SHOW_EXCEL|RUN_ANALYSIS",
+  "action": "NONE|REQUEST_FILE|SHOW_ANALYSIS|SHOW_TABLE|SHOW_EXCEL|RUN_ANALYSIS|GENERATE_EXCEL",
+  "targetFormat": "REPORT|MEETING_MINUTES|OFFICIAL_LETTER|ESTIMATE_COMPARISON|null",
   "recommendedTab": "analysis|table|excel|source|null",
   "quickReplies": ["후속 질문 1", "후속 질문 2"]
 }}
+
+[추가 규칙]
+10. "보고서 형식으로", "회의록으로", "공문으로" 같은 양식 변경 요청이면 intent=FORMAT_REQUEST, action=GENERATE_EXCEL, targetFormat에 REPORT/MEETING_MINUTES/OFFICIAL_LETTER 중 하나를 넣어라.
+11. action=GENERATE_EXCEL이라도 answer에서 "생성했습니다", "만들었습니다"를 쓰지 말고 "생성합니다"라고 써라. 실제 생성은 프론트에서 한다.
 """.strip()
 
 

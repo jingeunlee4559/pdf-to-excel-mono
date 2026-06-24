@@ -1692,8 +1692,9 @@ def _extract_requested_item_terms(user_request: str) -> List[str]:
     if not text.strip():
         return []
     terms: List[str] = []
-    # '유입변압기설치', '기중차단기 설치'처럼 설치/포설/배선/조립이 붙은 공종명을 우선 추출한다.
-    for m in re.finditer(r"[가-힣A-Za-z0-9·ㆍ()]+\s*(?:설치|포설|배선|조립|제작|철거|교체|시공)", text):
+    # '유입변압기설치', '기중차단기 설치', '변압기 설치'처럼 설치/포설/배선/조립이 붙은 공종명을 우선 추출한다.
+    # 공백이 있어도 compact_text 후 비교하므로 "변압기 설치" → "변압기설치"로 통일
+    for m in re.finditer(r"[가-힣A-Za-z0-9·ㆍ()]+(?:\s+[가-힣A-Za-z0-9·ㆍ()]+)*?\s*(?:설치|포설|배선|조립|제작|철거|교체|시공)", text):
         term = compact_text(m.group(0))
         if len(term) >= 3:
             terms.append(term)
@@ -1783,23 +1784,27 @@ def extract_text_vendor_item_rows(text: str, user_request: str = "") -> Tuple[Li
     request_qty, request_unit = _extract_requested_quantity_value(user_request)
     rows: List[Dict[str, Any]] = []
     seen = set()
-    page_header = r"(?:\s*전기공사\s*업체별\s*단가\s*비교\s*검토보고서\s*-\s*텍스트\s*전용\s*샘플\s*\d+\s*)?"
+    # 페이지 헤더 패턴: "[page X / Y]" 포함 형식도 처리
+    page_header = r"(?:\s*전기공사\s*업체별\s*단가\s*비교\s*검토보고서\s*-\s*텍스트\s*전용\s*샘플\s*\d+\s*(?:\[page\s*\d+\s*/\s*\d+\])?\s*)?"
     vendor_pat = r"(?:[A-Z]회사\s*)?(?:㈜|\(주\)|주식회사)?[가-힣A-Za-z0-9·ㆍ]+(?:㈜)?"
     pattern = re.compile(
         r"공종코드\s*(?P<code>[A-Z]{2}[0-9]{3}\.[0-9]{5})\s*항목은\s*"
-        r"(?P<item>.*?)에\s*관한\s*단가\s*검토\s*건이다\.\s*"
+        r"(?P<item>[^에]{1,80}?)에\s*관한\s*단가\s*검토\s*건이다\.\s*"
         r"적용\s*단위는\s*(?P<unit>[^\s\.]+)이고\s*표준시장단가는\s*(?P<std>[0-9]{1,3}(?:,[0-9]{3})+)원이다\.\s*"
         r"이번\s*비교에서\s*최저\s*견적은\s*(?P<low_vendor>" + vendor_pat + r")의" + page_header + r"\s*(?P<low_price>[0-9]{1,3}(?:,[0-9]{3})+)원이며,\s*"
         r"최고\s*견적은\s*(?P<high_vendor>" + vendor_pat + r")의" + page_header + r"\s*(?P<high_price>[0-9]{1,3}(?:,[0-9]{3})+)원이다\."
-        r"(?P<context>.{0,220}?)"
+        r"(?P<context>.{0,500}?)"
         r"(?=공종코드\s*[A-Z]{2}[0-9]{3}\.|[가-힣A-Za-z0-9·ㆍ()]+\s*\([A-Z]{2}[0-9]{2}\*\)에 대한 검토 의견|$)",
         re.S,
     )
     for m in pattern.finditer(text):
         full_item = clean_cell_text(m.group('item'))
         compact_item = compact_text(full_item)
-        if requested_terms and not any(term in compact_item or compact_item in term for term in requested_terms):
-            continue
+        if requested_terms:
+            # 변압기 설치(공백) → 변압기설치(compact)로 통일해서 비교
+            compact_terms = [compact_text(t) for t in requested_terms]
+            if not any(t in compact_item or compact_item in t for t in compact_terms):
+                continue
         item_name, spec = _split_item_name_and_spec(full_item)
         low_vendor = clean_cell_text(m.group('low_vendor'))
         high_vendor = clean_cell_text(m.group('high_vendor'))
@@ -1839,12 +1844,8 @@ def extract_text_vendor_item_rows(text: str, user_request: str = "") -> Tuple[Li
             continue
         seen.add(key)
         remark_parts = []
-        if request_qty:
-            remark_parts.append(f"사용자 요청 수량 {request_qty}{request_unit or ''} 적용")
         if request_unit and clean_cell_text(m.group('unit')) and compact_text(request_unit) != compact_text(m.group('unit')):
-            remark_parts.append(f"원문 단위 {clean_cell_text(m.group('unit'))}와 요청 단위 {request_unit} 확인 필요")
-        if any(value == "원문 미기재" for value in vendor_prices.values()):
-            remark_parts.append("원문에 해당 업체 단가가 직접 제시되지 않은 칸은 원문 미기재로 표시")
+            remark_parts.append(f"단위 확인: 원문 {clean_cell_text(m.group('unit'))} / 요청 {request_unit}")
         rows.append(enrich_row_units({
             "construction_code": code,
             "item_name": item_name,
@@ -1856,7 +1857,7 @@ def extract_text_vendor_item_rows(text: str, user_request: str = "") -> Tuple[Li
             "highest_vendor": high_vendor,
             "vendor_prices": vendor_prices,
             "vendor_amounts": vendor_amounts,
-            "remark": " / ".join(remark_parts) if remark_parts else "문장 기반 최저/최고 견적 추출",
+            "remark": " / ".join(remark_parts),
         }))
     return rows[:80], selected_vendors
 
@@ -3664,6 +3665,8 @@ def _first_text(*values: Any) -> str:
 
 def _clean_business_sentence(value: Any) -> str:
     text = clean_cell_text(value)
+    # PDF 페이지 마커 제거: [page N / T] 또는 [page N / T OCR]
+    text = re.sub(r"\[page\s*\d+\s*/\s*\d+(?:\s*OCR)?\]", "", text, flags=re.I)
     text = re.sub(r"\s+", " ", text).strip()
     text = re.sub(r"^[•\-–—*\s]+", "", text).strip()
     return text
@@ -3675,11 +3678,15 @@ def _looks_like_system_or_processing_meta(value: Any) -> bool:
     text = _clean_business_sentence(value)
     if not text:
         return False
+    # PDF 페이지 마커 자체가 남아있으면 메타로 처리
+    if re.search(r"\[page\s*\d+\s*/\s*\d+", text, re.I):
+        return True
     meta_tokens = [
         "첨부 파일", "파일 수", "총 페이지", "확인된 총 페이지", "페이지 수",
         "표 후보", "파싱", "PyMuPDF", "pdfplumber", "PP-Structure", "PaddleOCR",
         "OCR", "LLM", "ai-server", "저장 위치", "산출 방식", "요청 내용은",
         "문서 분석", "엑셀 미리보기", "백그라운드", "분석 결과", "처리했습니다",
+        "텍스트 전용 샘플", "텍스트전용", "샘플 문서",
     ]
     return any(token.lower() in text.lower() for token in meta_tokens)
 

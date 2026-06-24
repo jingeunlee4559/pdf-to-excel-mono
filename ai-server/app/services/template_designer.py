@@ -305,12 +305,18 @@ def _safe_text_items(items: Any, allowed_keys: set[str], fallback_items: List[Di
 def _sanitize_llm_design(raw: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
     fallback = _fallback_design(payload)
     allowed = _allowed_fields(payload.get("standard_fields") or [])
+    # standard_fields가 비어있으면 Gemini가 만든 모든 필드를 허용한다.
+    strict_filter = bool(allowed)
 
     def safe_item(item: Dict[str, Any]) -> Dict[str, str] | None:
         key = _field_key(item)
-        if key not in allowed:
+        if not key:
             return None
-        return {"fieldKey": key, "label": _field_label(item) or _field_label(allowed[key]) or key}
+        label = _field_label(item)
+        if strict_filter and key not in allowed:
+            return None
+        fallback_label = _field_label(allowed[key]) if key in allowed else ""
+        return {"fieldKey": key, "label": label or fallback_label or key}
 
     def safe_list(items: Any, fallback_items: List[Dict[str, str]]) -> List[Dict[str, str]]:
         out: List[Dict[str, str]] = []

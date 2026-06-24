@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
@@ -97,6 +98,33 @@ def _strip_trailing_commas(value: str) -> str:
     return re.sub(r",(\s*[}\]])", r"\1", value)
 
 
+def _recover_truncated_json(text: str) -> str:
+    """잘린 JSON에서 열린 괄호와 따옴표를 닫아 복구를 시도한다."""
+    if not text:
+        return ""
+    stack = []
+    in_string = False
+    escape_next = False
+    for ch in text:
+        if escape_next:
+            escape_next = False
+            continue
+        if ch == "\\" and in_string:
+            escape_next = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+        elif not in_string:
+            if ch in ("{", "["):
+                stack.append("}" if ch == "{" else "]")
+            elif ch in ("}", "]") and stack:
+                stack.pop()
+    if in_string:
+        text += '"'
+    text += "".join(reversed(stack))
+    return text
+
+
 def extract_json_object(text: str) -> Dict[str, Any]:
     if not text:
         raise ValueError("LLM 응답이 비어 있습니다.")
@@ -140,6 +168,20 @@ def extract_json_object(text: str) -> Dict[str, Any]:
         except Exception as exc:  # noqa: BLE001 - 복구 후보를 순차적으로 시도해야 한다.
             last_error = exc
 
+    # 잘린 JSON 복구: 열린 괄호/따옴표를 닫아본다.
+    for candidate in list(normalized_candidates):
+        recovered = _recover_truncated_json(candidate)
+        if recovered and recovered not in seen:
+            seen.add(recovered)
+            try:
+                parsed = json.loads(recovered)
+                if isinstance(parsed, dict):
+                    return parsed
+                if isinstance(parsed, list):
+                    return {"items": parsed}
+            except Exception as exc:
+                last_error = exc
+
     preview = cleaned[:300].replace("\n", " ")
     raise ValueError(f"LLM JSON 파싱 실패: {last_error}. response_preview={preview}")
 
@@ -179,7 +221,14 @@ def _make_gemini_config(types: Any, cfg: LlmConfig, response_schema: Optional[Di
     return types.GenerateContentConfig(**kwargs)
 
 
-def _call_gemini_sync(prompt: str, cfg: LlmConfig, response_schema: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+_RETRYABLE_ERRORS = ("ResourceExhausted", "ServiceUnavailable", "InternalServerError", "DeadlineExceeded", "RESOURCE_EXHAUSTED", "503", "429", "500")
+
+def _is_retryable(exc: Exception) -> bool:
+    msg = str(exc)
+    return any(token in msg for token in _RETRYABLE_ERRORS)
+
+
+def _call_gemini_sync(prompt: str, cfg: LlmConfig, response_schema: Optional[Dict[str, Any]] = None, _max_retries: int = 2) -> Dict[str, Any]:
     if not cfg.api_key:
         raise RuntimeError("GEMINI_API_KEY가 설정되지 않았습니다. ai-server .env에 GEMINI_API_KEY=... 값을 추가하세요.")
 
@@ -190,28 +239,41 @@ def _call_gemini_sync(prompt: str, cfg: LlmConfig, response_schema: Optional[Dic
         raise RuntimeError("google-genai 패키지가 없습니다. ai-server venv에서 `pip install -U google-genai`를 실행하세요.") from exc
 
     client = genai.Client(api_key=cfg.api_key)
-    try:
-        response = client.models.generate_content(
-            model=cfg.model,
-            contents=prompt,
-            config=_make_gemini_config(types, cfg, response_schema=response_schema),
-        )
-    except TypeError:
-        response = client.models.generate_content(
-            model=cfg.model,
-            contents=prompt,
-            config=_make_gemini_config(types, cfg, response_schema=None),
-        )
-    response_text = _extract_response_text(response)
-    parsed = extract_json_object(response_text)
-    parsed.setdefault("_llm", {})
-    parsed["_llm"].update({
-        "provider": cfg.provider,
-        "model": cfg.model,
-        "imageLlm": False,
-        "responseMimeType": "application/json",
-    })
-    return parsed
+    last_exc: Exception | None = None
+    for attempt in range(_max_retries + 1):
+        try:
+            try:
+                response = client.models.generate_content(
+                    model=cfg.model,
+                    contents=prompt,
+                    config=_make_gemini_config(types, cfg, response_schema=response_schema),
+                )
+            except TypeError:
+                response = client.models.generate_content(
+                    model=cfg.model,
+                    contents=prompt,
+                    config=_make_gemini_config(types, cfg, response_schema=None),
+                )
+            response_text = _extract_response_text(response)
+            parsed = extract_json_object(response_text)
+            parsed.setdefault("_llm", {})
+            parsed["_llm"].update({
+                "provider": cfg.provider,
+                "model": cfg.model,
+                "imageLlm": False,
+                "responseMimeType": "application/json",
+                "attempts": attempt + 1,
+            })
+            return parsed
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if attempt < _max_retries and _is_retryable(exc):
+                # 무료 티어 429 대응: 넉넉하게 대기 (5초, 10초)
+                wait = 5 * (2 ** attempt)
+                time.sleep(wait)
+                continue
+            break
+    raise last_exc  # type: ignore[misc]
 
 
 async def call_llm_json(prompt: str, cfg: Optional[LlmConfig] = None, response_schema: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
