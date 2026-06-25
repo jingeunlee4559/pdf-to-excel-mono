@@ -17,7 +17,7 @@ import { AiGeneratedTemplatePreview } from './AiGeneratedTemplatePreview.jsx';
 import { ProductPriceSurveyTemplatePreview } from './ProductPriceSurveyTemplatePreview.jsx';
 import { GenericRegisteredTemplatePreview } from './GenericRegisteredTemplatePreview.jsx';
 
-export function CompanyTemplatePreview({ table, issues, selectedTemplate, writerName, templateLayoutMode = 'PRESERVE_TEMPLATE', templatePreview = null, templatePreviewLoading = false, templatePreviewError = '', updateCell, removeRow, disabled }) {
+export function CompanyTemplatePreview({ table, issues, selectedTemplate, writerName, templateLayoutMode = 'PRESERVE_TEMPLATE', templatePreview = null, generatedExcelPreview = null, templatePreviewLoading = false, templatePreviewError = '', updateCell, removeRow, disabled }) {
   if (isAiGeneratedTemplate(selectedTemplate)) {
     return <AiGeneratedTemplatePreview table={table} issues={issues} selectedTemplate={selectedTemplate} writerName={writerName} updateCell={updateCell} removeRow={removeRow} disabled={disabled} />;
   }
@@ -28,7 +28,7 @@ export function CompanyTemplatePreview({ table, issues, selectedTemplate, writer
     return <GenericRegisteredTemplatePreview table={table} issues={issues} selectedTemplate={selectedTemplate} templatePreview={templatePreview} templatePreviewLoading={templatePreviewLoading} templatePreviewError={templatePreviewError} updateCell={updateCell} removeRow={removeRow} disabled={disabled} />;
   }
 
-  const vendors = inferPreviewVendors(table);
+  const vendors = inferPreviewVendors(table, { generatedExcelPreview });
   const visibleVendors = buildTemplateVendorSlots(vendors, templateLayoutMode);
   const rows = table.rows || [];
   const headerColSpan = 2 + visibleVendors.length * 4;

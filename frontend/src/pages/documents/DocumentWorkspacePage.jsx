@@ -84,6 +84,8 @@ export default function DocumentWorkspacePage() {
   const chatFileInputRef = useRef(null);
   const pollingTimersRef = useRef({});
   const unmountedRef = useRef(false);
+  // 채팅에서 설정한 인라인 테이블 — 분석 완료 후 덮어쓰지 않도록 보존
+  const pendingChatTableRef = useRef(null);
 
   useEffect(() => {
     listTemplatesApi().then((data) => {
@@ -356,26 +358,11 @@ export default function DocumentWorkspacePage() {
                 });
               } else {
                 setTab((current) => (current === 'analysis' ? 'excel' : current));
-                const rowCount = nextJob.tables?.[0]?.rows?.length || 0;
                 try {
-                  const autoResult = await generateExcelApi(nextJob.id, {
-                    outputMode: 'FREE_FORM',
-                    tableId: nextJob.tables?.[0]?.id || null,
-                  });
-                  if (autoResult?.excel) setGeneratedExcel(autoResult.excel);
-                  const preview = autoResult?.excel?.preview || autoResult?.preview;
-                  if (preview && Array.isArray(preview.rows) && preview.rows.length > 0
-                      && Array.isArray(preview.columns) && preview.columns.length > 0) {
-                    setGeneratedExcelPreview(preview);
-                  }
-                  await refreshDownloads();
+                  await refreshExcelPreviewOnly(nextJob, nextJob.tables?.[0]?.id || null);
                 } catch (_) {}
-                appendChat({
-                  role: 'assistant',
-                  content: `분석 완료: ${rowCount}행 추출됐습니다. 엑셀 미리보기에서 수정 후 다운로드하세요.`,
-                  showPreview: true,
-                  quickReplies: ['보고서로 만들어줘', '비교표로 만들어줘', '이 문서 뭐야?'],
-                });
+                // 분석 완료 메시지는 백엔드가 채팅 세션에 ANALYSIS_DONE으로 저장한다.
+                // 여기서 로컬 메시지를 추가하면 곧바로 세션 재조회에 덮여 보였다가 사라지는 문제가 생긴다.
               }
             }
           }
@@ -475,15 +462,114 @@ export default function DocumentWorkspacePage() {
     setTables(resultTables);
     setSelectedTableIndex(0);
     const firstTable = resultTables[0];
+
+    // 채팅 인라인 테이블이 대기 중이면 분석 결과로 덮어쓰지 않고 인라인 테이블을 사용
+    const pendingChat = pendingChatTableRef.current;
+    if (pendingChat && firstTable?.id) {
+      pendingChatTableRef.current = null;
+      const chatTable = {
+        id: firstTable.id,
+        tableName: pendingChat.tableName || firstTable?.tableName || '채팅 생성 비교표',
+        tableType: pendingChat.tableType || 'MULTI_VENDOR_PRICE_COMPARISON',
+        tableJson: pendingChat.tableJson || {},
+        columns: pendingChat.columns || defaultColumns,
+        rows: pendingChat.rows || [],
+      };
+      setTable(chatTable);
+      updateTableApi(jobData.id, { tableId: firstTable.id, columns: chatTable.columns, rows: chatTable.rows, tableJson: chatTable.tableJson })
+        .then(() => generateExcelApi(jobData.id, { fileName, outputMode, tableId: firstTable.id, chatSessionId: activeSessionId || null }))
+        .then((excelResult) => {
+          setGeneratedExcel(excelResult.excel || null);
+          const preview = excelResult.excel?.preview || excelResult.preview;
+          if (preview?.rows?.length && preview?.columns?.length) setGeneratedExcelPreview(preview);
+          refreshDownloads();
+        })
+        .catch(() => {});
+      setIssues(jobData?.issues || []);
+      return;
+    }
+
+    // 파일 분석 완료 후 userRequest에 품목별 수량 지정이 있으면 분석 행에 override 적용
+    // 예) "진공차단기(VCB)설치 수량 40개, 저압배전반(MDB)설치 수량 50개"
+    const applyQuantityOverrides = (rows, userReq) => {
+      if (!userReq) return rows;
+      const overrides = new Map();
+
+      // ── 형식 A: "품목 수량 N개" — 품목마다 개별 수량 명시 ─────────────
+      // 예) "진공차단기(VCB)설치 수량 40개, 저압배전반(MDB)설치 수량 50개"
+      const reA = /([가-힣A-Za-z0-9()（）\/]+)\s+수량\s+(\d+)\s*개/g;
+      let m;
+      while ((m = reA.exec(userReq)) !== null) {
+        const name = m[1].trim();
+        if (/[가-힣]/.test(name)) overrides.set(name, parseInt(m[2], 10));
+      }
+
+      // ── 형식 B: "품목1,품목2 각각 수량 N1개,N2개" ───────────────────────
+      // 예) "진공차단기(VCB)설치,저압배전반(MDB)설치 각각 수량 40개,50개"
+      if (overrides.size === 0 && userReq.includes('각각')) {
+        const parts = userReq.split('각각');
+        const beforeGakgak = parts[0] || '';
+        const afterGakgak = parts.slice(1).join('각각');
+        // 품목 추출: 콤마 구분 공백없는 한글 품목명
+        const itemMatches = [...beforeGakgak.matchAll(/([가-힣A-Za-z0-9()（）\/]+)/g)]
+          .map(r => r[1].trim())
+          .filter(n => /[가-힣]/.test(n) && n.length >= 2);
+        // 수량 추출: "수량 N개" 또는 "N개"
+        const qtyMatches = [...afterGakgak.matchAll(/(\d+)\s*개/g)]
+          .map(r => parseInt(r[1], 10))
+          .filter(q => q > 0 && q < 100000);
+        // 마지막 N개 품목에 순서대로 수량 매핑
+        const itemsToMap = itemMatches.slice(-qtyMatches.length);
+        itemsToMap.forEach((item, i) => { if (i < qtyMatches.length) overrides.set(item, qtyMatches[i]); });
+      }
+
+      // ── 형식 C: "품목1 N개, 품목2 M개" (수량 키워드 없이) ────────────────
+      if (overrides.size === 0) {
+        const reC = /([가-힣A-Za-z0-9()（）\/]+)\s+(\d+)\s*개/g;
+        while ((m = reC.exec(userReq)) !== null) {
+          const name = m[1].trim();
+          if (/[가-힣]/.test(name) && name.length >= 2) overrides.set(name, parseInt(m[2], 10));
+        }
+      }
+
+      if (overrides.size === 0) return rows;
+
+      return rows.map((row) => {
+        const rowName = String(row.item_name || row.work_item_name || row.product_name || row.material_name || '');
+        for (const [keyword, qty] of overrides) {
+          const core = keyword.replace(/\([^)]*\)/g, '').trim();
+          if (rowName.includes(keyword) || (core.length >= 2 && rowName.includes(core))) {
+            return { ...row, quantity: qty };
+          }
+        }
+        return row;
+      });
+    };
+
     const draftRow = getDraftRowFromAnalysis(jobData?.analysis || {}, nextDesigns[0]?.layout || '');
-    const displayRows = mergeDraftIntoRows(firstTable?.rows || [], draftRow);
+    const rawRows = applyQuantityOverrides(firstTable?.rows || [], jobData?.userRequest || '');
+    const displayRows = mergeDraftIntoRows(rawRows, draftRow);
+    // tableJson.meta.vendors가 비어있으면 analysis.fileProfiles의 companyName으로 보완
+    const rawTableJson = firstTable?.tableJson || {};
+    const enrichedTableJson = (() => {
+      if (Array.isArray(rawTableJson.meta?.vendors) && rawTableJson.meta.vendors.length) return rawTableJson;
+      const profiles = jobData?.analysis?.fileProfiles || [];
+      const fileVendors = profiles
+        .map((fp, idx) => {
+          const name = String(fp?.companyName || fp?.vendorName || fp?.company_name || fp?.vendor_name || '').trim();
+          return name ? { name, index: idx } : null;
+        })
+        .filter(Boolean);
+      if (!fileVendors.length) return rawTableJson;
+      return { ...rawTableJson, meta: { ...(rawTableJson.meta || {}), vendors: fileVendors } };
+    })();
     setTable({
       id: firstTable?.id,
       tableName: firstTable?.tableName || firstTable?.table_name || '문서 표 후보',
       tableType: firstTable?.tableType || firstTable?.table_type || 'NORMAL_TABLE',
       page: firstTable?.page || firstTable?.tableJson?.page || null,
       confidence: firstTable?.confidence || firstTable?.tableJson?.confidence || null,
-      tableJson: firstTable?.tableJson || {},
+      tableJson: enrichedTableJson,
       columns: firstTable?.columns || defaultColumns,
       rows: displayRows
     });
@@ -549,6 +635,41 @@ export default function DocumentWorkspacePage() {
     };
   };
 
+  const unwrapPreviewPayload = (payload) => {
+    const candidate = payload?.preview?.preview || payload?.excel?.preview?.preview || payload?.excel?.preview || payload?.preview || payload;
+    if (candidate && Array.isArray(candidate.rows) && candidate.rows.length > 0
+        && Array.isArray(candidate.columns) && candidate.columns.length > 0) {
+      return candidate;
+    }
+    return null;
+  };
+
+  const refreshExcelPreviewOnly = async (jobData = job, tableIdOverride = null) => {
+    const targetJob = jobData || job;
+    if (!targetJob?.id) return null;
+    const targetTableId = tableIdOverride || targetJob?.tables?.[0]?.id || table?.id || null;
+    const mode = outputMode === 'COMPANY_TEMPLATE' || targetJob?.outputMode === 'COMPANY_TEMPLATE'
+      ? 'COMPANY_TEMPLATE'
+      : 'FREE_FORM';
+    const payload = {
+      outputMode: mode,
+      tableId: targetTableId,
+      chatSessionId: activeSessionId || null,
+      templateId: mode === 'COMPANY_TEMPLATE' ? (templateId || targetJob?.templateId || null) : null,
+      templateLayoutMode: mode === 'COMPANY_TEMPLATE' ? templateLayoutMode : null,
+      design: mode === 'FREE_FORM' ? selectedDesign : null,
+      designId: mode === 'FREE_FORM' ? selectedDesign?.designId : null,
+    };
+    const result = await generateExcelPreviewOnlyApi(targetJob.id, payload);
+    const preview = unwrapPreviewPayload(result);
+    if (preview) {
+      setGeneratedExcelPreview(preview);
+      return preview;
+    }
+    setGeneratedExcelPreview(null);
+    return null;
+  };
+
   const shouldAnalyzeFromChat = (text, uploadFiles = []) => {
     if (uploadFiles.length > 0) return true;
     return false;
@@ -567,7 +688,7 @@ export default function DocumentWorkspacePage() {
       return `기준서/지침서 기준으로 문서를 분석했습니다.${parseText} 원문에 있는 기준·단가·산정 문장 ${rowCount}행을 표로 정리했고 확인 필요 항목은 ${issueCount}건입니다.`;
     }
     if (isMultiVendorCompareTableType(tableType)) {
-      return `업체별 단가 비교 기준으로 문서를 분석했습니다.${parseText} 요청한 공종/품목 기준 비교표 ${rowCount}행을 만들었습니다. 엑셀 미리보기에서 A/B/C 업체 단가와 표준시장단가를 확인하세요.`;
+      return `업체별 단가 비교 기준으로 문서를 분석했습니다.${parseText} 요청한 공종/품목 기준 비교표 ${rowCount}행을 만들었습니다. 엑셀 미리보기에서 요청 업체별 단가·금액과 최저 업체를 확인하세요.`;
     }
     if (isTextVendorComparisonReportType(tableType)) {
       return `표가 없는 서술형 업체 비교보고서로 분석했습니다.${parseText} 원문 총괄 비교 문장에서 업체별 총액 요약 ${rowCount}행을 추출했습니다. 개별 공종 단가는 원문에 명시된 범위에서만 확인하세요.`;
@@ -651,7 +772,7 @@ export default function DocumentWorkspacePage() {
       const isMultiCompareTable = isMultiVendorCompareTableType(tableType);
       return {
         answer: rowCount
-          ? (isMultiCompareTable ? `현재 업체별 단가 비교표 ${rowCount}행이 있습니다. 표준시장단가와 각 업체 단가/최저 업체를 같이 확인할 수 있습니다.` : (isReferenceTable ? `현재 기준서 항목 표 ${rowCount}행이 있습니다. 단가 기준 컬럼에서 원문 단가·가격·요금 기준을 확인할 수 있습니다.` : (isStandardMarketTable ? `현재 표준시장단가 표 ${rowCount}행이 있습니다. 공종명칭·규격·단위·단가 기준으로 확인할 수 있습니다.` : `현재 표 후보 ${rowCount}행 기준으로 단가 비교가 가능합니다. 업체별 동일 품목·동일 규격의 단위가 다를 때만 환산 기준 확인이 필요합니다.`)))
+          ? (isMultiCompareTable ? `현재 업체별 단가 비교표 ${rowCount}행이 있습니다. 요청 업체별 단가/금액과 최저 업체를 같이 확인할 수 있습니다.` : (isReferenceTable ? `현재 기준서 항목 표 ${rowCount}행이 있습니다. 단가 기준 컬럼에서 원문 단가·가격·요금 기준을 확인할 수 있습니다.` : (isStandardMarketTable ? `현재 표준시장단가 표 ${rowCount}행이 있습니다. 공종명칭·규격·단위·단가 기준으로 확인할 수 있습니다.` : `현재 표 후보 ${rowCount}행 기준으로 단가 비교가 가능합니다. 업체별 동일 품목·동일 규격의 단위가 다를 때만 환산 기준 확인이 필요합니다.`)))
           : '비교할 행 추가 후 바로 입력할 수 있습니다. 원문에 근거 없는 품목·금액·단가는 만들지 않았습니다.',
         quickReplies: ['기준 항목 표로 정리해줘', '엑셀 미리보기 보여줘'],
         recommendedTab: rowCount ? 'table' : 'analysis'
@@ -749,22 +870,66 @@ export default function DocumentWorkspacePage() {
         quickReplies: chat.quickReplies || ['이 문서 뭐야?', '단가만 비교해줘'],
         meta: chat.llmFallback ? 'fallback' : chat.model
       });
-      if (chat.recommendedTab) setTab(chat.recommendedTab);
+      if (chat.recommendedTab) setTab(chat.recommendedTab === 'table' ? 'excel' : chat.recommendedTab);
 
-      // newTable 처리: FORMAT_REQUEST 시 테이블 구조 교체
+      // 백엔드 rule-table-editor가 표를 직접 수정한 경우(chat.newTable 없음)에도
+      // 왼쪽 엑셀 미리보기를 즉시 다시 생성한다.
+      if (result.job && !chat.newTable && chat.action === 'UPDATE_TABLE') {
+        try {
+          await refreshExcelPreviewOnly(result.job, table?.id || result.job?.tables?.[0]?.id || null);
+        } catch (_) {}
+      }
+
+      // newTable 처리: 테이블 상태 교체 → DB 저장 → 엑셀 자동 생성 (순서 보장)
       if (chat.newTable && chat.newTable.columns && chat.newTable.rows) {
         const nt = chat.newTable;
-        setTable((prev) => ({
-          ...prev,
+        const currentTableId = table?.id || null;
+        const nextTable = {
+          ...table,
           columns: nt.columns,
           rows: nt.rows,
-          tableType: nt.tableType || prev.tableType,
-          tableName: nt.tableName || prev.tableName,
+          tableType: nt.tableType || table.tableType,
+          tableName: nt.tableName || table.tableName,
+          tableJson: nt.tableJson || table.tableJson || {},
           _theme: nt.theme || null,
-        }));
+        };
+        // 1) React state 업데이트
+        setTable(nextTable);
         setGeneratedExcelPreview(null);
         setTab('excel');
         if (chat.targetFormat) setChatFormatRequest({ format: chat.targetFormat, label: text, theme: nt.theme });
+
+        // 2) DB 저장 → 엑셀 자동 생성 (tableId 있을 때만)
+        if (job?.id && currentTableId) {
+          try {
+            await updateTableApi(job.id, { tableId: currentTableId, columns: nextTable.columns, rows: nextTable.rows, tableJson: nextTable.tableJson });
+            const excelResult = await generateExcelApi(job.id, {
+              fileName,
+              outputMode,
+              tableId: currentTableId,
+              chatSessionId: activeSessionId || null,
+              templateId: outputMode === 'COMPANY_TEMPLATE' ? templateId : null,
+            });
+            setGeneratedExcel(excelResult.excel || null);
+            const preview = excelResult.excel?.preview || excelResult.preview;
+            if (preview?.rows?.length && preview?.columns?.length) {
+              setGeneratedExcelPreview(preview);
+            }
+            await refreshDownloads();
+          } catch (_) {
+            // 자동 생성 실패 — 수동 생성으로 fallback
+          }
+        } else if (job?.id && !currentTableId) {
+          // tableId가 아직 없음 (분석 진행 중) → 분석 완료 후 pendingChatTableRef에서 처리
+          pendingChatTableRef.current = {
+            tableName: nextTable.tableName,
+            tableType: nextTable.tableType,
+            tableJson: nextTable.tableJson,
+            columns: nextTable.columns,
+            rows: nextTable.rows,
+          };
+        }
+        // newTable 있을 때는 아래 GENERATE_EXCEL 블록 건너뜀
       }
 
       // targetFormat 저장 (newTable 없어도)
@@ -772,7 +937,8 @@ export default function DocumentWorkspacePage() {
         setChatFormatRequest({ format: chat.targetFormat, label: text, theme: null });
       }
 
-      if (chat.action === 'GENERATE_EXCEL' && job?.id) {
+      // newTable이 없는 경우에만 아래 GENERATE_EXCEL 블록 실행
+      if (chat.action === 'GENERATE_EXCEL' && job?.id && !chat.newTable) {
         const isNarrativeRequest = chat.intent === 'NARRATIVE_REPORT' || chat.targetFormat === 'NARRATIVE_REPORT';
         const hasStoredReport = !!(analysis?.narrativeReport || analysis?.narrative_report);
 
@@ -972,10 +1138,19 @@ export default function DocumentWorkspacePage() {
     });
     setGeneratedExcelPreview((prev) => {
       if (!prev || !Array.isArray(prev.columns) || !Array.isArray(prev.rows)) return prev;
-      const allLetters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
-      const usedLetters = new Set(prev.columns.map((c) => c.letter));
-      const nextLetter = allLetters.split('').find((l) => !usedLetters.has(l));
-      if (!nextLetter) return prev;
+      const letterToIndex = (letter = '') => String(letter).split('').reduce((sum, ch) => sum * 26 + (ch.charCodeAt(0) - 64), 0);
+      const indexToLetter = (num) => {
+        let n = Number(num) || 1;
+        let out = '';
+        while (n > 0) {
+          const rem = (n - 1) % 26;
+          out = String.fromCharCode(65 + rem) + out;
+          n = Math.floor((n - 1) / 26);
+        }
+        return out;
+      };
+      const maxColIndex = Math.max(0, ...prev.columns.map((c) => letterToIndex(c.letter)));
+      const nextLetter = indexToLetter(maxColIndex + 1);
 
       // 헤더 row 감지: 첫 8행 중 스타일 있는(비흰색 배경) 셀 + 텍스트가 가장 많은 row
       const isNonWhite = (bg) => {
@@ -1157,6 +1332,21 @@ export default function DocumentWorkspacePage() {
     } finally {
       setLoading(false);
     }
+  };
+
+  // 드래그 리사이즈 — generatedExcelPreview 컬럼 너비/행 높이 갱신
+  const handleColumnWidthChange = (letter, newWidth) => {
+    setGeneratedExcelPreview((prev) => {
+      if (!prev || !Array.isArray(prev.columns)) return prev;
+      return { ...prev, columns: prev.columns.map((c) => c.letter === letter ? { ...c, widthPx: newWidth } : c) };
+    });
+  };
+
+  const handleRowHeightChange = (rowNumber, newHeight) => {
+    setGeneratedExcelPreview((prev) => {
+      if (!prev || !Array.isArray(prev.rows)) return prev;
+      return { ...prev, rows: prev.rows.map((r) => r.rowNumber === rowNumber ? { ...r, heightPx: newHeight } : r) };
+    });
   };
 
   const revalidate = async () => {
@@ -1418,7 +1608,7 @@ export default function DocumentWorkspacePage() {
             <TableSelector tables={tables} selectedIndex={selectedTableIndex} onSelect={selectTableByIndex} />
             {tab === 'analysis' && <AnalysisView analysis={analysis} issues={issues} table={table} onMoveTable={() => setTab('excel')} onMoveExcel={() => setTab('excel')} />}
             {tab === 'report' && <ReportView analysis={analysis} />}
-            {tab === 'excel' && <ExcelPreview table={table} issues={issues} outputMode={outputMode} selectedTemplate={selectedTemplate} selectedDesign={selectedDesign} writerName={writerName} templateLayoutMode={templateLayoutMode} templatePreview={templatePreview} templatePreviewLoading={templatePreviewLoading} templatePreviewError={templatePreviewError} updateCell={updateCell} addRow={addRow} removeRow={removeRow} addColumn={addColumn} removeColumn={removeColumn} updateColumnLabel={updateColumnLabel} saveTable={saveTable} disabled={loading} candidateFields={candidateFields} onCandidateAction={handleCandidateFieldAction} generatedExcelPreview={generatedExcelPreview} analysis={analysis} onPreviewCellEdit={handlePreviewCellEdit} onRemovePreviewRow={removePreviewRow} onRemovePreviewColumn={removePreviewColumn} onMergePreview={mergePreviewCells} onSplitPreview={splitPreviewCell} onRefreshPreview={generatedExcel && job?.id ? createExcel : null} />}
+            {tab === 'excel' && <ExcelPreview table={table} issues={issues} outputMode={outputMode} selectedTemplate={selectedTemplate} selectedDesign={selectedDesign} writerName={writerName} templateLayoutMode={templateLayoutMode} templatePreview={templatePreview} templatePreviewLoading={templatePreviewLoading} templatePreviewError={templatePreviewError} updateCell={updateCell} addRow={addRow} removeRow={removeRow} addColumn={addColumn} removeColumn={removeColumn} updateColumnLabel={updateColumnLabel} saveTable={saveTable} disabled={loading} candidateFields={candidateFields} onCandidateAction={handleCandidateFieldAction} generatedExcelPreview={generatedExcelPreview} analysis={analysis} onPreviewCellEdit={handlePreviewCellEdit} onRemovePreviewRow={removePreviewRow} onRemovePreviewColumn={removePreviewColumn} onMergePreview={mergePreviewCells} onSplitPreview={splitPreviewCell} onRefreshPreview={generatedExcel && job?.id ? createExcel : null} onColumnWidthChange={handleColumnWidthChange} onRowHeightChange={handleRowHeightChange} />}
             {tab === 'source' && <SourceView files={analyzedFiles} sourceText={sourceText} />}
           </div>
         </section>

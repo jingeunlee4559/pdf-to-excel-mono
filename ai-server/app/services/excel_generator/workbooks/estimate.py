@@ -76,15 +76,27 @@ def create_estimate_comparison_workbook(payload: Dict[str, Any]) -> Tuple[Workbo
     title_cell.border = BORDER
 
     # ── 메타 정보 행 ─────────────────────────────────
+    # 업체 수가 늘어 total_cols가 커질 때도 작성자 영역이 표의 오른쪽 끝에 붙도록 배치한다.
+    # 기존 방식(idx * 3)은 작성자/시스템관리자가 왼쪽에 고정되어 우측이 빈칸으로 남았다.
     ws.row_dimensions[2].height = 20
-    meta_pairs = [("작성일", today_text()), ("작성자", payload.get("author_name") or "")]
-    for idx, (lbl, val) in enumerate(meta_pairs):
-        col = idx * 3 + 1
-        write_cell(ws, 2, col, lbl, bold=True, fill=HEADER_FILL)
-        merge_write(ws, 2, col + 1, 2, col + 2, val, fill=LIGHT_FILL)
-    # 나머지 메타 셀 채우기
-    for c in range(len(meta_pairs) * 3 + 1, total_cols + 1):
-        write_cell(ws, 2, c, "", fill=LIGHT_FILL)
+    author = payload.get("author_name") or ""
+    if total_cols >= 8:
+        write_cell(ws, 2, 1, "작성일", bold=True, fill=HEADER_FILL)
+        date_end = min(4, max(2, total_cols - 4))
+        merge_write(ws, 2, 2, 2, date_end, today_text(), fill=LIGHT_FILL)
+        # 가운데 빈 구간도 양식 배경/테두리 유지
+        for c in range(date_end + 1, max(date_end + 1, total_cols - 2)):
+            write_cell(ws, 2, c, "", fill=LIGHT_FILL)
+        write_cell(ws, 2, total_cols - 2, "작성자", bold=True, fill=HEADER_FILL)
+        merge_write(ws, 2, total_cols - 1, 2, total_cols, author, fill=LIGHT_FILL)
+    else:
+        meta_pairs = [("작성일", today_text()), ("작성자", author)]
+        for idx, (lbl, val) in enumerate(meta_pairs):
+            col = idx * 3 + 1
+            if col > total_cols:
+                break
+            write_cell(ws, 2, col, lbl, bold=True, fill=HEADER_FILL)
+            merge_write(ws, 2, min(col + 1, total_cols), 2, min(col + 2, total_cols), val, fill=LIGHT_FILL)
 
     # ── 헤더 (2단) ──────────────────────────────────
     header_row = 3
@@ -187,9 +199,37 @@ def create_estimate_comparison_workbook(payload: Dict[str, Any]) -> Tuple[Workbo
         if row_fill:
             remark_cell.fill = row_fill
 
+    # 하단 빈 행 — 데이터 행과 동일한 테두리/높이 유지 (최소 5행, 최대 15행)
+    empty_row_count = max(5, 15 - len(rows))
+    for e_offset in range(empty_row_count):
+        er = data_start + len(rows) + e_offset
+        ws.row_dimensions[er].height = 18
+        row_fill = ALT_ROW_FILL if (len(rows) + e_offset) % 2 == 1 else None
+        for c_idx in range(1, total_cols + 1):
+            cell = ws.cell(er, c_idx, "")
+            cell.border = BORDER
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.font = Font(size=10)
+            if row_fill:
+                cell.fill = row_fill
+
     # 자동 필터 및 고정
     ws.auto_filter.ref = f"A{header_row + 1}:{get_column_letter(total_cols)}{data_start + len(rows) - 1}"
     ws.freeze_panes = ws.cell(data_start, 1)
+
+    # A4 Landscape 출력 설정
+    try:
+        from openpyxl.worksheet.page import PageMargins
+        ws.page_setup.paperSize = 9        # A4
+        ws.page_setup.orientation = "landscape"
+        ws.page_setup.fitToPage = True
+        ws.page_setup.fitToWidth = 1
+        ws.page_setup.fitToHeight = 0
+        ws.sheet_properties.pageSetPr.fitToPage = True
+        ws.page_margins = PageMargins(left=0.5, right=0.5, top=0.75, bottom=0.75)
+        ws.print_options.horizontalCentered = True
+    except Exception:
+        pass
 
     # 열 너비 최적화
     ws.column_dimensions["A"].width = 6   # NO

@@ -112,7 +112,7 @@ async function createExcelFile({ jobId, fileName, columns, rows, job = {}, autho
   };
 }
 
-async function createMappedTemplateExcel({ jobId, fileName, template, mappings, mappingJson = null, columns, rows, job, authorName, templateLayoutMode = 'COMPACT_VENDOR_GROUPS' }) {
+async function createMappedTemplateExcel({ jobId, fileName, template, mappings, mappingJson = null, columns, rows, job, authorName, templateLayoutMode = 'COMPACT_VENDOR_GROUPS', analysis = null }) {
   const safeName = sanitizeExcelName(fileName, `${template?.template_name || template?.templateName || '등록양식'}_${jobId}.xlsx`);
   const normalizedTemplate = template ? {
     ...template,
@@ -138,6 +138,7 @@ async function createMappedTemplateExcel({ jobId, fileName, template, mappings, 
     job: job || {},
     authorName,
     templateLayoutMode,
+    analysis: analysis || (job && job.analysis) || {},
   });
   if (!result?.file_path && !result?.filePath) throw new Error('AI 서버가 생성 엑셀 파일 경로를 반환하지 않았습니다.');
   return {
@@ -146,6 +147,7 @@ async function createMappedTemplateExcel({ jobId, fileName, template, mappings, 
     templateApplied: true,
     vendorCount: result.vendor_count || result.vendorCount || 0,
     templateKind: result.template_kind || result.templateKind || normalizedTemplate?.template_type || 'COMPANY_TEMPLATE',
+    preview: result.preview || null,
   };
 }
 

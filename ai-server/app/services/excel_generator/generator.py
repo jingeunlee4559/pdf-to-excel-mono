@@ -15,6 +15,7 @@ from .utils import (
 from .workbooks.design import create_design_workbook
 from .workbooks.template_mapped import create_mapped_template_workbook
 from .workbooks.narrative_report import create_narrative_report_workbook
+from ..excel_preview import build_excel_preview
 
 
 def save_workbook(wb: Workbook, file_name: Optional[str]) -> Dict[str, Any]:
@@ -44,6 +45,11 @@ def generate_excel(payload: Dict[str, Any]) -> Dict[str, Any]:
     else:
         wb, meta = create_design_workbook(payload)
     result = save_workbook(wb, payload.get("file_name"))
+    if mapped:
+        try:
+            result["preview"] = build_excel_preview(result["file_path"])
+        except Exception:
+            result["preview"] = None
     result.update({
         "template_kind": meta.get("template_kind"),
         "vendor_count": meta.get("vendor_count", 0),

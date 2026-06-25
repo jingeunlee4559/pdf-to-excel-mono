@@ -80,7 +80,7 @@ export function ProductPriceSurveyTemplatePreview({ table, issues, selectedTempl
                   <EditableTemplateCell key={`product-value-${rowIndex}-${vendorIndex}`} value={vendor.empty ? '' : getVendorPreviewValue(row, vendor, 'unit_price')} money onChange={(value) => !vendor.empty && updateCell?.(rowIndex, vendorEditKey(vendor, 'unit_price', vendorIndex), value)} disabled={disabled || vendor.empty} />
                 ))}
                 <TemplateCell>{formatMoney(getProductPriceAverage(row, visibleVendors))}</TemplateCell>
-                <EditableTemplateCell value={getSelectedVendorValue(row)} onChange={(value) => updateCell?.(rowIndex, 'selected_vendor', value)} disabled={disabled} />
+                <EditableTemplateCell value={getSelectedVendorValue(row, visibleVendors)} onChange={(value) => updateCell?.(rowIndex, 'selected_vendor', value)} disabled={disabled} />
                 <EditableTemplateCell align="left" value={pickRowValue(row, ['remark', 'note', 'memo', '비고'])} onChange={(value) => updateCell?.(rowIndex, 'remark', value)} disabled={disabled} />
               </tr>
             ))}

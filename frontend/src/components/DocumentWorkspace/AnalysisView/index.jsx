@@ -1,5 +1,5 @@
 import { Badge, Metric, InfoCard } from '../ui.jsx';
-import { isMultiVendorCompareTableType, tableTypeLabel, isTextVendorComparisonReportType } from '../utils.js';
+import { isMultiVendorCompareTableType, tableTypeLabel, isTextVendorComparisonReportType, toDisplayText } from '../utils.js';
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 const toNum = (v) => { const n = Number(String(v ?? '').replace(/[^0-9.-]/g, '')); return Number.isFinite(n) ? n : 0; };
@@ -232,12 +232,15 @@ function TypeSpecificDetail({ docTypeCode, analysis, table }) {
       <div className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-card xl:col-span-2">
         <h4 className="text-base font-black text-slate-950">보고서 섹션 요약</h4>
         <div className="mt-4 grid grid-cols-1 gap-3 lg:grid-cols-2">
-          {Object.entries(sectionLabels).map(([key, label]) => sections[key] ? (
-            <div key={key} className="rounded-2xl border border-brand-100 bg-brand-50 p-4">
-              <p className="text-xs font-black text-brand-600">{label}</p>
-              <p className="mt-1.5 text-sm leading-6 text-slate-700 line-clamp-4">{sections[key]}</p>
-            </div>
-          ) : null).filter(Boolean)}
+          {Object.entries(sectionLabels).map(([key, label]) => {
+            const content = toDisplayText(sections[key], '');
+            return content ? (
+              <div key={key} className="rounded-2xl border border-brand-100 bg-brand-50 p-4">
+                <p className="text-xs font-black text-brand-600">{label}</p>
+                <p className="mt-1.5 text-sm leading-6 text-slate-700 line-clamp-4">{content}</p>
+              </div>
+            ) : null;
+          }).filter(Boolean)}
         </div>
         {followUps.length > 0 && (
           <div className="mt-4">
@@ -245,7 +248,7 @@ function TypeSpecificDetail({ docTypeCode, analysis, table }) {
             {followUps.slice(0, 4).map((f, i) => (
               <div key={i} className="flex items-start gap-2 py-1.5 border-b border-slate-100 last:border-0">
                 <span className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-black ${f.priority === 'HIGH' ? 'bg-red-100 text-red-600' : f.priority === 'MEDIUM' ? 'bg-amber-100 text-amber-600' : 'bg-slate-100 text-slate-600'}`}>{f.priority || '일반'}</span>
-                <div className="min-w-0"><p className="text-xs font-black text-slate-800 truncate">{f.action}</p><p className="text-[10px] text-slate-400">{f.department} {f.due_date ? `/ ${f.due_date}` : ''}</p></div>
+                <div className="min-w-0"><p className="text-xs font-black text-slate-800 truncate">{toDisplayText(f.action, '')}</p><p className="text-[10px] text-slate-400">{toDisplayText(f.department, '')} {toDisplayText(f.due_date, '') ? `/ ${toDisplayText(f.due_date, '')}` : ''}</p></div>
               </div>
             ))}
           </div>

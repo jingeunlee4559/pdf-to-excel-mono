@@ -1,4 +1,4 @@
-import { formatMoney, cleanTableColumnLabel } from './utils.js';
+import { formatMoney, cleanTableColumnLabel, toDisplayText } from './utils.js';
 
 export function Select({ label, value, onChange, options, disabled, highlight }) {
   return (
@@ -67,8 +67,8 @@ export function Metric({ label, value, tone }) {
   const color = tone === 'blue' ? 'text-brand-700' : tone === 'amber' ? 'text-amber-700' : 'text-slate-950';
   return (
     <div className="rounded-3xl border border-slate-200 bg-white p-4 text-center">
-      <p className="text-xs font-black text-slate-400">{label}</p>
-      <p className={`mt-2 text-2xl font-black ${color}`}>{value}</p>
+      <p className="text-xs font-black text-slate-400">{toDisplayText(label, '')}</p>
+      <p className={`mt-2 text-2xl font-black ${color}`}>{toDisplayText(value, '')}</p>
     </div>
   );
 }
@@ -76,10 +76,10 @@ export function Metric({ label, value, tone }) {
 export function InfoCard({ icon, title, value, desc, warning }) {
   return (
     <div className={`rounded-3xl border p-4 ${warning ? 'border-amber-100 bg-amber-50' : 'border-slate-200 bg-slate-50'}`}>
-      <div className="flex h-10 w-10 items-center justify-center rounded-2xl bg-white text-lg">{icon}</div>
-      <p className={`mt-3 text-xs font-black ${warning ? 'text-amber-600' : 'text-slate-400'}`}>{title}</p>
-      <p className={`mt-1 text-base font-black ${warning ? 'text-amber-800' : 'text-slate-950'}`}>{value}</p>
-      <p className={`mt-1 text-sm leading-5 ${warning ? 'text-amber-700' : 'text-slate-500'}`}>{desc}</p>
+      <div className="flex h-10 w-10 items-center justify-center rounded-2xl bg-white text-lg">{toDisplayText(icon, '')}</div>
+      <p className={`mt-3 text-xs font-black ${warning ? 'text-amber-600' : 'text-slate-400'}`}>{toDisplayText(title, '')}</p>
+      <p className={`mt-1 text-base font-black ${warning ? 'text-amber-800' : 'text-slate-950'}`}>{toDisplayText(value, '')}</p>
+      <p className={`mt-1 text-sm leading-5 ${warning ? 'text-amber-700' : 'text-slate-500'}`}>{toDisplayText(desc, '')}</p>
     </div>
   );
 }
@@ -112,11 +112,12 @@ export function EditableTemplateCell({ value = '', onChange, className = '', col
 }
 
 export function ReportSection({ number, title, value, onChange, disabled, placeholder = '' }) {
+  const displayValue = toDisplayText(value, '');
   return (
     <div className="rounded-2xl border border-slate-200 bg-white p-4">
       <p className="text-sm font-black text-slate-900">{number}. {title}</p>
       <textarea
-        value={value || ''}
+        value={displayValue}
         onChange={(event) => onChange?.(event.target.value)}
         disabled={disabled}
         rows={4}

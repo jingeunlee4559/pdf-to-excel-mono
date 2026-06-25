@@ -31,6 +31,40 @@ export const toChatFile = (file) => ({
   lastModified: file.lastModified || 0
 });
 
+
+// ─── Safe display helpers ────────────────────────────────────────────────────
+
+export function toDisplayText(value, fallback = '') {
+  if (value === null || value === undefined) return fallback;
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => toDisplayText(item, ''))
+      .filter((item) => String(item || '').trim() !== '')
+      .join('\n');
+  }
+  if (typeof value === 'object') {
+    return Object.entries(value)
+      .map(([key, item]) => {
+        const rendered = toDisplayText(item, '');
+        return rendered ? `${key}: ${rendered}` : String(key);
+      })
+      .filter((item) => String(item || '').trim() !== '')
+      .join('\n');
+  }
+  return String(value);
+}
+
+export function escapeHtmlText(value) {
+  return toDisplayText(value, '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 // ─── Chat message helpers ─────────────────────────────────────────────────────
 
 export const welcomeMessage = () => ({
@@ -379,18 +413,44 @@ export function comparableCompanyName(name) {
 
 export function isIgnoredVendorLabel(label) {
   const normalized = normalizePreviewVendorLabel(label);
-  return /^(기준|표준|일반|최저|최고|차이|대비|요청|계산|산출|공급|세액|금액|단가)$/i.test(normalized)
+  return /^(기준|표준|일반|최저|최고|차이|대비|요청|계산|산출|공급|세액|금액|단가|업체명|회사명)$/i.test(normalized)
+    || /^[A-Z가-힣]?\s*업체\d*$/i.test(normalized)
+    || /^(?:vendor|company|target)[_\-]?\d+$/i.test(normalized)
     || /(기준|표준|일반|최저|최고|차이|대비|요청|계산|산출)\s*(단가|금액)?$/i.test(label || '');
 }
 
-export function inferPreviewVendors(table) {
+function readVendorName(vendor) {
+  if (!vendor) return '';
+  if (typeof vendor === 'string') return vendor;
+  return vendor.name || vendor.vendorName || vendor.vendor_name || vendor.label || '';
+}
+
+function asVendorArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+export function inferPreviewVendors(table = {}, options = {}) {
   const columns = table.columns || [];
   const rows = table.rows || [];
-  const metaVendors = Array.isArray(table.tableJson?.meta?.vendors) ? table.tableJson.meta.vendors : [];
+  const meta = table.tableJson?.meta || {};
+  const preview = options.generatedExcelPreview || table.generatedExcelPreview || table.previewModel || meta.editedPreviewModel || {};
+
+  // source 우선순위: 채팅 요청/선택 업체 → 문서 분석 vendors → generatedExcelPreview vendors → 컬럼/행 추론 → fallback
+  const sourceVendorGroups = [
+    asVendorArray(meta.selectedVendors),
+    asVendorArray(meta.selected_vendors),
+    asVendorArray(meta.requestedVendors),
+    asVendorArray(meta.requested_vendors),
+    asVendorArray(meta.vendors),
+    asVendorArray(meta.allVendors),
+    asVendorArray(preview.vendors),
+    asVendorArray(preview.meta?.vendors),
+  ];
+  const metaVendors = sourceVendorGroups.find((group) => group.length > 0) || [];
   const metaVendorByIndex = new Map();
   metaVendors.forEach((vendor, index) => {
     const actualIndex = Number.isFinite(Number(vendor?.index)) ? Number(vendor.index) : index;
-    const name = vendor?.name || vendor?.vendorName || vendor?.label || vendor;
+    const name = readVendorName(vendor);
     if (name) metaVendorByIndex.set(actualIndex, vendor);
   });
   const map = new Map();
@@ -404,7 +464,7 @@ export function inferPreviewVendors(table) {
   };
 
   metaVendors.forEach((vendor, index) => {
-    const name = vendor?.name || vendor?.vendorName || vendor?.label || vendor;
+    const name = readVendorName(vendor);
     put(name, {
       index,
       unitPriceKey: vendor?.unitPriceKey || vendor?.priceKey,
@@ -485,8 +545,17 @@ export function getVendorPreviewValue(row, vendor, key) {
   if (!row) return '';
   const priceMap = row.vendor_prices || row.vendorPrices || row.vendor_unit_prices || row.vendorUnitPrices;
   const amountMap = row.vendor_amounts || row.vendorAmounts;
+  const quantityMap = row.vendor_quantities || row.vendorQuantities || row.vendor_qty || row.vendorQty;
   if (key === 'spec') return row[vendor.specKey] || row.spec || '';
-  if (key === 'quantity') return row[vendor.quantityKey] || row.quantity || row.request_quantity || row.requested_quantity || '';
+  if (key === 'quantity') {
+    if (vendor.quantityKey && row[vendor.quantityKey] !== undefined && row[vendor.quantityKey] !== '') return row[vendor.quantityKey];
+    if (quantityMap && typeof quantityMap === 'object') {
+      if (quantityMap[vendor.name] !== undefined) return quantityMap[vendor.name];
+      const matched = Object.entries(quantityMap).find(([name]) => comparableCompanyName(name) === comparableCompanyName(vendor.name));
+      if (matched) return matched[1];
+    }
+    return row.quantity || row.request_quantity || row.requested_quantity || '';
+  }
   if (key === 'unit_price') {
     if (vendor.unitPriceKey && row[vendor.unitPriceKey] !== undefined && row[vendor.unitPriceKey] !== '') return row[vendor.unitPriceKey];
     if (priceMap && typeof priceMap === 'object') {
@@ -516,7 +585,9 @@ export function getVendorPreviewValue(row, vendor, key) {
 
 export function buildTemplateVendorSlots(vendors, layoutMode) {
   const cleanVendors = vendors.filter((vendor) => vendor?.name);
-  const minSlots = layoutMode === 'COMPACT_VENDOR_GROUPS' ? Math.max(cleanVendors.length, 1) : Math.max(cleanVendors.length, 3);
+  // 실제 업체명이 1개 이상 있으면 미사용 업체 슬롯은 만들지 않는다.
+  // A/B/C업체 fallback은 분석/요청/preview 업체명이 전혀 없을 때만 표시한다.
+  const minSlots = cleanVendors.length > 0 ? cleanVendors.length : (layoutMode === 'COMPACT_VENDOR_GROUPS' ? 1 : 3);
   const slots = [...cleanVendors];
   while (slots.length < minSlots) slots.push({ name: slots.length === 0 ? 'A업체' : `${String.fromCharCode(65 + slots.length)}업체`, empty: true });
   return slots;
@@ -666,17 +737,26 @@ export function getProductPriceAverage(row, vendors) {
   return Math.round(prices.reduce((sum, value) => sum + value, 0) / prices.length);
 }
 
-export function getSelectedVendorValue(row) {
-  return cleanTableColumnLabel(pickRowValue(row, [
+export function getSelectedVendorValue(row, vendors = []) {
+  const explicit = cleanTableColumnLabel(pickRowValue(row, [
     'selected_vendor',
     'selected_company',
     'chosen_vendor',
     'lowest_vendor',
+    'lowest_target',
     'best_vendor',
     'vendor_selection',
     '업체선정',
     '최저업체'
   ], ''));
+  if (explicit) return explicit;
+  const candidates = (Array.isArray(vendors) ? vendors : [])
+    .filter((vendor) => vendor && !vendor.empty)
+    .map((vendor) => ({ vendor, price: toPreviewNumber(getVendorPreviewValue(row, vendor, 'unit_price')) }))
+    .filter((item) => item.price > 0);
+  if (!candidates.length) return '';
+  candidates.sort((a, b) => a.price - b.price);
+  return cleanTableColumnLabel(candidates[0].vendor.name || '');
 }
 
 // ─── Design classification ────────────────────────────────────────────────────

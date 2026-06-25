@@ -625,16 +625,31 @@ function sanitizeKoreanAssistantText(value = '', fallback = '') {
 
 function isIgnoredVendorLabelForEdit(label = '') {
   const cleaned = normalizeVendorLabelForEdit(label);
-  return !cleaned || /^(기준|표준|일반|최저|최고|차이|대비|요청|계산|산출|공급|세액|금액|단가|업체\d+)$/.test(compactForSearch(cleaned));
+  const compact = compactForSearch(cleaned);
+  if (!cleaned || !compact) return true;
+  if (/^(기준|표준|일반|최저|최고|차이|대비|요청|계산|산출|공급|세액|금액|단가|업체\d+)$/.test(compact)) return true;
+  // 표 제목/헤더가 업체명으로 섞이는 경우 차단.
+  // 예: "5개 업체 단가 비교 (대분류 EA)", "최저 업체", "업체별 단가 비교표"
+  if (/(\d+\s*개\s*(업체|회사|개사)|업체\s*별|업체\s*단가|단가\s*비교|가격\s*비교|비교\s*견적|비교표|대분류|중분류|소분류|최저|최고|비고|작성자|작성일|견적일|규격|수량|단위|품명|품목|공종)/i.test(cleaned)) return true;
+  return false;
 }
 
 function getTableMetaVendors(table = {}) {
-  const metaVendors = Array.isArray(table?.tableJson?.meta?.vendors) ? table.tableJson.meta.vendors : [];
+  const meta = table?.tableJson?.meta && typeof table.tableJson.meta === 'object' ? table.tableJson.meta : {};
+  const metaVendors = Array.isArray(meta.selectedVendors) && meta.selectedVendors.length
+    ? meta.selectedVendors
+    : (Array.isArray(meta.selected_vendors) && meta.selected_vendors.length
+      ? meta.selected_vendors
+      : (Array.isArray(meta.vendors) ? meta.vendors : []));
+  const seen = new Set();
   return metaVendors
     .map((vendor, index) => {
-      const name = String(vendor?.name || vendor?.vendorName || vendor?.label || vendor || '').trim();
+      const name = normalizeVendorLabelForEdit(String(vendor?.name || vendor?.vendorName || vendor?.label || vendor || '').trim());
+      const key = compactForSearch(name);
       const actualIndex = Number.isFinite(Number(vendor?.index)) ? Number(vendor.index) : index;
-      return name ? { ...vendor, name, index: actualIndex, compareKey: compactForSearch(name) } : null;
+      if (!name || !key || seen.has(key) || isIgnoredVendorLabelForEdit(name)) return null;
+      seen.add(key);
+      return { ...vendor, name, index: actualIndex, compareKey: key };
     })
     .filter(Boolean);
 }
@@ -744,6 +759,207 @@ function parseNumberForEdit(value) {
 function formatNumberForEdit(value) {
   const num = parseNumberForEdit(value);
   return num ? String(Math.round(num)).replace(/\B(?=(\d{3})+(?!\d))/g, ',') : '';
+}
+
+
+function normalizeQuantityItemText(value = '') {
+  return compactForSearch(String(value || '')
+    .replace(/수량|개|EA|ea|으로|로|만|이거|이것|수정|변경|바꿔|해줘|해주세요/g, ''));
+}
+
+function getRowItemNameForQuantity(row = {}) {
+  return String(row.item_name || row.work_item_name || row.product_name || row.material_name || row.construction_name || '').trim();
+}
+
+function extractQuantityNumbersForEdit(message = '') {
+  const text = String(message || '');
+  const results = [];
+  const re = /(\d[\d,]*(?:\.\d+)?)\s*(개|EA|ea|㎡|m2|m²|㎥|m3|m³|톤|ton|kg|KG|대|명|식|시간|일|세트|SET)?/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const after = text.slice(m.index + m[0].length, m.index + m[0].length + 14);
+    const before = text.slice(Math.max(0, m.index - 10), m.index);
+    if (/^\s*(업체|회사|개사|파일|문서|페이지|행|컬럼|열)/.test(after)) continue;
+    if (/(업체|회사|개사|파일|문서|페이지|행|컬럼|열)\s*$/.test(before)) continue;
+    const value = String(m[1] || '').replace(/,/g, '');
+    if (!value) continue;
+    const num = Number(value);
+    if (!Number.isFinite(num) || num <= 0 || num > 1000000) continue;
+    results.push({ value: String(Number.isInteger(num) ? Math.trunc(num) : num), unit: m[2] || '', index: m.index });
+  }
+  return results;
+}
+
+function extractQuantityPlanForRows(message = '', rows = []) {
+  const text = String(message || '');
+  const quantityNumbers = extractQuantityNumbersForEdit(text);
+  if (!quantityNumbers.length || !Array.isArray(rows) || !rows.length) return null;
+
+  const itemNames = Array.from(new Set((rows || [])
+    .map(getRowItemNameForQuantity)
+    .filter(Boolean)))
+    .sort((a, b) => b.length - a.length);
+
+  const matchedItems = [];
+  const seenMatched = new Set();
+  for (const item of itemNames) {
+    const itemKey = normalizeQuantityItemText(item);
+    const core = normalizeQuantityItemText(item.replace(/\([^)]*\)/g, ''));
+    const compactMsg = normalizeQuantityItemText(text);
+    if ((itemKey && compactMsg.includes(itemKey)) || (core && core.length >= 2 && compactMsg.includes(core))) {
+      if (!seenMatched.has(item)) {
+        matchedItems.push(item);
+        seenMatched.add(item);
+      }
+    }
+  }
+
+  // "품목1, 품목2 각각 수량 40개, 50개" 형태는 가장 먼저 처리한다.
+  // 이 경우 첫 번째 수량이 바로 앞 품목에만 붙은 값이 아니라 품목 목록 전체의 순서값이다.
+  if (/각각\s*수량/.test(text) && matchedItems.length >= 2 && quantityNumbers.length >= 2) {
+    const orderedItems = matchedItems
+      .map((item) => {
+        const raw = text.indexOf(item);
+        const core = item.replace(/\([^)]*\)/g, '').trim();
+        const corePos = core ? text.indexOf(core) : -1;
+        return { item, pos: raw >= 0 ? raw : corePos };
+      })
+      .filter((x) => x.pos >= 0)
+      .sort((a, b) => a.pos - b.pos)
+      .map((x) => x.item);
+    const selectedItems = orderedItems.slice(-quantityNumbers.length);
+    const plan = new Map();
+    selectedItems.forEach((item, idx) => {
+      if (quantityNumbers[idx]) plan.set(item, quantityNumbers[idx]);
+    });
+    if (plan.size) return { mode: 'ITEMS', itemQuantities: plan };
+  }
+
+  const exactPlan = new Map();
+  for (const item of matchedItems) {
+    const itemKey = normalizeQuantityItemText(item);
+    const core = normalizeQuantityItemText(item.replace(/\([^)]*\)/g, ''));
+    const compactMsg = normalizeQuantityItemText(text);
+    let pos = itemKey ? compactMsg.indexOf(itemKey) : -1;
+    if (pos < 0 && core) pos = compactMsg.indexOf(core);
+    if (pos < 0) continue;
+
+    // 원문 기준 위치는 다를 수 있으므로, 해당 품목명이 포함된 구간 뒤쪽의 가장 가까운 수량을 사용한다.
+    const rawPos = Math.max(text.indexOf(item), text.indexOf(item.replace(/\([^)]*\)/g, '').trim()));
+    const afterCandidates = quantityNumbers.filter((q) => rawPos < 0 || q.index >= rawPos);
+    const beforeNextItemRaw = matchedItems
+      .map((other) => other === item ? -1 : text.indexOf(other))
+      .filter((idx) => idx >= 0 && (rawPos < 0 || idx > rawPos))
+      .sort((a, b) => a - b)[0];
+    const scoped = beforeNextItemRaw ? afterCandidates.filter((q) => q.index < beforeNextItemRaw) : afterCandidates;
+    if (scoped.length && /수량|개|EA|ea|으로|로|수정|변경|바꿔/.test(text.slice(Math.max(0, (rawPos < 0 ? 0 : rawPos)), scoped[0].index + 10))) {
+      exactPlan.set(item, scoped[0]);
+    }
+  }
+
+  if (exactPlan.size) return { mode: 'ITEMS', itemQuantities: exactPlan };
+
+  // "품목1, 품목2 각각 수량 40개, 50개" 형태: 명시된 품목 순서와 수량 순서를 매칭한다.
+  if (/각각/.test(text) && matchedItems.length >= 2 && quantityNumbers.length >= 2) {
+    const orderedItems = matchedItems
+      .map((item) => {
+        const raw = text.indexOf(item);
+        const core = item.replace(/\([^)]*\)/g, '').trim();
+        const corePos = core ? text.indexOf(core) : -1;
+        return { item, pos: raw >= 0 ? raw : corePos };
+      })
+      .filter((x) => x.pos >= 0)
+      .sort((a, b) => a.pos - b.pos)
+      .map((x) => x.item);
+    const selectedItems = orderedItems.slice(-quantityNumbers.length);
+    const plan = new Map();
+    selectedItems.forEach((item, idx) => {
+      if (quantityNumbers[idx]) plan.set(item, quantityNumbers[idx]);
+    });
+    if (plan.size) return { mode: 'ITEMS', itemQuantities: plan };
+  }
+
+  // 특정 품목 + 단일 수량: 해당 품목만 변경한다.
+  if (matchedItems.length && quantityNumbers.length === 1) {
+    const plan = new Map();
+    matchedItems.forEach((item) => plan.set(item, quantityNumbers[0]));
+    return { mode: 'ITEMS', itemQuantities: plan };
+  }
+
+  // 전체/각 수량: 모든 행 변경.
+  if (/전체|모두|전부|각\s*수량|각각\s*수량|각\s*\d/.test(text) || (!matchedItems.length && quantityNumbers.length === 1 && /수량/.test(text))) {
+    return { mode: 'ALL', quantity: quantityNumbers[0] };
+  }
+
+  return null;
+}
+
+function rowMatchesQuantityItem(row = {}, item = '') {
+  const rowName = getRowItemNameForQuantity(row);
+  const rowKey = normalizeQuantityItemText(rowName);
+  const itemKey = normalizeQuantityItemText(item);
+  const itemCore = normalizeQuantityItemText(String(item || '').replace(/\([^)]*\)/g, ''));
+  if (!rowKey || (!itemKey && !itemCore)) return false;
+  return (itemKey && (rowKey.includes(itemKey) || itemKey.includes(rowKey))) || (itemCore && itemCore.length >= 2 && rowKey.includes(itemCore));
+}
+
+function applyQuantityPlanToRows(rows = [], columns = [], plan = null) {
+  if (!plan) return { rows, changed: 0 };
+  let changed = 0;
+  let nextRows = (rows || []).map((row) => {
+    let q = null;
+    if (plan.mode === 'ALL') {
+      q = plan.quantity;
+    } else if (plan.mode === 'ITEMS') {
+      for (const [item, quantity] of plan.itemQuantities.entries()) {
+        if (rowMatchesQuantityItem(row, item)) {
+          q = quantity;
+          break;
+        }
+      }
+    }
+    if (!q?.value) return row;
+    changed += 1;
+    return { ...row, quantity: q.value, request_quantity: q.value, requested_quantity: q.value };
+  });
+  if (!changed) return { rows, changed: 0 };
+
+  // 수량 변경 후 업체별 금액과 최저 금액 재계산.
+  const vendors = inferVendorColumnsForEdit({ columns, rows: nextRows }, columns)
+    .filter((vendor) => vendor.unitPriceKey || vendor.priceKey || vendor.amountKey);
+  nextRows = nextRows.map((row) => {
+    const qty = parseNumberForEdit(row.quantity || row.request_quantity || row.requested_quantity);
+    if (!qty) return row;
+    const out = { ...row };
+    for (const vendor of vendors) {
+      const unitKey = vendor.unitPriceKey || vendor.priceKey;
+      const amountKey = vendor.amountKey;
+      const unitPrice = parseNumberForEdit(unitKey ? out[unitKey] : '');
+      if (amountKey && unitPrice) out[amountKey] = formatNumberForEdit(unitPrice * qty);
+    }
+    return out;
+  });
+  return { rows: recomputeLowestForRows(nextRows, columns), changed };
+}
+
+function patchTableRowsByUserRequest(table = {}, userRequest = '') {
+  const rows = Array.isArray(table.rows) ? table.rows : [];
+  const columns = Array.isArray(table.columns) ? table.columns : [];
+  const plan = extractQuantityPlanForRows(userRequest, rows);
+  if (!plan) return { table, changed: 0 };
+  const result = applyQuantityPlanToRows(rows, columns, plan);
+  if (!result.changed) return { table, changed: 0 };
+  const nextRaw = table.raw && typeof table.raw === 'object'
+    ? { ...table.raw, rows: result.rows, columns: columns }
+    : table.raw;
+  return {
+    table: {
+      ...table,
+      rows: result.rows,
+      raw: nextRaw,
+    },
+    changed: result.changed,
+  };
 }
 
 function recomputeLowestForRows(rows = [], columns = []) {
@@ -1259,6 +1475,24 @@ function detectTableEditCommand(message, table) {
   const tableType = table.tableType || table.table_type || '';
 
   const requestedQuantity = extractRequestedQuantityFromMessage(text);
+
+  // 수량 수정은 행 필터보다 먼저 처리한다.
+  // 예: "저압배전반(MDB)설치만 수량 50개로 수정"은 해당 행 수량만 바꾸고
+  // 진공차단기 등 기존 행을 삭제/필터링하면 안 된다.
+  const quantityPlan = extractQuantityPlanForRows(text, table.rows);
+  if (quantityPlan && /(수량|개|EA|ea|수정|변경|바꿔|고쳐|로|으로)/i.test(text)) {
+    const quantityResult = applyQuantityPlanToRows(table.rows, table.columns, quantityPlan);
+    if (quantityResult.changed) {
+      return {
+        type: quantityPlan.mode === 'ALL' ? 'APPLY_REQUESTED_QUANTITY' : 'APPLY_REQUESTED_QUANTITY_TO_MATCHED_ROWS',
+        requestedQuantity,
+        columns: ensureColumn(table.columns, 'quantity'),
+        rows: quantityResult.rows,
+        changedRows: quantityResult.changed,
+      };
+    }
+  }
+
   const filterEdit = extractRowFilterEdit(text, table);
   if (filterEdit) {
     let nextEdit = filterEdit;
@@ -1416,6 +1650,7 @@ function describeTableEdit(edit) {
   if (edit.type === 'NOOP_COLUMNS_ALREADY_VISIBLE') return `${edit.keys.map(labelOf).join(', ')} 컬럼은 이미 표에 표시되어 있습니다.`;
   if (edit.type === 'SORT_ROWS') return edit.sort === 'UNIT_PRICE_DESC' ? '단가 높은 순으로 표를 정렬했습니다.' : '단가 낮은 순으로 표를 정렬했습니다.';
   if (edit.type === 'APPLY_REQUESTED_QUANTITY') return `요청 수량 ${edit.requestedQuantity?.value || ''}${edit.requestedQuantity?.unit || ''}을 표와 등록양식 산출 기준에 반영했습니다.`;
+  if (edit.type === 'APPLY_REQUESTED_QUANTITY_TO_MATCHED_ROWS') return `요청한 품목 ${edit.changedRows || ''}행의 수량을 수정했고, 다른 품목 행은 유지했습니다.`;
   if (edit.type === 'REMOVE_VENDOR_COLUMNS') return `${(edit.vendorNames || []).join(', ')} 업체 컬럼을 제외하고 현재 표를 다시 구성했습니다.`;
   if (edit.type === 'RESTORE_VENDOR_COLUMNS') return `${(edit.vendorNames || []).join(', ')} 업체 컬럼을 다시 추가하고 최저 업체/금액을 재계산했습니다.`;
   if (edit.type === 'SELECT_VENDOR_COLUMNS') return `${(edit.vendorNames || []).join(', ')} 업체만 남기고 표를 다시 정리했습니다.`;
@@ -1483,12 +1718,48 @@ function validateAllTables(tables) {
 async function persistAnalysisResult({ jobId, sessionId, aiResult, userRequest, outputMode, templateId }) {
   const totalPages = (aiResult.files || []).reduce((sum, item) => sum + Number(item.pageCount || item.page_count || 0), 0);
   const totalChars = (aiResult.files || []).reduce((sum, item) => sum + String(item.extractedText || item.extracted_text || '').length, 0);
-  const aiTables = normalizeAiTables(aiResult);
+  let aiTables = normalizeAiTables(aiResult);
+
+  // 사용자 최초 요청의 품목별 수량을 DB 저장 전에 강제 반영한다.
+  // 프론트 화면에서만 수량을 고치면 엑셀 미리보기/다운로드가 다시 원래 수량으로 돌아가는 문제가 생긴다.
+  let quantityPatchCount = 0;
+  aiTables = aiTables.map((tableItem) => {
+    const patched = patchTableRowsByUserRequest(tableItem, userRequest || '');
+    quantityPatchCount += patched.changed || 0;
+    return patched.table;
+  });
+
+  // 사용자가 업체명을 직접 지정한 경우, 원문/AI가 잡은 추가 업체 컬럼을 제외하고 요청 업체만 남긴다.
+  // 예: "한국전기, 대한전기설비, 전기기술, 스마트일렉 4개 업체" 요청인데
+  // 원문에 다른 업체나 "5개 업체 단가 비교" 같은 헤더가 섞이는 것을 방지한다.
+  aiTables = aiTables.map((tableItem) => {
+    try {
+      const selected = extractVendorSelectEdit(userRequest || '', {
+        ...tableItem,
+        tableJson: tableItem.raw || {},
+      }, tableItem.rows, tableItem.columns);
+      if (selected && Array.isArray(selected.columns) && selected.columns.length && Array.isArray(selected.rows)) {
+        return {
+          ...tableItem,
+          columns: selected.columns,
+          rows: selected.rows,
+          raw: {
+            ...(tableItem.raw || {}),
+            columns: selected.columns,
+            rows: selected.rows,
+            meta: { ...((tableItem.raw || {}).meta || {}), ...((selected.tableJson || {}).meta || {}) },
+          },
+        };
+      }
+    } catch (_) {}
+    return tableItem;
+  });
+
   const totalRows = aiTables.reduce((sum, table) => sum + Number((table.rows || []).length), 0);
   const table = aiTables[0];
   const validatedIssues = [...(aiResult.issues || []), ...validateAllTables(aiTables)];
 
-  console.info(`[DOC_JOB][AI_DONE] jobId=${jobId} files=${(aiResult.files || []).length} pages=${totalPages} chars=${totalChars} tables=${aiTables.length} rows=${totalRows} issues=${validatedIssues.length} ocrUsed=${Boolean(aiResult.parseMetrics?.ocrUsed)} model=${aiResult.model || 'unknown'}`);
+  console.info(`[DOC_JOB][AI_DONE] jobId=${jobId} files=${(aiResult.files || []).length} pages=${totalPages} chars=${totalChars} tables=${aiTables.length} rows=${totalRows} quantityPatched=${quantityPatchCount} issues=${validatedIssues.length} ocrUsed=${Boolean(aiResult.parseMetrics?.ocrUsed)} model=${aiResult.model || 'unknown'}`);
 
   const conn = await pool.getConnection();
   try {
@@ -1820,6 +2091,9 @@ const updateTable = asyncHandler(async (req, res) => {
 
   const rows = req.body.rows || [];
   const columns = req.body.columns || table.columns || defaultColumns;
+  const bodyTableJson = (req.body.tableJson && typeof req.body.tableJson === 'object')
+    ? req.body.tableJson
+    : ((req.body.table_json && typeof req.body.table_json === 'object') ? req.body.table_json : {});
   const issues = validateTable({ columns, rows, tableType: table.tableType });
   await saveCandidateFieldsForTable({ jobId: job.id, tableId: table.id, columns, rows, editedBy: req.user.id });
   try {
@@ -1836,12 +2110,15 @@ const updateTable = asyncHandler(async (req, res) => {
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
+    const previousTableJson = table.tableJson && typeof table.tableJson === 'object' ? table.tableJson : {};
     const nextTableJson = {
-      ...(table.tableJson || {}),
+      ...previousTableJson,
+      ...bodyTableJson,
       columns,
       rows,
       meta: {
-        ...((table.tableJson || {}).meta || {}),
+        ...(previousTableJson.meta || {}),
+        ...((bodyTableJson || {}).meta || {}),
       },
     };
     await conn.query(`UPDATE extracted_tables SET columns_json = ?, rows_json = ?, table_json = ?, row_count = ?, status = 'MODIFIED' WHERE id = ?`, [JSON.stringify(columns), JSON.stringify(rows), JSON.stringify(nextTableJson), rows.length, table.id]);
@@ -1916,7 +2193,8 @@ async function generateExcelForJob({ job, tableId, fileName, outputMode = null, 
       rows: table.rows,
       job: { ...job, tables: [table] },
       authorName,
-      templateLayoutMode: templateLayoutMode || 'COMPACT_VENDOR_GROUPS'
+      templateLayoutMode: templateLayoutMode || 'COMPACT_VENDOR_GROUPS',
+      analysis: job.analysis || {},
     });
   } else {
     excel = await createExcelFile({ jobId: job.id, fileName, columns: table.columns, rows: table.rows, job: { ...job, tables: [table] }, authorName, mappingJson: design || {}, designId, analysis: job.analysis || {} });
@@ -1932,7 +2210,7 @@ async function generateExcelForJob({ job, tableId, fileName, outputMode = null, 
   let excelPreview = null;
   try {
     const { getExcelPreview } = require('../services/aiServerService');
-    const previewResult = await getExcelPreview({ filePath: excel.filePath, maxRows: 80, maxCols: 26 });
+    const previewResult = await getExcelPreview({ filePath: excel.filePath, maxRows: 80, maxCols: 80 });
     // ai-server는 { preview: { rows, columns, ... } } 중첩 구조로 반환
     const previewData = previewResult?.preview || previewResult;
     if (previewData && Array.isArray(previewData.rows) && previewData.rows.length > 0) {
@@ -2043,7 +2321,7 @@ const previewExcel = asyncHandler(async (req, res) => {
   const [[excel]] = await pool.query('SELECT * FROM generated_excels WHERE id = ? AND job_id = ?', [req.params.excelId, req.params.id]);
   if (!excel || !excel.file_path) return res.status(404).json({ message: '엑셀 파일 정보가 없습니다.' });
   const { getExcelPreview } = require('../services/aiServerService');
-  const previewResult = await getExcelPreview({ filePath: excel.file_path, maxRows: 80, maxCols: 26 });
+  const previewResult = await getExcelPreview({ filePath: excel.file_path, maxRows: 80, maxCols: 80 });
   const preview = previewResult?.preview || previewResult;
   res.json({ preview });
 });
@@ -2067,7 +2345,7 @@ const generateExcelPreviewOnly = asyncHandler(async (req, res) => {
     const templateId = normalizeTemplateId(req.body.templateId || req.body.template_id);
     if (templateId) {
       const { template, mappings, mappingJson } = await loadTemplateWithMappings(templateId);
-      excelFile = await createMappedTemplateExcel({ jobId: job.id, fileName: 'preview_temp.xlsx', template, mappings, mappingJson, columns: table.columns, rows: table.rows, job: { ...job, tables: [table] }, authorName, templateLayoutMode: req.body.templateLayoutMode || 'COMPACT_VENDOR_GROUPS' });
+      excelFile = await createMappedTemplateExcel({ jobId: job.id, fileName: 'preview_temp.xlsx', template, mappings, mappingJson, columns: table.columns, rows: table.rows, job: { ...job, tables: [table] }, authorName, templateLayoutMode: req.body.templateLayoutMode || 'COMPACT_VENDOR_GROUPS', analysis: job.analysis || {} });
     }
   }
   if (!excelFile) {
@@ -2075,7 +2353,8 @@ const generateExcelPreviewOnly = asyncHandler(async (req, res) => {
   }
 
   const { getExcelPreview } = require('../services/aiServerService');
-  const preview = await getExcelPreview({ filePath: excelFile.filePath, maxRows: 80, maxCols: 26 });
+  const previewResult = await getExcelPreview({ filePath: excelFile.filePath, maxRows: 80, maxCols: 80 });
+  const preview = previewResult?.preview || previewResult;
   res.json({ preview });
 });
 

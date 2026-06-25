@@ -133,6 +133,139 @@ _FORMAT_THEMES = {
 }
 
 
+def _clean_inline_vendor_name(value: str) -> str:
+    text = str(value or "").strip()
+    text = re.sub(r'^(각각|각|기준으로|대상으로)\s*', '', text)
+    text = re.sub(r'\s*(이|가)?\s*\d+\s*개\s*(업체|회사|개사).*$', '', text)
+    text = re.sub(r'\s*(업체|회사)$', '', text)
+    text = text.strip(' ,·ㆍ/\t\r\n')
+    if re.search(r'업체\s*단가\s*비교|단가\s*비교|비교표|대분류|중분류|소분류|최저|최고|비고', text):
+        return ''
+    return text
+
+def _parse_vendor_table_request(message: str) -> Optional[Dict[str, Any]]:
+    """
+    업체/품목/수량을 명시한 단가 비교표 생성 요청을 파싱한다.
+
+    지원 형식:
+      A) "item1 수량 40개, item2 수량 50개" — 품목별 수량 개별 명시
+      B) "item1, item2 각각 수량 40개, 50개" — 품목 목록 후 수량 나열
+      C) "item1, item2 수량 40개" — 전체 동일 수량
+
+    업체명은 "업체" 키워드 앞 콤마 구분 목록에서 추출한다.
+    파싱 실패 시 None 반환.
+    """
+    text = message.strip()
+
+    # ── 업체명 추출 ─────────────────────────────────────────────────
+    vendor_match = re.search(
+        r'([가-힣A-Za-z0-9㈜\(\)\s]+(?:\s*,\s*[가-힣A-Za-z0-9㈜\(\)\s]+)+)'
+        r'\s*(?:이?\s*\d+\s*개?\s*업체|업체)',
+        text,
+    )
+    if not vendor_match:
+        return None
+    vendors_raw = vendor_match.group(1)
+    vendors = []
+    seen_vendor_keys = set()
+    for raw_vendor in re.split(r'\s*,\s*', vendors_raw):
+        cleaned_vendor = _clean_inline_vendor_name(raw_vendor)
+        key = re.sub(r'[\s㈜()（）주식회사._,·ㆍ-]+', '', cleaned_vendor).lower()
+        if cleaned_vendor and key and key not in seen_vendor_keys:
+            vendors.append(cleaned_vendor)
+            seen_vendor_keys.add(key)
+    if not vendors:
+        return None
+
+    remainder = text[vendor_match.end():]
+
+    # 업체 수 숫자 (예: "2개업체" → {2}) — 수량 필터링에 사용
+    vendor_count_nums = re.findall(r'(\d+)\s*개\s*업체', text)
+    vendor_count_set = {int(n) for n in vendor_count_nums}
+
+    items: List[str] = []
+    quantities: List[Optional[int]] = []
+
+    # ── 방법 A: "품목 수량 N개" 패턴 — 공백 없는 품목명 한정 ────────────
+    # 예) "진공차단기(VCB)설치 수량 40개 , 저압배전반(MDB)설치 수량 50개"
+    # 주의: 품목명 그룹에 공백을 허용하면 "수량"이 먹혀 매칭 실패함 → 공백 불허
+    per_item_pairs = re.findall(
+        r'([가-힣A-Za-z0-9\(\)（）\/]+)'   # 공백 없는 품목명
+        r'\s+수량\s+(\d+)\s*개',
+        remainder,
+    )
+    # "2개" 같은 숫자만 있는 항목 제거
+    per_item_pairs = [(n, q) for n, q in per_item_pairs if re.search(r'[가-힣]', n)]
+    if len(per_item_pairs) >= 2:
+        for name, qty in per_item_pairs:
+            items.append(name.strip())
+            quantities.append(int(qty))
+
+    # ── 방법 B/C: 품목 목록 + 수량 나열 ──────────────────────────────
+    if not items:
+        item_block_match = re.search(
+            r'([가-힣A-Za-z0-9\(\)\s\/]+(?:\s*,\s*[가-힣A-Za-z0-9\(\)\s\/]+)+)'
+            r'(?=\s*(?:각각|수량|\d+개))',
+            remainder,
+        )
+        if not item_block_match:
+            return None
+        items = [i.strip() for i in re.split(r'\s*,\s*', item_block_match.group(1)) if i.strip()]
+        if not items:
+            return None
+
+        # 수량 숫자 추출 (업체 수 제외)
+        qty_nums = re.findall(r'(\d+)\s*개', remainder)
+        raw_qtys = [int(q) for q in qty_nums if 0 < int(q) < 10000 and int(q) not in vendor_count_set]
+
+        if len(raw_qtys) == 1:
+            quantities = [raw_qtys[0]] * len(items)
+        else:
+            quantities = raw_qtys[: len(items)]
+            while len(quantities) < len(items):
+                quantities.append(None)
+
+    # ── 컬럼 빌드 ──────────────────────────────────────────────────
+    columns = [
+        {"key": "row_no", "label": "NO", "dataType": "number", "width": 50},
+        {"key": "item_name", "label": "품명", "dataType": "text", "width": 180},
+        {"key": "spec", "label": "규격", "dataType": "text", "width": 120},
+        {"key": "quantity", "label": "수량", "dataType": "number", "width": 70},
+        {"key": "unit", "label": "단위", "dataType": "text", "width": 60},
+    ]
+    meta_vendors = []
+    for vi, vname in enumerate(vendors):
+        price_key = f"vendor_{vi + 1}_unit_price"
+        amount_key = f"vendor_{vi + 1}_amount"
+        columns.append({"key": price_key, "label": f"{vname} 단가", "dataType": "number", "width": 100})
+        columns.append({"key": amount_key, "label": f"{vname} 금액", "dataType": "number", "width": 110})
+        meta_vendors.append({"name": vname, "index": vi, "unitPriceKey": price_key, "amountKey": amount_key})
+
+    # ── 행 빌드 (품목별 수량 개별 적용) ────────────────────────────
+    rows = []
+    for ri, item in enumerate(items):
+        row: Dict[str, Any] = {
+            "row_no": ri + 1,
+            "item_name": item,
+            "spec": "",
+            "quantity": quantities[ri],  # None이면 빈칸으로 표시됨
+            "unit": "식",
+        }
+        for vi, vname in enumerate(vendors):
+            row[f"vendor_{vi + 1}_unit_price"] = None
+            row[f"vendor_{vi + 1}_amount"] = None
+        rows.append(row)
+
+    return {
+        "tableType": "MULTI_VENDOR_PRICE_COMPARISON",
+        "tableName": "업체별 단가 비교표",
+        "columns": columns,
+        "rows": rows,
+        "tableJson": {"meta": {"vendors": meta_vendors}},
+        "theme": _FORMAT_THEMES.get("VENDOR_COMPARISON", {}),
+    }
+
+
 def _detect_intent(message: str) -> str:
     text = (message or "").strip().lower()
     original = (message or "").strip()
@@ -238,6 +371,27 @@ def _fallback_answer(message: str, context: Optional[Dict[str, Any]] = None, llm
             "newTable": new_table,
             "quickReplies": ["엑셀 다운로드", "다른 양식으로", "원래 형식으로"],
         }
+
+    # ── 인라인 테이블 생성 (파일 없이 업체/품목/수량 직접 지정) ────────────────
+    if intent in {"TABLE_CREATE", "PRICE_COMPARE", "FORMAT_REQUEST", "GENERAL"}:
+        inline_table = _parse_vendor_table_request(msg)
+        if inline_table:
+            vendor_count = len((inline_table.get("tableJson") or {}).get("meta", {}).get("vendors") or [])
+            item_count = len(inline_table.get("rows") or [])
+            return {
+                **base,
+                "answer": (
+                    f"업체 {vendor_count}개, 품목 {item_count}개 기준으로 단가 비교표를 생성했습니다. "
+                    "단가와 금액을 직접 입력하거나, 견적 파일을 첨부하면 자동으로 채워집니다."
+                ),
+                "intent": "TABLE_CREATE",
+                "needsFile": False,
+                "action": "GENERATE_EXCEL",
+                "targetFormat": "VENDOR_COMPARISON",
+                "recommendedTab": "excel",
+                "newTable": inline_table,
+                "quickReplies": ["파일 첨부해서 단가 채우기", "엑셀 다운로드", "업체/품목 변경"],
+            }
 
     if intent in {"GREETING", "SELF_INTRO"}:
         answer = (
@@ -405,6 +559,81 @@ def _guard_bad_repeated_answer(result: Dict[str, Any], message: str, context: Op
     return result
 
 
+def _try_patch_quantity(
+    message: str,
+    existing_rows: List[Dict[str, Any]],
+    table: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """
+    "저압배전반만 수량 50개로 고쳐줘" 같은 요청을 파싱해서
+    전체 행을 유지하되 해당 품목의 quantity만 변경한다.
+    변경이 없으면 None 반환.
+
+    품목 매칭: 기존 행의 item_name이 메시지 안에 직접 포함되는지 비교.
+    "설치" 같은 공통 단어 추출 대신 item_name 전체를 역방향으로 검색한다.
+    """
+    # 수량 숫자 추출
+    qty_m = re.search(r'수량\s*(\d+)\s*개?|(\d+)\s*개(?:로|으로)', message)
+    if not qty_m:
+        return None
+    new_qty = int(qty_m.group(1) or qty_m.group(2))
+
+    # "전체", "모두" → 모든 행 변경
+    all_pattern = bool(re.search(r'전체|모두|모든\s*(?:항목|품목)|다\s*(?:수량|바꿔|변경)', message))
+
+    # 기존 행의 item_name이 메시지에 직접 등장하는지 체크
+    matched_indices: List[int] = []
+    if not all_pattern:
+        for i, row in enumerate(existing_rows):
+            item_name = str(
+                row.get("item_name") or row.get("work_item_name") or
+                row.get("product_name") or row.get("material_name") or ""
+            ).strip()
+            # 전략1: item_name 전체가 메시지에 있으면 매칭
+            if item_name and item_name in message:
+                matched_indices.append(i)
+                continue
+            # 전략2: 괄호 코드 제거한 핵심 명칭이 메시지에 있으면 매칭
+            core = re.sub(r'\([^)]*\)', '', item_name).strip()
+            if core and len(core) >= 3 and core in message:
+                matched_indices.append(i)
+            # 전략3(제거됨): 공통 단어("설치" 등)가 매칭되어 전체 행 변경되는 문제 방지
+
+    # 매칭된 품목 없음 → LLM에게 위임 (패치 안 함)
+    if not matched_indices and not all_pattern:
+        return None
+
+    patched_rows = []
+    changed = 0
+    for i, row in enumerate(existing_rows):
+        if all_pattern or (i in matched_indices):
+            patched_rows.append({**row, "quantity": new_qty})
+            changed += 1
+        else:
+            patched_rows.append(row)
+
+    if changed == 0:
+        return None
+
+    if all_pattern:
+        scope = f"전체 {changed}개 품목"
+    else:
+        first_name = str(existing_rows[matched_indices[0]].get("item_name") or "")
+        scope = f"'{first_name}' 포함 {changed}행"
+
+    return {
+        "changed": changed,
+        "answer": f"{scope}의 수량을 {new_qty}개로 변경했습니다. 전체 {len(patched_rows)}행이 유지됩니다.",
+        "table": {
+            "tableType": table.get("tableType") or "MULTI_VENDOR_PRICE_COMPARISON",
+            "tableName": table.get("tableName") or "업체별 단가 비교표",
+            "columns": table.get("columns") or [],
+            "rows": patched_rows,
+            "tableJson": table.get("tableJson") or {},
+        },
+    }
+
+
 async def answer_chat(message: str, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     msg = (message or "").strip()
     if not msg:
@@ -415,7 +644,8 @@ async def answer_chat(message: str, context: Optional[Dict[str, Any]] = None) ->
     doc_analysis = ctx.get("analysis") or {}
     doc_type = doc_analysis.get("documentType") or doc_analysis.get("document_type") or ""
     table = ctx.get("table") or {}
-    row_count = len(table.get("rows") or [])
+    existing_rows = table.get("rows") or []
+    row_count = len(existing_rows)
     file_profiles = doc_analysis.get("fileProfiles") or []
     file_names = [fp.get("fileName", "") for fp in file_profiles if fp.get("fileName")]
 
@@ -429,6 +659,51 @@ async def answer_chat(message: str, context: Optional[Dict[str, Any]] = None) ->
     else:
         logger.info("[채팅 문서 컨텍스트 없음] 질문=%s", msg[:80])
 
+    # ── 룰 기반 처리 (LLM보다 먼저) ──────────────────────────────────────────
+
+    # 1) 인라인 비교표 생성: 업체/품목/수량을 명시한 경우 → LLM 없이 바로 생성
+    inline_table = _parse_vendor_table_request(msg)
+    if inline_table:
+        vendor_count = len((inline_table.get("tableJson") or {}).get("meta", {}).get("vendors") or [])
+        item_count = len(inline_table.get("rows") or [])
+        logger.info("[인라인 테이블 생성] 업체=%d 품목=%d", vendor_count, item_count)
+        return {
+            "llmUsed": False,
+            "llmFallback": False,
+            "model": "rule-inline-table",
+            "newTable": inline_table,
+            "answer": (
+                f"업체 {vendor_count}개, 품목 {item_count}개 기준으로 단가 비교표를 생성했습니다. "
+                "단가·금액을 직접 입력하거나 파일을 첨부하면 자동으로 채워집니다."
+            ),
+            "intent": "TABLE_CREATE",
+            "needsFile": False,
+            "action": "GENERATE_EXCEL",
+            "targetFormat": "VENDOR_COMPARISON",
+            "recommendedTab": "excel",
+            "quickReplies": ["파일 첨부해서 단가 채우기", "엑셀 다운로드", "수량 변경"],
+        }
+
+    # 2) 특정 품목 수량 patch: 기존 행 유지하며 해당 품목만 수량 변경
+    if existing_rows:
+        patched = _try_patch_quantity(msg, existing_rows, table)
+        if patched:
+            logger.info("[수량 patch 적용] 변경 행=%d / 전체=%d", patched["changed"], len(existing_rows))
+            return {
+                "llmUsed": False,
+                "llmFallback": False,
+                "model": "rule-qty-patch",
+                "newTable": patched["table"],
+                "answer": patched["answer"],
+                "intent": "TABLE_CREATE",
+                "needsFile": False,
+                "action": "GENERATE_EXCEL",
+                "targetFormat": "VENDOR_COMPARISON",
+                "recommendedTab": "excel",
+                "quickReplies": ["엑셀 다운로드", "다른 품목 수량 변경", "업체 추가"],
+            }
+
+    # ── LLM 처리 ──────────────────────────────────────────────────────────────
     if not _chat_llm_enabled():
         return _fallback_answer(msg, context, "CHAT_LLM_ENABLED=false")
 
@@ -443,12 +718,10 @@ async def answer_chat(message: str, context: Optional[Dict[str, Any]] = None) ->
         if not answer:
             raise RuntimeError("LLM 응답 JSON에 answer가 없습니다.")
 
-        # newTable 처리: FORMAT_REQUEST 시 LLM이 반환한 newTable 또는 룰 기반 생성
         new_table = result.get("newTable") or None
         intent = result.get("intent") or _detect_intent(msg)
         target_format = result.get("targetFormat") or None
         if intent == "FORMAT_REQUEST" and not new_table and has_doc and target_format:
-            existing_rows = (table.get("rows") or [])
             new_table = _build_new_table_for_format(target_format, existing_rows)
 
         chat_result = {

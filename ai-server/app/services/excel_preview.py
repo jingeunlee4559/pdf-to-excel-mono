@@ -165,18 +165,23 @@ def build_excel_preview(file_path: str, sheet_name: str | None = None, max_rows:
     if target.suffix.lower() not in {".xlsx", ".xlsm"}:
         raise ValueError("엑셀 미리보기는 xlsx, xlsm 파일만 지원합니다.")
 
-    wb = load_workbook(target, read_only=False, data_only=False)
+    wb = load_workbook(target, read_only=False, data_only=True)
     ws = wb[sheet_name] if sheet_name and sheet_name in wb.sheetnames else wb.active
 
     max_row = min(ws.max_row or 1, max_rows)
     max_col = min(ws.max_column or 1, max_cols)
 
     columns = []
+    hidden_columns: set[int] = set()
     for col_idx in range(1, max_col + 1):
         letter = get_column_letter(col_idx)
         width = ws.column_dimensions[letter].width or 10
         hidden = bool(ws.column_dimensions[letter].hidden)
-        columns.append({"index": col_idx, "letter": letter, "widthPx": max(48, int(width * 7)), "hidden": hidden})
+        if hidden:
+            hidden_columns.add(col_idx)
+        # 숨김 컬럼을 최소 48px로 다시 키우면 브라우저 미리보기에서
+        # 업체 5 같은 빈 업체 슬롯이 되살아난다. 숨김 컬럼은 0px로 전달한다.
+        columns.append({"index": col_idx, "letter": letter, "widthPx": 0 if hidden else max(48, int(width * 7)), "hidden": hidden})
 
     merge_masters, merge_hidden, merged_ranges = _build_merge_maps(ws, max_row, max_col)
 
@@ -199,6 +204,7 @@ def build_excel_preview(file_path: str, sheet_name: str | None = None, max_rows:
                         "text": "",
                         "value": "",
                         "isMergedHidden": True,
+                        "isColumnHidden": col_idx in hidden_columns,
                         "masterAddress": master_address,
                     }
                 )
@@ -218,10 +224,11 @@ def build_excel_preview(file_path: str, sheet_name: str | None = None, max_rows:
                     "row": row_idx,
                     "columnIndex": col_idx,
                     "columnLetter": get_column_letter(col_idx),
-                    "value": _cell_value(cell.value),
-                    "text": _cell_value(cell.value),
+                    "value": "" if col_idx in hidden_columns else _cell_value(cell.value),
+                    "text": "" if col_idx in hidden_columns else _cell_value(cell.value),
                     "isMerged": bool(merge_info),
                     "isMergedHidden": False,
+                    "isColumnHidden": col_idx in hidden_columns,
                     "rowSpan": merge_info["rowSpan"] if merge_info else 1,
                     "colSpan": merge_info["colSpan"] if merge_info else 1,
                     "mergedRange": merge_info["range"] if merge_info else None,

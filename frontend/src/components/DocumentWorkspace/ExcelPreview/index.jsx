@@ -14,7 +14,7 @@ import { DesignMeetingPreview } from '../DesignPreviews/DesignMeetingPreview.jsx
 import { DesignOfficialLetterPreview } from '../DesignPreviews/DesignOfficialLetterPreview.jsx';
 import { DesignReportPreview } from '../DesignPreviews/DesignReportPreview.jsx';
 
-export function ExcelPreview({ table, issues = [], outputMode, selectedTemplate, selectedDesign, writerName, templateLayoutMode, templatePreview = null, templatePreviewLoading = false, templatePreviewError = '', updateCell, addRow, removeRow, addColumn, removeColumn, updateColumnLabel, saveTable, disabled, candidateFields = [], onCandidateAction, generatedExcelPreview = null, analysis = {}, onPreviewCellEdit, onRemovePreviewRow, onRemovePreviewColumn, onMergePreview, onSplitPreview, onRefreshPreview }) {
+export function ExcelPreview({ table, issues = [], outputMode, selectedTemplate, selectedDesign, writerName, templateLayoutMode, templatePreview = null, templatePreviewLoading = false, templatePreviewError = '', updateCell, addRow, removeRow, addColumn, removeColumn, updateColumnLabel, saveTable, disabled, candidateFields = [], onCandidateAction, generatedExcelPreview = null, analysis = {}, onPreviewCellEdit, onRemovePreviewRow, onRemovePreviewColumn, onMergePreview, onSplitPreview, onRefreshPreview, onColumnWidthChange, onRowHeightChange, selectedPreviewColumn = '', onSelectedPreviewColumnChange }) {
   const isRegisteredTemplate = outputMode === 'COMPANY_TEMPLATE' && selectedTemplate;
   const activeDesign = !isRegisteredTemplate ? selectedDesign : null;
   const tableType = String(table?.tableType || table?.table_type || '');
@@ -99,6 +99,10 @@ export function ExcelPreview({ table, issues = [], outputMode, selectedTemplate,
               onRemoveColumn={onRemovePreviewColumn}
               onMergePreview={onMergePreview}
               onSplitPreview={onSplitPreview}
+              onColumnWidthChange={onColumnWidthChange}
+              onRowHeightChange={onRowHeightChange}
+              selectedPreviewColumn={selectedPreviewColumn}
+              onSelectedPreviewColumnChange={onSelectedPreviewColumnChange}
             />
           </div>
         </div>
@@ -116,7 +120,8 @@ export function ExcelPreview({ table, issues = [], outputMode, selectedTemplate,
             </div>
           )}
           {isRegisteredTemplate ? (
-            <CompanyTemplatePreview table={table} issues={issues} selectedTemplate={selectedTemplate} writerName={writerName} templateLayoutMode={templateLayoutMode} templatePreview={templatePreview} templatePreviewLoading={templatePreviewLoading} templatePreviewError={templatePreviewError} updateCell={updateCell} removeRow={removeRow} disabled={disabled} />
+            <CompanyTemplatePreview table={table} issues={issues} selectedTemplate={selectedTemplate} writerName={writerName} templateLayoutMode={templateLayoutMode} templatePreview={templatePreview}
+          generatedExcelPreview={generatedExcelPreview} templatePreviewLoading={templatePreviewLoading} templatePreviewError={templatePreviewError} updateCell={updateCell} removeRow={removeRow} disabled={disabled} />
           ) : activeDesign ? (
             <DesignCandidatePreview table={table} issues={issues} design={activeDesign} writerName={writerName} updateCell={updateCell} removeRow={removeRow} disabled={disabled} updateColumnLabel={updateColumnLabel} removeColumn={removeColumn} />
           ) : renderFallbackPreview()}

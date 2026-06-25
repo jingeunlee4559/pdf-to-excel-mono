@@ -78,7 +78,7 @@ async function designTemplateWithAiServer({ userRequest, analysis, columns, rows
   }, Number(process.env.AI_TEMPLATE_DESIGN_TIMEOUT_MS || 120000));
 }
 
-async function getExcelPreview({ filePath, sheetName, maxRows = 80, maxCols = 26 }) {
+async function getExcelPreview({ filePath, sheetName, maxRows = 80, maxCols = 80 }) {
   const { data } = await axios.post(
     `${aiBaseUrl()}/api/excel/preview`,
     { file_path: filePath, sheet_name: sheetName || null, max_rows: maxRows, max_cols: maxCols },

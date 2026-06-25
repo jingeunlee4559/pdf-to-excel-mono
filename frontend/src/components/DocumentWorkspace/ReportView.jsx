@@ -1,3 +1,5 @@
+import { toDisplayText, escapeHtmlText } from './utils.js';
+
 const SECTION_LABELS = {
   overview: '문서 개요',
   background: '검토 배경 및 목적',
@@ -15,27 +17,28 @@ function buildPrintHtml(report) {
   const today = new Date().toLocaleDateString('ko-KR', { year: 'numeric', month: 'long', day: 'numeric' });
 
   const sectionRows = Object.entries(SECTION_LABELS)
-    .filter(([key]) => sections[key])
-    .map(([key, label]) => `
+    .map(([key, label]) => [key, label, toDisplayText(sections[key], '')])
+    .filter(([, , content]) => content)
+    .map(([, label, content]) => `
       <div class="section">
-        <div class="section-label">${label}</div>
-        <div class="section-body">${(sections[key] || '').replace(/\n/g, '<br>')}</div>
+        <div class="section-label">${escapeHtmlText(label)}</div>
+        <div class="section-body">${escapeHtmlText(content).replace(/\n/g, '<br>')}</div>
       </div>`)
     .join('');
 
   const followUpRows = followUpActions.map((item, i) => `
     <tr>
       <td>${i + 1}</td>
-      <td>${item.department || '확인 필요'}</td>
-      <td>${item.action || ''}</td>
-      <td>${item.due_date || '확인 필요'}</td>
+      <td>${escapeHtmlText(item.department || '확인 필요')}</td>
+      <td>${escapeHtmlText(item.action || '')}</td>
+      <td>${escapeHtmlText(item.due_date || '확인 필요')}</td>
     </tr>`).join('');
 
   return `<!DOCTYPE html>
 <html lang="ko">
 <head>
 <meta charset="UTF-8">
-<title>${report.report_title || '보고서'}</title>
+<title>${escapeHtmlText(report.report_title || '보고서')}</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: 'Malgun Gothic', '맑은 고딕', sans-serif; font-size: 11pt; color: #1e293b; background: #fff; padding: 30px 40px; }
@@ -63,7 +66,7 @@ function buildPrintHtml(report) {
 <body>
 <div class="header">
   <div class="label-top">내부 보고서</div>
-  <div class="title">${report.report_title || '보고서'}</div>
+  <div class="title">${escapeHtmlText(report.report_title || '보고서')}</div>
   <div class="subtitle">본 보고서는 첨부 원문에 근거하여 AI가 초안을 작성하였습니다. 확인 필요 항목은 담당자 검토 후 확정하시기 바랍니다.</div>
   <div class="date-row">작성일: ${today}</div>
 </div>
@@ -114,7 +117,7 @@ export function ReportView({ analysis }) {
             <div>
               <div className="mb-2 text-xs font-black tracking-widest text-brand-600 uppercase">내부 보고서</div>
               <h2 className="text-2xl font-black tracking-tight text-slate-950 lg:text-3xl">
-                {report.report_title || '보고서'}
+                {toDisplayText(report.report_title, '보고서')}
               </h2>
               <p className="mt-3 text-xs font-bold leading-5 text-slate-400">
                 본 보고서는 첨부 원문에 근거하여 AI가 초안을 작성하였습니다.
@@ -133,7 +136,7 @@ export function ReportView({ analysis }) {
 
         <div className="divide-y divide-slate-100 px-8 py-2">
           {Object.entries(SECTION_LABELS).map(([key, label]) => {
-            const content = sections[key];
+            const content = toDisplayText(sections[key], '');
             if (!content) return null;
             return (
               <div key={key} className="py-6">
@@ -156,12 +159,12 @@ export function ReportView({ analysis }) {
                 className="flex items-start gap-3 rounded-2xl border border-slate-100 bg-slate-50 p-4"
               >
                 <div className="flex-shrink-0 rounded-full bg-brand-100 px-3 py-1 text-xs font-black text-brand-700">
-                  {item.department || '확인 필요'}
+                  {toDisplayText(item.department, '확인 필요')}
                 </div>
                 <div className="min-w-0 flex-1">
-                  <p className="text-sm font-bold text-slate-800">{item.action}</p>
-                  {item.due_date && (
-                    <p className="mt-1 text-xs font-bold text-slate-400">목표기한: {item.due_date}</p>
+                  <p className="text-sm font-bold text-slate-800">{toDisplayText(item.action, '')}</p>
+                  {toDisplayText(item.due_date, '') && (
+                    <p className="mt-1 text-xs font-bold text-slate-400">목표기한: {toDisplayText(item.due_date, '')}</p>
                   )}
                 </div>
               </div>
