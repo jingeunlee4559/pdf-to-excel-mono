@@ -1,11 +1,9 @@
-# AI 업무문서 자동화 시스템
+# 🏗️ AI 업무문서 자동화 시스템
 
 > 건설·전기 공사업무의 PDF/Excel 문서를 업로드하면,  
 > AI가 내용을 분석하고 **회사 내부 양식에 맞는 Excel 파일**로 자동 생성해주는 업무 자동화 시스템
 
----
-
-## 목차
+## 📋 목차
 
 1. [프로젝트 소개](#1-프로젝트-소개)
 2. [주요 기능](#2-주요-기능)
@@ -72,49 +70,66 @@
 
 ## 3. 시스템 아키텍처
 
+### 서비스 구성
+
 | 서비스 | 기술 | 포트 |
 |--------|------|:----:|
-| Frontend | React + Vite | 3000 |
-| Backend | Node.js + Express | 8080 |
-| AI Server | Python + FastAPI | 8000 |
-| Database | MongoDB | 27017 |
+| 🌐 Frontend | React + Vite | `3000` |
+| ⚙️ Backend | Node.js + Express | `8080` |
+| 🤖 AI Server | Python + FastAPI | `8000` |
+| 🗄️ Database | MongoDB | `27017` |
 
-**서비스 간 통신 흐름**
+### 서비스 간 통신 흐름
 
-| 구간 | 방식 |
-|------|------|
-| 사용자 ↔ Frontend | 브라우저 |
-| Frontend ↔ Backend | REST API |
-| Backend ↔ MongoDB | Mongoose |
-| Backend ↔ AI Server | 내부 HTTP |
+```
+사용자 (브라우저)
+    ↕ HTTP
+Frontend  :3000
+    ↕ REST API
+Backend   :8080  ←→  MongoDB :27017
+    ↕ 내부 HTTP
+AI Server :8000
+```
 
-**AI Server 처리 내역**
+### AI Server 처리 내역
 
 | 역할 | 라이브러리 |
 |------|-----------|
-| PDF 파싱 | PyMuPDF, pdfplumber |
-| 문서 분석 | OpenAI |
-| Excel 생성 | openpyxl |
+| 📄 PDF 파싱 | PyMuPDF, pdfplumber |
+| 🧠 문서 분석 | OpenAI |
+| 📊 Excel 생성 | openpyxl |
 
 ---
 
 ## 4. 기술 스택
 
-| 영역 | 기술 |
-|------|------|
-| **Frontend** | React, Vite, JavaScript, Tailwind CSS |
-| **Backend** | Node.js, Express |
-| **AI Server** | Python, FastAPI |
-| **Database** | MongoDB |
-| **Excel 처리** | openpyxl, ExcelJS |
-| **문서 파싱** | PyMuPDF, pdfplumber |
-| **AI 연동** | OpenAI |
+### Frontend
+![React](https://img.shields.io/badge/React-20232A?style=for-the-badge&logo=react&logoColor=61DAFB)
+![Vite](https://img.shields.io/badge/Vite-646CFF?style=for-the-badge&logo=vite&logoColor=white)
+![JavaScript](https://img.shields.io/badge/JavaScript-F7DF1E?style=for-the-badge&logo=javascript&logoColor=black)
+![TailwindCSS](https://img.shields.io/badge/Tailwind_CSS-06B6D4?style=for-the-badge&logo=tailwindcss&logoColor=white)
+
+### Backend
+![Node.js](https://img.shields.io/badge/Node.js-339933?style=for-the-badge&logo=nodedotjs&logoColor=white)
+![Express](https://img.shields.io/badge/Express-000000?style=for-the-badge&logo=express&logoColor=white)
+
+### AI Server
+![Python](https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-009688?style=for-the-badge&logo=fastapi&logoColor=white)
+![OpenAI](https://img.shields.io/badge/OpenAI-412991?style=for-the-badge&logo=openai&logoColor=white)
+
+### Database
+![MongoDB](https://img.shields.io/badge/MongoDB-47A248?style=for-the-badge&logo=mongodb&logoColor=white)
+
+### 문서 처리
+![openpyxl](https://img.shields.io/badge/openpyxl-217346?style=for-the-badge&logo=microsoftexcel&logoColor=white)
+![PyMuPDF](https://img.shields.io/badge/PyMuPDF-FF0000?style=for-the-badge&logo=adobeacrobatreader&logoColor=white)
 
 ---
 
 ## 5. 실행 방법
 
-> 세 개의 서버를 모두 실행해야 정상 동작합니다.
+> ⚠️ 세 개의 서버를 모두 실행해야 정상 동작합니다.
 
 ### 0) MongoDB 설정
 
@@ -208,7 +223,7 @@ OCR_ENABLED=false
 
 ## 7. 사용 흐름
 
-### 관리자 사전 설정
+### 👨‍💼 관리자 사전 설정
 
 > 사용자가 양식을 사용하기 전에 관리자가 먼저 설정해야 합니다.
 
@@ -216,17 +231,27 @@ OCR_ENABLED=false
 2. 양식별 셀 매핑 설정 (품목명 → B열, 단가 → C열, 수량 → D열 등)
 3. 등록 완료 → 전체 사용자에게 양식 공개
 
-### 사용자 업무 흐름
+### 👷 사용자 업무 흐름
 
-1. 문서 업로드 (PDF / Excel)
-2. 백엔드에서 작업 생성 → MongoDB에 저장
-3. AI 서버에서 문서 분석
-4. 분석 결과를 표 구조 JSON으로 변환
-5. 채팅으로 원하는 양식 요청
-6. 엑셀 미리보기 생성
-7. 직접 수정 또는 저장
-8. 관리자가 등록한 자사 양식 적용
-9. Excel 파일 다운로드
+```
+① 문서 업로드 (PDF / Excel)
+        ↓
+② 백엔드에서 작업 생성 → MongoDB에 저장
+        ↓
+③ AI 서버에서 문서 분석
+        ↓
+④ 분석 결과를 표 구조 JSON으로 변환
+        ↓
+⑤ 채팅으로 원하는 양식 요청
+        ↓
+⑥ 엑셀 미리보기 생성
+        ↓
+⑦ 직접 수정 또는 저장
+        ↓
+⑧ 관리자가 등록한 자사 양식 적용
+        ↓
+⑨ Excel 파일 다운로드 ✅
+```
 
 ---
 
@@ -251,8 +276,10 @@ P.P마대(만들기), 톤마대(쌓기) 각각 수량 40개, 50개로
 
 ## 9. 핵심 개발 포인트
 
-- **자연어 → 표 구조 변환**: OpenAI를 통해 자유로운 요청을 정형화된 JSON 표로 변환
-- **동적 컬럼 생성**: 업체 수에 따라 Excel 컬럼을 자동으로 생성
-- **관리자 셀 매핑 처리**: 등록된 양식의 셀 위치에 맞게 데이터 자동 배치
-- **미리보기 일관성**: 브라우저 Excel 미리보기와 실제 다운로드 결과 일치 보장
-- **복합 분석 흐름**: 문서 분석 결과 + 채팅 요청을 함께 반영하는 통합 자동화 파이프라인
+| 포인트 | 설명 |
+|--------|------|
+| 🔤 **자연어 → 표 구조 변환** | OpenAI를 통해 자유로운 요청을 정형화된 JSON 표로 변환 |
+| 📊 **동적 컬럼 생성** | 업체 수에 따라 Excel 컬럼을 자동으로 생성 |
+| 🗂️ **관리자 셀 매핑 처리** | 등록된 양식의 셀 위치에 맞게 데이터 자동 배치 |
+| 👁️ **미리보기 일관성** | 브라우저 Excel 미리보기와 실제 다운로드 결과 일치 보장 |
+| 🔄 **복합 분석 흐름** | 문서 분석 결과 + 채팅 요청을 함께 반영하는 통합 자동화 파이프라인 |
